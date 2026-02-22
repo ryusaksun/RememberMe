@@ -1,0 +1,26 @@
+[project]
+name = "remember-me"
+version = "0.1.0"
+description = "通过聊天记录复活记忆中的人"
+readme = "README.md"
+authors = [
+    { name = "Ryuichi", email = "2540987771@qq.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=1.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "chromadb>=0.5.0",
+    "python-dotenv>=1.0.0",
+    "pycryptodome>=3.20.0",
+    "qrcode>=7.4.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+remember-me = "remember_me.cli:cli"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
