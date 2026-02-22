@@ -84,7 +84,8 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
 @cli.command()
 @click.argument("name")
 @click.option("--api-key", envvar="GEMINI_API_KEY", help="Gemini API Key（或设置 GEMINI_API_KEY 环境变量）")
-def chat(name: str, api_key: str | None):
+@click.option("--no-greet", is_flag=True, default=False, help="跳过主动开场消息")
+def chat(name: str, api_key: str | None, no_greet: bool):
     """与记忆中的人对话。"""
     profile_path = PROFILES_DIR / f"{name}.json"
     if not profile_path.exists():
@@ -131,6 +132,31 @@ def chat(name: str, api_key: str | None):
     ))
     console.print()
 
+    import random
+    import time as _time
+
+    from remember_me.engine.topic_starter import TopicStarter
+    topic_starter = TopicStarter(persona=persona, client=engine.client)
+
+    # 主动开场消息
+    if not no_greet and getattr(persona, "topic_interests", None):
+        status = console.status(f"  [dim]{name} 正在输入...[/]")
+        status.start()
+        greet_msgs = []
+        try:
+            greet_msgs = topic_starter.generate()
+        except Exception:
+            pass
+        status.stop()
+
+        if greet_msgs:
+            for i, msg in enumerate(greet_msgs):
+                console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
+                if i < len(greet_msgs) - 1:
+                    _time.sleep(0.4 + random.random() * 0.8)
+            console.print()
+            engine.inject_proactive_message(greet_msgs)
+
     while True:
         try:
             user_input = console.input("[bold green]你: [/]")
@@ -145,10 +171,6 @@ def chat(name: str, api_key: str | None):
             console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
             break
 
-        # 多条消息回复（模拟连发）
-        import random
-        import time as _time
-
         try:
             replies = engine.send_multi(user_input)
             for i, reply in enumerate(replies):
@@ -159,6 +181,21 @@ def chat(name: str, api_key: str | None):
             console.print(f"  [red]出错了: {e}[/]")
 
         console.print()
+
+        # 冷场检测：有概率主动转换话题
+        if engine.detect_cold_chat() and random.random() < 0.3:
+            _time.sleep(1.5 + random.random())
+            try:
+                cold_msgs = topic_starter.generate_cold_topic()
+                if cold_msgs:
+                    for i, msg in enumerate(cold_msgs):
+                        console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
+                        if i < len(cold_msgs) - 1:
+                            _time.sleep(0.4 + random.random() * 0.8)
+                    console.print()
+                    engine.inject_proactive_message(cold_msgs)
+            except Exception:
+                pass
 
 
 @cli.command()

@@ -17,36 +17,66 @@ def _build_system_prompt(persona: Persona) -> str:
 
     lines = [
         f"你就是「{name}」本人。不是在扮演，你就是这个人。",
-        f"以下是从你和对方的真实聊天记录中提取的说话特征，严格按照这些特征回复。",
+        f"以下是从你和对方超过 {persona.total_messages} 条真实聊天记录中提取的说话特征。",
         "",
     ]
 
-    # ── 核心风格描述（自然语言，不要像报告） ──
-    lines.append(f"你说话{'' if persona.avg_length > 15 else '很短很碎，'}经常一句话拆成好几条发。"
-                 f"不会写长段文字。口头禅包括：{', '.join(persona.catchphrases[:8])}。" if persona.catchphrases else "")
+    # ── 性格画像 ──
+    lines.append("## 你是什么样的人")
+    desc_parts = []
 
-    if persona.top_emojis:
-        lines.append(f"偶尔用这些 emoji：{''.join(persona.top_emojis[:6])}，但不是每句都带。")
+    if persona.avg_length < 10:
+        desc_parts.append("说话很短很碎，一句话经常拆成好几条发出去")
+    elif persona.avg_length < 20:
+        desc_parts.append("说话简短直接")
 
-    if getattr(persona, "tone_markers", None):
-        lines.append(f"语气词习惯：{', '.join(persona.tone_markers[:6])}。")
+    slang = getattr(persona, "slang_expressions", [])
+    if slang:
+        desc_parts.append(f"有独特用语，比如「{'」「'.join(slang[:6])}」")
 
+    swear = getattr(persona, "swear_ratio", 0)
+    if swear > 0.02:
+        desc_parts.append("说话粗犷直接，偶尔带脏话，不需要避讳")
+    elif swear > 0.005:
+        desc_parts.append("偶尔说脏话")
+
+    self_refs = getattr(persona, "self_references", [])
+    if "老子" in self_refs:
+        desc_parts.append("经常用「老子」自称")
+
+    interests = getattr(persona, "topic_interests", {})
+    if interests:
+        top = sorted(interests.items(), key=lambda x: -x[1])[:4]
+        desc_parts.append(f"平时喜欢聊{', '.join(t for t, _ in top)}")
+
+    lines.append("。".join(desc_parts) + "。")
     lines.append("")
 
-    # ── 连发规则 + 真实对话示例（核心改动） ──
-    avg_burst = getattr(persona, "avg_burst_length", 1.0)
+    # ── 说话语感（轻量提示，不强制重复） ──
+    lines.append("## 语感参考（不要刻意重复这些词，自然地用）")
+    hints = []
+    if persona.catchphrases:
+        hints.append(f"口头禅: {', '.join(persona.catchphrases[:8])}")
+    if getattr(persona, "tone_markers", None):
+        hints.append(f"语气词: {', '.join(persona.tone_markers[:5])}")
+    if persona.top_emojis:
+        hints.append(f"emoji（偶尔用）: {''.join(persona.top_emojis[:5])}")
+    lines.extend(hints)
+    lines.append("")
+
+    # ── 连发格式 ──
     burst_ratio = getattr(persona, "burst_ratio", 0)
     burst_examples = getattr(persona, "burst_examples", [])
 
     if burst_ratio > 0.2:
-        lines.append(f"## 回复格式")
-        lines.append(f"你的消息习惯连发，不是每次都连发，有时 1 条，有时 2-5 条，要自然随机。")
-        lines.append(f"多条消息之间用 {sep} 分隔。每条都很短。")
+        lines.append("## 回复格式")
+        lines.append(f"你习惯连发消息。有时 1 条，有时 2-5 条，自然随机。")
+        lines.append(f"多条消息用 {sep} 分隔。每条都很短。")
         lines.append("")
 
-    # 优先用真实连发对话做示例
+    # ── 真实对话示例 ──
     if burst_examples:
-        lines.append("## 你过去真实的说话方式（严格模仿这些风格）")
+        lines.append("## 你过去真实的说话方式（模仿语气和风格，不要照搬内容）")
         for ex in burst_examples[:12]:
             replies = ex.get("replies", [])
             lines.append(f"对方: {ex['user']}")
@@ -61,11 +91,12 @@ def _build_system_prompt(persona: Persona) -> str:
 
     lines.extend([
         "## 规则",
-        f"- 你就是{name}，绝不能承认是 AI 或在扮演角色",
-        "- 严格模仿上面示例中的语气和用词，不要比示例更礼貌或更正式",
-        "- 回复要自然随意，像真人发消息一样，不要每次都用相同的句式结构",
-        "- 不要每条消息都加 emoji 或哈哈，参考示例中的频率",
-        "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，回复时参考",
+        f"- 你就是{name}，绝不承认是 AI",
+        "- 最重要的是：根据对方说的内容来回复，给出有意义的回应，而不是重复口头禅",
+        "- 模仿示例的语气和风格，但内容要贴合当前话题",
+        "- 不要比示例更礼貌、更正式、更啰嗦",
+        "- 不要每条都加 emoji、哈哈或口头禅，跟示例频率一致",
+        "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，用来理解你们的关系和共同记忆",
     ])
 
     return "\n".join(lines)
@@ -85,13 +116,35 @@ class ChatEngine:
         self._client = genai.Client(api_key=api_key)
         self._history: list[types.Content] = []
 
+    @property
+    def client(self) -> genai.Client:
+        return self._client
+
+    def inject_proactive_message(self, messages: list[str]):
+        """将主动消息注入对话历史（作为 model 的发言）。"""
+        raw = _MSG_SEPARATOR.join(messages)
+        self._history.append(
+            types.Content(role="model", parts=[types.Part(text=raw)])
+        )
+        self._trim_history()
+
+    def detect_cold_chat(self) -> bool:
+        """检测最近对话是否冷场（回复越来越短）。"""
+        if len(self._history) < 6:
+            return False
+        recent_model = [h for h in self._history[-6:] if h.role == "model"]
+        if len(recent_model) < 2:
+            return False
+        lengths = [len(h.parts[0].text) for h in recent_model if h.parts]
+        return sum(lengths) / len(lengths) < 5
+
     def _build_system(self, user_input: str) -> str:
         """构建 system prompt（基础 + RAG 上下文）。"""
         context_parts = []
         if self._memory:
-            relevant = self._memory.search(user_input, top_k=5)
+            relevant = self._memory.search(user_input, top_k=8)
             if relevant:
-                context_parts.append("## 相关的历史对话记忆")
+                context_parts.append("## 你们过去聊到类似话题时的真实对话（参考这些来回复，而不是编造）")
                 for fragment in relevant:
                     context_parts.append(fragment)
                     context_parts.append("---")

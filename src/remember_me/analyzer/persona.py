@@ -51,23 +51,26 @@ class Persona:
     # 词汇习惯
     catchphrases: list[str] = field(default_factory=list)
     top_emojis: list[str] = field(default_factory=list)
-    tone_markers: list[str] = field(default_factory=list)       # 常用语气词
-    sentence_endings: list[str] = field(default_factory=list)    # 句尾习惯
+    tone_markers: list[str] = field(default_factory=list)
+    sentence_endings: list[str] = field(default_factory=list)
+    slang_expressions: list[str] = field(default_factory=list)   # 方言/网络用语/独特表达
+    swear_ratio: float = 0.0                                      # 粗口比例
 
     # 行为模式
-    active_hours: list[int] = field(default_factory=list)        # 活跃时段 (top 5 小时)
-    burst_ratio: float = 0.0                                     # 连发消息比例
-    avg_burst_length: float = 1.0                                # 平均连发条数
-    burst_distribution: list[float] = field(default_factory=list) # 连发 1-5 条各自概率
-    greeting_patterns: list[str] = field(default_factory=list)   # 打招呼方式
-    farewell_patterns: list[str] = field(default_factory=list)   # 告别方式
+    active_hours: list[int] = field(default_factory=list)
+    burst_ratio: float = 0.0
+    avg_burst_length: float = 1.0
+    burst_distribution: list[float] = field(default_factory=list)
+    greeting_patterns: list[str] = field(default_factory=list)
+    farewell_patterns: list[str] = field(default_factory=list)
+    self_references: list[str] = field(default_factory=list)     # 自称方式
 
     # 话题偏好
-    topic_keywords: list[str] = field(default_factory=list)      # 高频话题词
+    topic_keywords: list[str] = field(default_factory=list)
+    topic_interests: dict[str, int] = field(default_factory=dict) # 话题→频次
 
     # 典型回复样例
     example_dialogues: list[dict[str, str]] = field(default_factory=list)
-    # 真实连发对话样例: [{"user": "xxx", "replies": ["r1", "r2", ...]}]
     burst_examples: list[dict] = field(default_factory=list)
 
     # 综合描述
@@ -309,6 +312,47 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     # ── 话题关键词 ──
     topic_keywords = _analyze_topic_keywords(contents)
 
+    # ── 方言/网络用语/独特表达 ──
+    slang_map = {
+        "你嘛": r"你嘛", "吗的": r"吗的", "要得": r"要得", "对头": r"对头",
+        "噻": r"噻", "老子": r"老子", "笑西": r"笑西", "孽障": r"孽障",
+        "书背": r"书背", "书币": r"书币", "hiehie": r"hiehie", "赫赫": r"赫赫",
+        "干巴爹": r"干巴爹", "速速": r"速速", "笑死": r"笑死",
+        "我靠": r"我靠", "他妈的": r"他妈的", "几把": r"几把",
+        "懂的都懂": r"懂的都懂", "谁懂": r"谁懂", "是这个理": r"是这个理",
+        "真羡慕你": r"真羡慕你", "嘤嘤嘤": r"嘤嘤嘤",
+    }
+    slang_expressions = []
+    for label, pattern in slang_map.items():
+        cnt = sum(1 for c in contents if re.search(pattern, c))
+        if cnt >= 3:
+            slang_expressions.append(label)
+
+    # ── 粗口比例 ──
+    swear_re = re.compile(r"他妈|妈的|吗的|卧槽|我靠|操|屎|几把|傻逼|牛逼")
+    swear_count = sum(1 for c in contents if swear_re.search(c))
+    swear_ratio = round(swear_count / total, 3)
+
+    # ── 自称方式 ──
+    self_ref_map = {"老子": r"老子", "爹": r"爹[^爹]|^爹$", "我": r"^我[^的]|[^是]我$"}
+    self_references = [label for label, pattern in self_ref_map.items()
+                       if sum(1 for c in contents if re.search(pattern, c)) >= 5]
+
+    # ── 话题兴趣 ──
+    topic_defs = {
+        "游戏": r"(游戏|王者|排位|上号|吃鸡|打游戏|五排|双排|连跪|段位|吕布|联盟)",
+        "音乐": r"(听歌|歌|耳机|音乐|音乐节|专辑)",
+        "学习": r"(学习|上课|作业|考试|ppt|老师|学年|学期|宿舍)",
+        "影视": r"(电影|电视|追|剧|动漫|漫画)",
+        "美食": r"(吃|好吃|恰|麻辣|米线|外卖|饭|烧烤|奶茶)",
+        "吐槽": r"(无语|离谱|笑死|受不了|绝了|我靠|服了)",
+    }
+    topic_interests = {}
+    for topic, pattern in topic_defs.items():
+        cnt = sum(1 for c in contents if re.search(pattern, c, re.I))
+        if cnt >= 10:
+            topic_interests[topic] = cnt
+
     # ── 典型对话样例（均匀采样） ──
     pairs = history.as_dialogue_pairs()
     pairs = [(u, r) for u, r in pairs
@@ -392,6 +436,19 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     if topic_keywords:
         style_parts.append(f"常聊话题: {', '.join(topic_keywords[:10])}")
 
+    if slang_expressions:
+        style_parts.append(f"方言/独特用语: {', '.join(slang_expressions[:10])}")
+
+    if swear_ratio > 0.01:
+        style_parts.append(f"说话比较粗犷，偶尔带脏话（约{swear_ratio*100:.0f}%的消息）")
+
+    if self_references and "老子" in self_references:
+        style_parts.append("经常用「老子」自称")
+
+    if topic_interests:
+        sorted_topics = sorted(topic_interests.items(), key=lambda x: -x[1])
+        style_parts.append(f"最感兴趣: {', '.join(t for t, _ in sorted_topics[:5])}")
+
     style_summary = "。".join(style_parts) + "。"
 
     return Persona(
@@ -405,13 +462,17 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         top_emojis=top_emojis,
         tone_markers=tone_markers,
         sentence_endings=sentence_endings,
+        slang_expressions=slang_expressions,
+        swear_ratio=swear_ratio,
         active_hours=active_hours,
         burst_ratio=burst_ratio,
         avg_burst_length=avg_burst_length,
         burst_distribution=burst_distribution,
         greeting_patterns=greeting_patterns,
         farewell_patterns=farewell_patterns,
+        self_references=self_references,
         topic_keywords=topic_keywords,
+        topic_interests=topic_interests,
         example_dialogues=example_dialogues,
         burst_examples=burst_examples,
         style_summary=style_summary,
