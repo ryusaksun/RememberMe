@@ -91,6 +91,47 @@ function fbox(c, x, y, w, h, base) {
 }
 function fr(c,x,y,w,h,col){c.fillStyle=col;c.fillRect(x,y,w,h);}
 
+/* Floor796-style 3D box: front + top + right side faces */
+function box3d(c,x,y,w,h,d,base){
+  if(w<=0||h<=0) return;
+  /* Cast shadow */
+  c.fillStyle='rgba(0,0,0,0.10)';c.fillRect(x+3,y+3,w+d,h);
+  /* Right side face */
+  c.fillStyle=shade(base,-28);c.fillRect(x+w,y-d+1,d,h+d-1);
+  c.fillStyle=shade(base,-40);c.fillRect(x+w,y-d+1,1,h+d-1);
+  c.fillStyle=shade(base,-18);c.fillRect(x+w+d-1,y-d+1,1,h+d-1);
+  /* Top face */
+  c.fillStyle=shade(base,22);c.fillRect(x+1,y-d,w+d-1,d);
+  c.fillStyle=shade(base,32);c.fillRect(x+1,y-d,w+d-1,1);
+  c.fillStyle=shade(base,10);c.fillRect(x+1,y-1,w+d-1,1);
+  /* Outline corner */
+  c.fillStyle=shade(base,-35);c.fillRect(x,y-d,1,d);c.fillRect(x,y-d,w,1);
+  c.fillRect(x+w+d-1,y-d,1,1);
+  /* Front face */
+  c.fillStyle=shade(base,-40);c.fillRect(x,y,w,h);
+  c.fillStyle=base;c.fillRect(x+1,y+1,w-2,h-2);
+  if(h>3&&w>3){
+    c.fillStyle=shade(base,20);c.fillRect(x+1,y+1,w-2,1);c.fillRect(x+w-2,y+1,1,h-2);
+    c.fillStyle=shade(base,-18);c.fillRect(x+1,y+h-2,w-2,1);c.fillRect(x+1,y+1,1,h-2);
+  }
+}
+function fbox3d(c,x,y,w,h,d,base){
+  if(w<=0||h<=0) return;
+  /* Right side face */
+  c.fillStyle=shade(base,-25);c.fillRect(x+w,y-d+1,d,h+d-1);
+  c.fillStyle=shade(base,-35);c.fillRect(x+w,y-d+1,1,h+d-1);
+  /* Top face */
+  c.fillStyle=shade(base,20);c.fillRect(x+1,y-d,w+d-1,d);
+  c.fillStyle=shade(base,30);c.fillRect(x+1,y-d,w+d-1,1);
+  /* Front face */
+  c.fillStyle=shade(base,-30);c.fillRect(x,y,w,h);
+  c.fillStyle=base;c.fillRect(x+1,y+1,Math.max(0,w-2),Math.max(0,h-2));
+  if(h>3&&w>3){
+    c.fillStyle=shade(base,18);c.fillRect(x+1,y+1,w-2,1);c.fillRect(x+w-2,y+1,1,h-2);
+    c.fillStyle=shade(base,-15);c.fillRect(x+1,y+h-2,w-2,1);c.fillRect(x+1,y+1,1,h-2);
+  }
+}
+
 /* ═══ LAYOUT ═══
    Thicker structure for Floor796 feel:
    Roof=20, Upper=316, Mid=48(pipes!), Lower=316, Ground=20
@@ -309,21 +350,30 @@ function drawStructure(c){
   drawCeiling(c,WP,LY,CX-WP,WP+100,60);
   drawCeiling(c,CX+CW,LY,W-WP-CX-CW,CX+CW+120,50);
 
-  /* Floors */
+  /* Floors — with 3D depth edge */
   drawWoodFloor(c,WP,UF-4,CX-WP,MY-UF+4,'#b89870');
   drawTileFloor(c,CX+CW,UF-4,W-WP-CX-CW,MY-UF+4,'#98b8ae');
   drawWoodFloor(c,WP,LF-4,CX-WP,GY-LF+4,'#b89870');
   drawTileFloor(c,CX+CW,LF-4,W-WP-CX-CW,GY-LF+4,'#b0a888');
+  /* Floor depth edge (3D illusion — visible front edge of floor plane) */
+  fr(c,WP,UF+2,CX-WP,4,shade('#b89870',-20));
+  fr(c,WP,UF+2,CX-WP,1,shade('#b89870',-10));
+  fr(c,CX+CW,UF+2,W-WP-CX-CW,4,shade('#98b8ae',-20));
+  fr(c,CX+CW,UF+2,W-WP-CX-CW,1,shade('#98b8ae',-10));
+  fr(c,WP,LF+2,CX-WP,4,shade('#b89870',-20));
+  fr(c,WP,LF+2,CX-WP,1,shade('#b89870',-10));
+  fr(c,CX+CW,LF+2,W-WP-CX-CW,4,shade('#b0a888',-20));
+  fr(c,CX+CW,LF+2,W-WP-CX-CW,1,shade('#b0a888',-10));
 
-  /* Roof — thick with industrial detail */
-  box(c,0,0,W,ROOF,'#585060');
+  /* Roof — thick with industrial detail — 3D */
+  box3d(c,0,0,W,ROOF,6,'#585060');
   for(var i=0;i<W;i+=20){fr(c,i,4,18,4,shade('#585060',-8));}
   for(var i=10;i<W;i+=20){fr(c,i,12,18,3,shade('#585060',5));}
   /* Roof rivets */
   for(var rx=15;rx<W;rx+=40){fr(c,rx,8,2,2,'#686068');}
 
-  /* Ground */
-  box(c,0,GY,W,GND,'#585060');
+  /* Ground — 3D */
+  box3d(c,0,GY,W,GND,6,'#585060');
   for(var i=0;i<W;i+=24){fr(c,i,GY+4,22,4,shade('#585060',-6));}
 
   /* Mid-floor with pipes */
@@ -350,9 +400,9 @@ function drawStructure(c){
   drawCenterWall(c,CX,UY,CW,UH,UDOOR_Y,DOOR_H);
   drawCenterWall(c,CX,LY,CW,LH,LDOOR_Y,DOOR_H);
 
-  /* Outer walls — thick with industrial detail */
-  box(c,0,UY,WP,UH+MID+LH,'#606870');
-  box(c,W-WP,UY,WP,UH+MID+LH,'#606870');
+  /* Outer walls — thick with industrial detail — 3D */
+  box3d(c,0,UY,WP,UH+MID+LH,5,'#606870');
+  box3d(c,W-WP,UY,WP,UH+MID+LH,5,'#606870');
   /* Wall rivets */
   for(var ry=UY+20;ry<GY;ry+=40){
     fr(c,2,ry,2,2,'#707880');
@@ -482,7 +532,7 @@ function drawBedroom(c){
 
   /* ── Bookshelf (tall, on right side) ── */
   var bsx=rx+290,bsy=ry+90;
-  box(c,bsx,bsy,42,120,'#806848');
+  box3d(c,bsx,bsy,42,120,5,'#806848');
   var bkC=['#c05050','#5080b0','#50a050','#c0a040','#8868a8','#c07040'];
   for(var si=0;si<4;si++){
     var sy=bsy+4+si*29;
@@ -495,11 +545,11 @@ function drawBedroom(c){
     }
   }
 
-  /* ── Desk (larger) ── */
+  /* ── Desk (larger) — 3D ── */
   var dx=rx+20,dy=UF-58;
-  box(c,dx,dy,100,6,'#806848');
-  box(c,dx+4,dy+6,6,52,'#705838');
-  box(c,dx+90,dy+6,6,52,'#705838');
+  box3d(c,dx,dy,100,6,4,'#806848');
+  box3d(c,dx+4,dy+6,6,52,3,'#705838');
+  box3d(c,dx+90,dy+6,6,52,3,'#705838');
   /* Back panel */
   fr(c,dx+10,dy+6,80,4,'#705838');
   /* Drawers right */
@@ -510,7 +560,7 @@ function drawBedroom(c){
 
   /* ── Monitor on desk ── */
   var mx=dx+18,my=dy-48;
-  box(c,mx,my,56,42,'#282830');
+  box3d(c,mx,my,56,42,4,'#282830');
   fr(c,mx+3,my+3,50,34,'#1a3040');
   fbox(c,mx+24,my+42,8,6,'#383840');
   fbox(c,mx+18,my+46,20,4,'#383840');
@@ -539,9 +589,9 @@ function drawBedroom(c){
 
   /* ── Chair ── */
   var cx=dx+34,cy=UF-38;
-  box(c,cx,cy-28,32,28,'#c87888');
+  box3d(c,cx,cy-28,32,28,4,'#c87888');
   fr(c,cx+4,cy-24,24,20,'#d88898');
-  box(c,cx+2,cy-2,28,8,'#c87888');
+  box3d(c,cx+2,cy-2,28,8,3,'#c87888');
   fbox(c,cx+4,cy+6,4,30,'#685848');
   fbox(c,cx+26,cy+6,4,30,'#685848');
   /* Chair wheels */
@@ -552,10 +602,10 @@ function drawBedroom(c){
   /* ── Bed (right side, large) ── */
   var bx=rx+170,by=UF-54;
   /* Headboard */
-  box(c,bx+110,by-14,14,68,'#806848');
+  box3d(c,bx+110,by-14,14,68,5,'#806848');
   fr(c,bx+113,by-10,8,16,'#907858');
   /* Bed frame */
-  box(c,bx,by,124,54,'#907858');
+  box3d(c,bx,by,124,54,6,'#907858');
   /* Mattress */
   fr(c,bx+4,by+4,116,24,'#e8e0d4');
   fr(c,bx+4,by+4,116,2,'#d8d0c4');
@@ -575,7 +625,7 @@ function drawBedroom(c){
 
   /* ── Nightstand ── */
   var nx=bx-32,ny=UF-36;
-  box(c,nx,ny,28,36,'#806848');
+  box3d(c,nx,ny,28,36,4,'#806848');
   fbox(c,nx+3,ny+4,22,14,'#907858');
   fr(c,nx+10,ny+9,8,3,'#b09878');
   fbox(c,nx+3,ny+20,22,12,'#907858');
@@ -609,7 +659,7 @@ function drawBedroom(c){
 
   /* ── Wardrobe (against right wall near center) ── */
   var wrx=rx+234,wry=ry+70;
-  box(c,wrx,wry,50,148,'#806848');
+  box3d(c,wrx,wry,50,148,5,'#806848');
   fbox(c,wrx+3,wry+3,20,142,'#907858');
   fbox(c,wrx+26,wry+3,21,142,'#907858');
   fr(c,wrx+22,wry+50,4,12,'#b09878');
@@ -673,7 +723,7 @@ function drawBathroom(c){
   /* Mirror frame detail */
   fr(c,sx+9,ry+53,38,1,'#a0b0b8');
   /* Counter */
-  box(c,sx,sy,56,24,'#d8dce0');
+  box3d(c,sx,sy,56,24,4,'#d8dce0');
   fr(c,sx+4,sy+4,48,14,'#b8c4cc');
   /* Faucet */
   fbox(c,sx+22,sy-10,4,12,'#a0aab0');
@@ -689,9 +739,9 @@ function drawBathroom(c){
 
   /* ── Toilet ── */
   var tx=rx+100,ty=UF-46;
-  box(c,tx,ty+16,34,30,'#d8dce0');
+  box3d(c,tx,ty+16,34,30,4,'#d8dce0');
   fr(c,tx+4,ty+20,26,22,'#c8ccd0');
-  box(c,tx+2,ty,30,18,'#d8dce0');
+  box3d(c,tx+2,ty,30,18,3,'#d8dce0');
   fr(c,tx+6,ty+4,22,10,'#ccd0d4');
   fbox(c,tx+30,ty+6,6,4,'#a0aab0');
   fbox(c,tx+2,ty+14,32,4,'#e0e4e8');
@@ -710,7 +760,7 @@ function drawBathroom(c){
 
   /* ── Bathtub (large) ── */
   var bx=rx+170,bby=UF-52;
-  box(c,bx,bby,150,52,'#d8dce0');
+  box3d(c,bx,bby,150,52,6,'#d8dce0');
   fr(c,bx+5,bby+5,140,38,'#b8c8d8');
   fr(c,bx+5,bby+5,140,10,'#c0d0e0');
   fbox(c,bx,bby,150,7,'#e0e4e8');
@@ -789,8 +839,8 @@ function drawBathroom(c){
   fr(c,rx+223,ry+81,24,8,'#c0b880');
   fr(c,rx+230,ry+76,8,7,'#e8e0d0');
 
-  /* Wall mounted cabinet (glass doors) */
-  box(c,rx+240,ry+50,60,40,'#c0c8cc');
+  /* Wall mounted cabinet (glass doors) — 3D */
+  box3d(c,rx+240,ry+50,60,40,4,'#c0c8cc');
   fbox(c,rx+244,ry+54,24,32,'#d8e0e8');
   fbox(c,rx+272,ry+54,24,32,'#d8e0e8');
   /* Items inside */
@@ -860,13 +910,13 @@ function drawLiving(c){
   /* Wall bracket */
   fbox(c,tvx+16,tvy-8,24,8,'#505050');
   /* TV */
-  box(c,tvx,tvy,56,42,'#282830');
+  box3d(c,tvx,tvy,56,42,4,'#282830');
   fr(c,tvx+3,tvy+3,50,34,'#181828');
   /* TV stand LED */
   fr(c,tvx+25,tvy+39,6,1,'#40c060');
 
   /* ── TV cabinet ── */
-  box(c,tvx-4,LF-42,64,42,'#605848');
+  box3d(c,tvx-4,LF-42,64,42,5,'#605848');
   fbox(c,tvx-1,LF-38,26,14,'#706858');fr(c,tvx+7,LF-34,10,3,'#887868');
   fbox(c,tvx+29,LF-38,30,14,'#706858');fr(c,tvx+39,LF-34,10,3,'#887868');
   fbox(c,tvx-1,LF-22,56,16,'#706858');
@@ -886,9 +936,9 @@ function drawLiving(c){
   /* ── Sofa (large) ── */
   var sx=rx+110,sy=LF-56;
   /* Back */
-  box(c,sx,sy-12,140,16,'#5a3830');
+  box3d(c,sx,sy-12,140,16,4,'#5a3830');
   /* Body */
-  box(c,sx,sy+2,140,36,'#5a3830');
+  box3d(c,sx,sy+2,140,36,5,'#5a3830');
   /* Cushions */
   fbox(c,sx+8,sy+6,56,26,'#d898a8');
   fbox(c,sx+68,sy+6,64,26,'#d898a8');
@@ -897,8 +947,8 @@ function drawLiving(c){
   /* Cushion stitch */
   fr(c,sx+64,sy+8,4,22,'#a87080');
   /* Armrests */
-  box(c,sx-8,sy-6,12,44,'#6a4838');
-  box(c,sx+136,sy-6,12,44,'#6a4838');
+  box3d(c,sx-8,sy-6,12,44,4,'#6a4838');
+  box3d(c,sx+136,sy-6,12,44,4,'#6a4838');
   /* Throw pillows */
   fbox(c,sx+12,sy-8,18,16,'#e8d0b0');
   fbox(c,sx+110,sy-8,18,16,'#a8c8e0');
@@ -909,7 +959,7 @@ function drawLiving(c){
 
   /* ── Coffee table ── */
   var cofX=rx+138,cofY=LF-24;
-  box(c,cofX,cofY,60,6,'#806848');
+  box3d(c,cofX,cofY,60,6,4,'#806848');
   /* Shelf under table */
   fr(c,cofX+4,cofY+14,52,3,'#705838');
   fbox(c,cofX+6,cofY+6,4,20,'#705838');
@@ -926,7 +976,7 @@ function drawLiving(c){
 
   /* ── Bookshelf (tall) ── */
   var bsx=rx+268,bsy=ry+60;
-  box(c,bsx,bsy,60,160,'#806848');
+  box3d(c,bsx,bsy,60,160,5,'#806848');
   var bkCols=['#c05050','#5080b0','#50a050','#c0a040','#8868a8','#c07040','#a05080'];
   for(var si=0;si<5;si++){
     var ssy=bsy+4+si*31;
@@ -944,7 +994,7 @@ function drawLiving(c){
 
   /* ── Plant ── */
   var px=rx+300,py=LF;
-  fbox(c,px,py-32,28,32,'#907050');
+  fbox3d(c,px,py-32,28,32,4,'#907050');
   fr(c,px+2,py-30,24,28,'#806040');
   fr(c,px+4,py-30,20,4,'#504030');
   fr(c,px+4,py-50,20,22,'#58a058');
@@ -1048,14 +1098,14 @@ function drawKitchen(c){
   fr(c,wx+9,wy+wh-12,6,7,'#58a858');
 
   /* ── Upper cabinets (long row) ── */
-  box(c,rx+10,ry+44,60,44,'#908068');
+  box3d(c,rx+10,ry+44,60,44,4,'#908068');
   fbox(c,rx+14,ry+48,24,36,'#a09078');fr(c,rx+36,ry+62,4,8,'#b8a888');
   fbox(c,rx+42,ry+48,24,36,'#a09078');fr(c,rx+64,ry+62,4,8,'#b8a888');
-  box(c,rx+78,ry+44,60,44,'#908068');
+  box3d(c,rx+78,ry+44,60,44,4,'#908068');
   fbox(c,rx+82,ry+48,24,36,'#a09078');fr(c,rx+104,ry+62,4,8,'#b8a888');
   fbox(c,rx+110,ry+48,24,36,'#a09078');fr(c,rx+132,ry+62,4,8,'#b8a888');
   /* Glass cabinet */
-  box(c,rx+146,ry+44,40,44,'#908068');
+  box3d(c,rx+146,ry+44,40,44,4,'#908068');
   fbox(c,rx+150,ry+48,32,36,'#b0b8b0');
   /* Plates visible through glass */
   for(var i=0;i<3;i++){fr(c,rx+154+i*10,ry+56,6,20,'#d8d0c0');}
@@ -1071,7 +1121,7 @@ function drawKitchen(c){
 
   /* ── Counter / Stove ── */
   var stx=rx+10,sty=LF-48;
-  box(c,stx,sty,140,48,'#908078');
+  box3d(c,stx,sty,140,48,5,'#908078');
   fbox(c,stx,sty,140,7,'#a89888');
   /* Stove burners */
   fbox(c,stx+10,sty+1,24,5,'#404040');
@@ -1100,7 +1150,7 @@ function drawKitchen(c){
   fr(c,stx+102,sty-8,4,4,'#605040');
 
   /* ── Sink ── */
-  box(c,rx+160,sty,44,48,'#a09888');
+  box3d(c,rx+160,sty,44,48,4,'#a09888');
   fbox(c,rx+160,sty,44,7,'#b0a898');
   fr(c,rx+166,sty+10,32,20,'#888078');
   fbox(c,rx+178,sty-14,4,16,'#a0aab0');
@@ -1111,7 +1161,7 @@ function drawKitchen(c){
 
   /* ── Fridge (tall) ── */
   var fx=rx+290,fy=LF-100;
-  box(c,fx,fy,48,100,'#d0d4d8');
+  box3d(c,fx,fy,48,100,5,'#d0d4d8');
   fbox(c,fx+3,fy+3,42,36,'#d8dce0');
   fr(c,fx+44,fy+14,4,12,'#b8bcc0');
   fbox(c,fx+3,fy+42,42,54,'#d8dce0');
@@ -1127,7 +1177,7 @@ function drawKitchen(c){
 
   /* ── Table + Chairs ── */
   var tbx=rx+166,tby=LF-40;
-  box(c,tbx,tby,68,7,'#806848');
+  box3d(c,tbx,tby,68,7,4,'#806848');
   fbox(c,tbx+6,tby+7,4,33,'#705838');
   fbox(c,tbx+58,tby+7,4,33,'#705838');
   /* Chair left */
