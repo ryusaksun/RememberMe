@@ -26,6 +26,7 @@ DATA_DIR = Path("data")
 PROFILES_DIR = DATA_DIR / "profiles"
 CHROMA_DIR = DATA_DIR / "chroma"
 HISTORY_DIR = DATA_DIR / "history"
+SESSIONS_DIR = DATA_DIR / "sessions"
 
 IMPORTERS = {
     "text": plain_text,
@@ -107,7 +108,22 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     if chroma_path.exists():
         memory = MemoryStore(chroma_path, persona_name=name)
 
-    engine = ChatEngine(persona=persona, memory=memory, api_key=api_key)
+    # 加载表情包库
+    from remember_me.analyzer.sticker import StickerLibrary
+    sticker_lib = None
+    sticker_path = DATA_DIR / "stickers" / f"{name}.json"
+    if sticker_path.exists():
+        try:
+            sticker_lib = StickerLibrary.load(sticker_path)
+        except Exception:
+            pass
+
+    engine = ChatEngine(persona=persona, memory=memory, api_key=api_key, sticker_lib=sticker_lib)
+
+    # 加载上次对话
+    session_path = SESSIONS_DIR / f"{name}.json"
+    session_loaded = engine.load_session(session_path)
+    history_start_index = len(engine._history)  # 记录起始位置，退出时只保存新消息
 
     # 加载历史消息数
     from remember_me.importers.base import ChatHistory
@@ -123,8 +139,9 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     # 欢迎界面
     title = Text(f" {name} ", style="bold white on blue")
     console.print()
+    session_hint = "（续接上次对话）" if session_loaded else ""
     console.print(Panel(
-        f"正在连接 [bold]{name}[/] 的记忆...\n"
+        f"正在连接 [bold]{name}[/] 的记忆...{session_hint}\n"
         f"共有 {total_msg_count} 条历史消息\n\n"
         f"输入消息开始对话，输入 [bold]quit[/] 退出",
         title=title,
@@ -146,12 +163,16 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     running = True
 
     def _show_messages(msgs: list[str]):
-        """逐条展示消息（带延迟）。"""
+        """逐条展示消息（带延迟）。支持 [sticker:path] 格式。"""
         msgs = [m for m in msgs if m and m.strip()]
         if not msgs:
             return
         for i, msg in enumerate(msgs):
-            console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
+            if msg.startswith("[sticker:"):
+                path = msg[9:].rstrip("]")
+                console.print(f"[bold cyan]{name}[/]: [dim][表情包: {Path(path).name}][/]", highlight=False)
+            else:
+                console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
             if i < len(msgs) - 1:
                 _time.sleep(0.4 + random.random() * 0.8)
         console.print()
@@ -182,8 +203,11 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             now = _time.time()
             idle = now - last_activity
             if idle > 15 and now > next_proactive_at:
-                # 检查是否还应该发主动消息（基于真人行为分析）
+                # 检查是否还应该发主动消息
                 if not topic_starter.should_send_proactive():
+                    continue
+                # 对话已自然结束（说了再见/去忙了），不再打扰
+                if engine.is_conversation_ended():
                     continue
                 try:
                     ctx = engine.get_recent_context()
@@ -210,7 +234,9 @@ def chat(name: str, api_key: str | None, no_greet: bool):
         status.start()
         greet_msgs = []
         try:
-            greet_msgs = topic_starter.generate()
+            # 如果有上次对话，传入上下文避免重复话题
+            ctx = engine.get_recent_context() if session_loaded else ""
+            greet_msgs = topic_starter.generate(recent_context=ctx)
         except Exception:
             pass
         status.stop()
@@ -230,48 +256,77 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
     proactive_thread.start()
 
+    # ── 退出时保存（atexit 兜底 Ctrl+C） ──
+    _session_saved = False
+
+    def _save_session():
+        nonlocal _session_saved
+        if _session_saved:
+            return
+        _session_saved = True
+        try:
+            engine.save_session(session_path)
+            new_msgs = engine.get_new_messages(history_start_index)
+            if new_msgs and memory:
+                memory.add_messages(new_msgs)
+        except Exception:
+            pass
+
+    import atexit
+    atexit.register(_save_session)
+
     # ── 主循环 ──
     console.print("[bold green]你: [/]", end="")
-    while running:
-        try:
-            msg_type, data = msg_queue.get(timeout=1)
-        except Empty:
-            continue
-
-        if msg_type == "quit":
-            console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
-            break
-
-        elif msg_type == "user":
-            user_input = data.strip()
-            if not user_input:
-                console.print("[bold green]你: [/]", end="")
+    try:
+        while running:
+            try:
+                msg_type, data = msg_queue.get(timeout=1)
+            except Empty:
                 continue
-            if user_input.lower() in ("quit", "exit", "q"):
+
+            if msg_type == "quit":
                 console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
                 break
-            topic_starter.on_user_replied()
 
-            last_activity = _time.time()
-            try:
-                replies = engine.send_multi(user_input)
-                _show_messages(replies)
-            except Exception as e:
-                console.print(f"  [red]出错了: {e}[/]")
+            elif msg_type == "user":
+                user_input = data.strip()
+                if not user_input:
+                    console.print("[bold green]你: [/]", end="")
+                    continue
+                if user_input.lower() in ("quit", "exit", "q"):
+                    console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
+                    break
+                topic_starter.on_user_replied()
+
+                last_activity = _time.time()
+                try:
+                    replies = engine.send_multi(user_input)
+                    _show_messages(replies)
+                except Exception as e:
+                    console.print(f"  [red]出错了: {e}[/]")
+                    console.print()
+
+                last_activity = _time.time()
+                console.print("[bold green]你: [/]", end="")
+
+            elif msg_type == "proactive":
+                # 对话已自然结束（说了再见/去忙了），丢弃主动消息
+                if engine.is_conversation_ended():
+                    continue
+                # 刚回复完用户消息，丢弃过时的主动消息（竞态：生成期间用户发了新消息）
+                if _time.time() - last_activity < 15:
+                    continue
+                # 主动消息打断时，先换行再显示
                 console.print()
-
-            last_activity = _time.time()
-            console.print("[bold green]你: [/]", end="")
-
-        elif msg_type == "proactive":
-            # 主动消息打断时，先换行再显示
-            console.print()
-            _show_messages(data)
-            engine.inject_proactive_message(data)
-            last_activity = _time.time()
-            console.print("[bold green]你: [/]", end="")
-
-    running = False
+                _show_messages(data)
+                engine.inject_proactive_message(data)
+                last_activity = _time.time()
+                console.print("[bold green]你: [/]", end="")
+    except KeyboardInterrupt:
+        console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
+    finally:
+        running = False
+        _save_session()
 
 
 @cli.command()
@@ -415,6 +470,15 @@ def import_netease(cookie: str | None):
     store = MemoryStore(CHROMA_DIR / target_name, persona_name=target_name)
     store.index_history(history)
     console.print(f"  [green]✓[/] 记忆索引已建立")
+
+    # 分类表情包
+    images_dir = DATA_DIR / "images" / target_name
+    if images_dir.exists():
+        from remember_me.analyzer.sticker import classify_stickers
+        sticker_lib = classify_stickers(images_dir, history, target_name)
+        sticker_path = DATA_DIR / "stickers" / f"{target_name}.json"
+        sticker_lib.save(sticker_path)
+        console.print(f"  [green]✓[/] 识别到 {len(sticker_lib.stickers)} 张表情包")
 
     console.print(f"\n  人格档案已保存: [bold]{profile_path}[/]")
     console.print(f"  现在可以运行 [bold cyan]remember-me chat {target_name}[/] 开始对话\n")
