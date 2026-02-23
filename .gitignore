@@ -11,6 +11,8 @@ wheels/
 
 # User data
 data/
+output/
+progress.md
 
 # Environment
 .env

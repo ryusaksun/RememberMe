@@ -69,6 +69,28 @@ uv run remember-me import-netease
 uv run remember-me chat 小明
 ```
 
+#### 2.1 GUI 像素房间 Playwright 回归（Floor796 风格迭代）
+
+```bash
+# 自动启动 GUI，执行桌面基线 + 状态切换 + 移动端截图
+uv run python scripts/pixel_room_playwright_regression.py --round round_01
+
+# 或使用快捷脚本（可选 persona 名称）
+scripts/pixel_room_iterate.sh round_01 小明
+```
+
+回归产物默认输出到 `output/pixel_room/<round>/`，包括：
+- `desktop_idle/`（桌面基线）
+- `state_sequence/`（状态机序列）
+- `mobile/`（移动端布局）
+- `console_errors.json`（浏览器错误日志）
+
+可对比两轮差异：
+
+```bash
+uv run python scripts/pixel_room_compare_rounds.py --base round_06 --candidate round_07
+```
+
 #### 3. 查看已有人格
 
 ```bash

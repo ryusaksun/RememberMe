@@ -129,22 +129,59 @@ body::after {
 
 /* 像素房间 */
 .pixel-room-panel {
-    background: #1a1520;
-    border-right: 1px solid rgba(0,255,213,0.15);
+    background: radial-gradient(circle at 30%% 20%%, #2a211a 0%%, #191512 52%%, #13100e 100%%);
+    border-right: 1px solid rgba(190,166,122,0.22);
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     padding: 20px;
+    position: relative;
+}
+
+.pixel-room-panel::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(255,245,230,0.01),
+        rgba(255,245,230,0.01) 2px,
+        rgba(0,0,0,0.015) 2px,
+        rgba(0,0,0,0.015) 4px
+    );
+    pointer-events: none;
 }
 
 .pixel-room-status {
-    color: var(--text-dim) !important;
+    color: #7a6d60 !important;
     font-size: 11px !important;
     letter-spacing: 1px;
     text-align: center;
     width: 100%%;
     margin-top: 8px;
+}
+
+@media (max-width: 980px) {
+    .chat-layout {
+        flex-direction: column !important;
+        height: auto !important;
+        min-height: 100vh;
+    }
+    .chat-left-panel {
+        width: 100%% !important;
+        min-height: 44vh !important;
+        border-right: none !important;
+        border-bottom: 1px solid rgba(190,166,122,0.22) !important;
+        padding: 12px !important;
+    }
+    .chat-right-panel {
+        width: 100%% !important;
+        min-height: 56vh !important;
+    }
+    #pixel-room-canvas {
+        max-width: min(95vw, 620px) !important;
+    }
 }
 
 /* 消息样式 */

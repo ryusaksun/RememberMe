@@ -34,21 +34,20 @@ def create_chat_page(persona_name: str):
     ui.query("body").style(f"background: {BG_PRIMARY}; margin: 0; overflow: hidden;")
 
     # ── 外层：左右分栏 ──
-    with ui.row().style(
+    with ui.row().classes("chat-layout").style(
         "width: 100%; height: 100vh; margin: 0; "
         "display: flex; flex-direction: row; padding: 0; gap: 0; flex-wrap: nowrap;"
     ):
         # ── 左栏：像素房间 (40%) ──
-        left_panel = ui.column().classes("pixel-room-panel").style(
+        left_panel = ui.column().classes("pixel-room-panel chat-left-panel").style(
             "width: 40%; height: 100%; min-width: 0; "
-            "background: #1a1520; border-right: 1px solid rgba(0,255,213,0.15); "
             "display: flex; flex-direction: column; "
             "align-items: center; justify-content: center; padding: 20px;"
         )
         pixel_room.create(left_panel)
 
         # ── 右栏：聊天区域 (60%) ──
-        with ui.column().style(
+        with ui.column().classes("chat-right-panel").style(
             "width: 60%; height: 100%; min-width: 0; "
             "display: flex; flex-direction: column; padding: 0; gap: 0;"
         ):
