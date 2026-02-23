@@ -138,6 +138,16 @@ class ChatEngine:
         lengths = [len(h.parts[0].text) for h in recent_model if h.parts]
         return sum(lengths) / len(lengths) < 5
 
+    def get_recent_context(self) -> str:
+        """获取最近几轮对话的文本，供外部判断当前话题。"""
+        recent = self._history[-6:] if len(self._history) >= 6 else self._history
+        lines = []
+        for h in recent:
+            if h.parts and h.parts[0].text:
+                role = "对方" if h.role == "user" else "你"
+                lines.append(f"{role}: {h.parts[0].text[:100]}")
+        return "\n".join(lines)
+
     def _build_system(self, user_input: str) -> str:
         """构建 system prompt（基础 + RAG 上下文）。"""
         context_parts = []

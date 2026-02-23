@@ -186,12 +186,13 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                 if not topic_starter.should_send_proactive():
                     continue
                 try:
+                    ctx = engine.get_recent_context()
                     if topic_starter._last_proactive:
-                        msgs = topic_starter.generate_followup()
+                        msgs = topic_starter.generate_followup(recent_context=ctx)
                     else:
                         msgs = topic_starter.pop_cached()
                         if not msgs:
-                            msgs = topic_starter.generate()
+                            msgs = topic_starter.generate(recent_context=ctx)
                     if msgs:
                         msg_queue.put(("proactive", msgs))
                         next_proactive_at = now + proactive_cooldown + random.randint(0, 30)
@@ -203,10 +204,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     except Exception:
                         pass
 
-    proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
-    proactive_thread.start()
-
-    # ── 主动开场消息 ──
+    # ── 主动开场消息（在后台线程启动之前） ──
     if not no_greet and has_topics:
         status = console.status(f"  [dim]{name} 正在输入...[/]")
         status.start()
@@ -225,6 +223,12 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
             # 后台预缓存下一条
             threading.Thread(target=topic_starter.prefetch, daemon=True).start()
+
+    # 开场完成后再启动后台主动消息线程
+    last_activity = _time.time()
+    next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
+    proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
+    proactive_thread.start()
 
     # ── 主循环 ──
     console.print("[bold green]你: [/]", end="")

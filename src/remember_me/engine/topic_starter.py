@@ -113,8 +113,8 @@ class TopicStarter:
         messages = _split_reply(raw)
         return [m for m in messages if m]
 
-    def generate(self, topic: str | None = None) -> list[str]:
-        """搜索热点 + 生成主动消息。"""
+    def generate(self, topic: str | None = None, recent_context: str = "") -> list[str]:
+        """搜索热点 + 生成主动消息。会参考当前对话内容决定如何切入。"""
         if topic is None:
             topic = self.pick_topic()
         if topic is None:
@@ -131,13 +131,25 @@ class TopicStarter:
             return []
 
         # 把搜索结果拼成上下文
-        context = f"今天是{today}。以下是搜索到的最新「{topic}」相关新闻：\n\n"
+        news_context = f"今天是{today}。以下是搜索到的最新「{topic}」相关新闻：\n\n"
         for i, r in enumerate(results, 1):
-            context += f"{i}. {r['title']}\n   {r['description']}\n\n"
+            news_context += f"{i}. {r['title']}\n   {r['description']}\n\n"
+
+        # 如果有当前对话上下文，让模型判断是否适合插入
+        chat_context = ""
+        if recent_context:
+            chat_context = (
+                f"你们刚刚在聊的内容：\n{recent_context}\n\n"
+                f"注意：如果你们正在聊比较重要或严肃的话题（比如身体健康、感情问题、考试压力等），"
+                f"不要突然换话题，而是继续关心对方。"
+                f"只有在对话已经聊得差不多了、或者话题比较轻松时，才自然地分享新闻。\n\n"
+            )
 
         prompt = (
-            f"{context}"
-            f"从上面的新闻中选一个最有意思的，用{name}的语气主动跟对方分享。\n\n"
+            f"{chat_context}"
+            f"{news_context}"
+            f"从上面的新闻中选一个最有意思的，用{name}的语气主动跟对方分享。\n"
+            f"如果你们刚才的话题还没聊完或比较重要，就先不分享新闻，而是接着之前的话题继续聊。\n\n"
             f"要求：\n"
             f"- 像是随手在聊天窗口打字，不要像新闻播报\n"
             f"- 加上自己的评价/吐槽\n"
@@ -154,19 +166,19 @@ class TopicStarter:
     def should_send_proactive(self) -> bool:
         return self._proactive_count < self._max_proactive_per_silence
 
-    def generate_followup(self) -> list[str]:
+    def generate_followup(self, recent_context: str = "") -> list[str]:
         """对方没回复时的行为，根据 chase_ratio 决定。"""
         self._proactive_count += 1
 
         if self._chase_ratio < 0.05:
             self._last_proactive = []
             self._followup_count = 0
-            return self.generate()
+            return self.generate(recent_context=recent_context)
 
         if self._followup_count >= max(1, round(self._chase_ratio * 10)):
             self._last_proactive = []
             self._followup_count = 0
-            return self.generate()
+            return self.generate(recent_context=recent_context)
 
         name = self._persona.name
         last_msg = _MSG_SEPARATOR.join(self._last_proactive)
