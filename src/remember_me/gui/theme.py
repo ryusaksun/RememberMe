@@ -127,6 +127,26 @@ body::after {
     animation: glitch 0.3s ease-in-out;
 }
 
+/* 像素房间 */
+.pixel-room-panel {
+    background: #1a1520;
+    border-right: 1px solid rgba(0,255,213,0.15);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.pixel-room-status {
+    color: var(--text-dim) !important;
+    font-size: 11px !important;
+    letter-spacing: 1px;
+    text-align: center;
+    width: 100%%;
+    margin-top: 8px;
+}
+
 /* 消息样式 */
 .msg-target {
     color: var(--neon-cyan);
