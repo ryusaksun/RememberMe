@@ -3,10 +3,43 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
+import warnings
 from pathlib import Path
+
+# 屏蔽 sentence-transformers / HF 加载时的冗余输出
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
+warnings.filterwarnings("ignore", message=".*unauthenticated.*")
 
 import chromadb
 from chromadb.utils import embedding_functions
+
+_ef_instance: embedding_functions.SentenceTransformerEmbeddingFunction | None = None
+
+
+def _get_embedding_function() -> embedding_functions.SentenceTransformerEmbeddingFunction:
+    """懒加载嵌入模型，屏蔽加载时的冗余输出。"""
+    global _ef_instance
+    if _ef_instance is not None:
+        return _ef_instance
+    import io
+    import sys
+    # 模型加载时 HF/safetensors 直接 print，临时重定向 stdout/stderr
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        _ef_instance = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=_BGE_MODEL,
+        )
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+    return _ef_instance
 
 from remember_me.importers.base import ChatHistory
 
@@ -20,14 +53,21 @@ class MemoryStore:
         self._client = chromadb.PersistentClient(path=str(self._persist_dir))
         # ChromaDB collection name 只支持 ASCII，用哈希处理中文名
         self._safe_name = "mem_" + hashlib.md5(persona_name.encode()).hexdigest()[:12]
-        self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=_BGE_MODEL,
-        )
-        self._collection = self._client.get_or_create_collection(
-            name=self._safe_name,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=self._ef,
-        )
+        self._ef = _get_embedding_function()
+        try:
+            self._collection = self._client.get_or_create_collection(
+                name=self._safe_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._ef,
+            )
+        except ValueError:
+            # 嵌入模型变更（如从 default 迁移到 bge），删除旧 collection 重建
+            self._client.delete_collection(name=self._safe_name)
+            self._collection = self._client.get_or_create_collection(
+                name=self._safe_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._ef,
+            )
 
     def index_history(self, history: ChatHistory):
         """将聊天记录索引到向量数据库。按对话窗口分组存储。"""
