@@ -113,10 +113,13 @@ def _build_system_prompt(persona: Persona) -> str:
     return "\n".join(lines)
 
 
-def _split_reply(text: str) -> list[str]:
-    """将 ||| 分隔的回复拆成多条消息。"""
+def _split_reply(text: str, truncated: bool = False) -> list[str]:
+    """将 ||| 分隔的回复拆成多条消息。truncated=True 时丢弃最后一条不完整的消息。"""
     parts = text.split(_MSG_SEPARATOR)
-    return [p.strip() for p in parts if p.strip()]
+    result = [p.strip() for p in parts if p.strip()]
+    if truncated and len(result) > 1:
+        result = result[:-1]
+    return result
 
 
 class ChatEngine:
@@ -332,7 +335,7 @@ class ChatEngine:
                 config=types.GenerateContentConfig(
                     system_instruction=system,
                     temperature=0.8,
-                    max_output_tokens=1024,
+                    max_output_tokens=2048,
                 ),
             )
         except Exception:
@@ -341,6 +344,11 @@ class ChatEngine:
             raise
 
         raw_reply = response.text or ""
+        truncated = (
+            response.candidates
+            and response.candidates[0].finish_reason
+            and response.candidates[0].finish_reason.name == "MAX_TOKENS"
+        )
 
         self._history.append(types.Content(role="model", parts=[types.Part(text=raw_reply)]))
         self._trim_history()
@@ -349,7 +357,7 @@ class ChatEngine:
         if self._should_update_scratchpad():
             self._trigger_scratchpad_update()
 
-        messages = _split_reply(raw_reply)
+        messages = _split_reply(raw_reply, truncated=truncated)
         result = messages if messages else [raw_reply]
 
         # 按概率附加表情包
@@ -406,7 +414,7 @@ class ChatEngine:
                 config=types.GenerateContentConfig(
                     system_instruction=system,
                     temperature=0.8,
-                    max_output_tokens=1024,
+                    max_output_tokens=2048,
                 ),
             ):
                 text = chunk.text or ""

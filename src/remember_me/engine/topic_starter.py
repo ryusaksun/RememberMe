@@ -138,11 +138,16 @@ class TopicStarter:
             config=types.GenerateContentConfig(
                 system_instruction=self._system_prompt,
                 temperature=0.9,
-                max_output_tokens=1024,
+                max_output_tokens=2048,
             ),
         )
         raw = response.text or ""
-        messages = _split_reply(raw)
+        truncated = (
+            response.candidates
+            and response.candidates[0].finish_reason
+            and response.candidates[0].finish_reason.name == "MAX_TOKENS"
+        )
+        messages = _split_reply(raw, truncated=truncated)
         return [m for m in messages if m]
 
     def generate(self, topic: str | None = None, recent_context: str = "") -> list[str]:
