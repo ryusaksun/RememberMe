@@ -206,13 +206,13 @@ class TopicStarter:
         # Brave Search
         results = _brave_search(f"{search_hint}", count=5)
 
-        if not results:
-            return []
-
-        # 把搜索结果拼成上下文
-        news_context = f"今天是{today}。以下是搜索到的最新「{topic}」相关新闻：\n\n"
-        for i, r in enumerate(results, 1):
-            news_context += f"{i}. {r['title']}\n   {r['description']}\n\n"
+        # 把搜索结果拼成上下文（无结果时用纯话题生成）
+        if results:
+            news_context = f"今天是{today}。以下是搜索到的最新「{topic}」相关新闻：\n\n"
+            for i, r in enumerate(results, 1):
+                news_context += f"{i}. {r['title']}\n   {r['description']}\n\n"
+        else:
+            news_context = f"今天是{today}。话题方向：「{topic}」\n\n"
 
         # 如果有当前对话上下文，让模型判断是否适合插入
         chat_context = ""
@@ -224,17 +224,29 @@ class TopicStarter:
                 f"只有在对话已经聊得差不多了、或者话题比较轻松时，才自然地分享新闻。\n\n"
             )
 
-        prompt = (
-            f"{chat_context}"
-            f"{news_context}"
-            f"从上面的新闻中选一个最有意思的，用{name}的语气主动跟对方分享。\n"
-            f"如果你们刚才的话题还没聊完或比较重要，就先不分享新闻，而是接着之前的话题继续聊。\n\n"
-            f"要求：\n"
-            f"- 像是随手在聊天窗口打字，不要像新闻播报\n"
-            f"- 加上自己的评价/吐槽\n"
-            f"- 用 {_MSG_SEPARATOR} 分隔多条消息\n"
-            f"- 1-3 条短消息就够了\n"
-        )
+        if results:
+            prompt = (
+                f"{chat_context}"
+                f"{news_context}"
+                f"从上面的新闻中选一个最有意思的，用{name}的语气主动跟对方分享。\n"
+                f"如果你们刚才的话题还没聊完或比较重要，就先不分享新闻，而是接着之前的话题继续聊。\n\n"
+                f"要求：\n"
+                f"- 像是随手在聊天窗口打字，不要像新闻播报\n"
+                f"- 加上自己的评价/吐槽\n"
+                f"- 用 {_MSG_SEPARATOR} 分隔多条消息\n"
+                f"- 1-3 条短消息就够了\n"
+            )
+        else:
+            prompt = (
+                f"{chat_context}"
+                f"{news_context}"
+                f"用{name}的语气，主动跟对方聊点关于「{topic}」的话题。\n"
+                f"可以是分享自己最近的想法、推荐什么东西、吐槽某件事，或者问对方一个相关的问题。\n\n"
+                f"要求：\n"
+                f"- 像是随手在聊天窗口打字，自然随意\n"
+                f"- 用 {_MSG_SEPARATOR} 分隔多条消息\n"
+                f"- 1-3 条短消息就够了\n"
+            )
 
         msgs = self._generate_with_context(prompt)
         if msgs:

@@ -18,10 +18,17 @@ dependencies = [
     "qrcode>=7.4.0",
     "requests>=2.31.0",
     "Pillow>=10.0.0",
+    "nicegui>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.58.0",
 ]
 
 [project.scripts]
 remember-me = "remember_me.cli:cli"
+remember-me-gui = "remember_me.gui.app:main"
 
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10.0"]
