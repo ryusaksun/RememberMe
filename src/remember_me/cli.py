@@ -133,13 +133,81 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     console.print()
 
     import random
+    import threading
     import time as _time
+    from queue import Empty, Queue
 
     from remember_me.engine.topic_starter import TopicStarter
     topic_starter = TopicStarter(persona=persona, client=engine.client)
+    has_topics = bool(getattr(persona, "topic_interests", None))
 
-    # 主动开场消息
-    if not no_greet and getattr(persona, "topic_interests", None):
+    msg_queue: Queue = Queue()
+    last_activity = _time.time()
+    running = True
+
+    def _show_messages(msgs: list[str]):
+        """逐条展示消息（带延迟）。"""
+        msgs = [m for m in msgs if m and m.strip()]
+        if not msgs:
+            return
+        for i, msg in enumerate(msgs):
+            console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
+            if i < len(msgs) - 1:
+                _time.sleep(0.4 + random.random() * 0.8)
+        console.print()
+
+    # ── 用户输入线程 ──
+    def input_worker():
+        while running:
+            try:
+                text = input()
+                msg_queue.put(("user", text))
+            except (EOFError, KeyboardInterrupt):
+                msg_queue.put(("quit", ""))
+                break
+
+    input_thread = threading.Thread(target=input_worker, daemon=True)
+    input_thread.start()
+
+    # ── 后台主动消息线程 ──
+    proactive_cooldown = 60  # 发完一条后至少等 60 秒
+    next_proactive_at = _time.time() + random.randint(20, 45)
+
+    def proactive_worker():
+        nonlocal next_proactive_at
+        while running:
+            _time.sleep(2)
+            if not has_topics or not running:
+                continue
+            now = _time.time()
+            idle = now - last_activity
+            if idle > 15 and now > next_proactive_at:
+                # 检查是否还应该发主动消息（基于真人行为分析）
+                if not topic_starter.should_send_proactive():
+                    continue
+                try:
+                    if topic_starter._last_proactive:
+                        msgs = topic_starter.generate_followup()
+                    else:
+                        msgs = topic_starter.pop_cached()
+                        if not msgs:
+                            msgs = topic_starter.generate()
+                    if msgs:
+                        msg_queue.put(("proactive", msgs))
+                        next_proactive_at = now + proactive_cooldown + random.randint(0, 30)
+                except Exception:
+                    pass
+                if not topic_starter._last_proactive:
+                    try:
+                        topic_starter.prefetch()
+                    except Exception:
+                        pass
+
+    proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
+    proactive_thread.start()
+
+    # ── 主动开场消息 ──
+    if not no_greet and has_topics:
         status = console.status(f"  [dim]{name} 正在输入...[/]")
         status.start()
         greet_msgs = []
@@ -149,53 +217,57 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             pass
         status.stop()
 
+        greet_msgs = [m for m in greet_msgs if m and m.strip()]
         if greet_msgs:
-            for i, msg in enumerate(greet_msgs):
-                console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
-                if i < len(greet_msgs) - 1:
-                    _time.sleep(0.4 + random.random() * 0.8)
-            console.print()
+            _show_messages(greet_msgs)
             engine.inject_proactive_message(greet_msgs)
+            last_activity = _time.time()
+            next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
+            # 后台预缓存下一条
+            threading.Thread(target=topic_starter.prefetch, daemon=True).start()
 
-    while True:
+    # ── 主循环 ──
+    console.print("[bold green]你: [/]", end="")
+    while running:
         try:
-            user_input = console.input("[bold green]你: [/]")
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n")
-            break
-
-        user_input = user_input.strip()
-        if not user_input:
+            msg_type, data = msg_queue.get(timeout=1)
+        except Empty:
             continue
-        if user_input.lower() in ("quit", "exit", "q"):
+
+        if msg_type == "quit":
             console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
             break
 
-        try:
-            replies = engine.send_multi(user_input)
-            for i, reply in enumerate(replies):
-                console.print(f"[bold cyan]{name}[/]: {reply}", highlight=False)
-                if i < len(replies) - 1:
-                    _time.sleep(0.4 + random.random() * 0.8)
-        except Exception as e:
-            console.print(f"  [red]出错了: {e}[/]")
+        elif msg_type == "user":
+            user_input = data.strip()
+            if not user_input:
+                console.print("[bold green]你: [/]", end="")
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
+                break
+            topic_starter.on_user_replied()
 
-        console.print()
-
-        # 冷场检测：有概率主动转换话题
-        if engine.detect_cold_chat() and random.random() < 0.3:
-            _time.sleep(1.5 + random.random())
+            last_activity = _time.time()
             try:
-                cold_msgs = topic_starter.generate_cold_topic()
-                if cold_msgs:
-                    for i, msg in enumerate(cold_msgs):
-                        console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
-                        if i < len(cold_msgs) - 1:
-                            _time.sleep(0.4 + random.random() * 0.8)
-                    console.print()
-                    engine.inject_proactive_message(cold_msgs)
-            except Exception:
-                pass
+                replies = engine.send_multi(user_input)
+                _show_messages(replies)
+            except Exception as e:
+                console.print(f"  [red]出错了: {e}[/]")
+                console.print()
+
+            last_activity = _time.time()
+            console.print("[bold green]你: [/]", end="")
+
+        elif msg_type == "proactive":
+            # 主动消息打断时，先换行再显示
+            console.print()
+            _show_messages(data)
+            engine.inject_proactive_message(data)
+            last_activity = _time.time()
+            console.print("[bold green]你: [/]", end="")
+
+    running = False
 
 
 @cli.command()

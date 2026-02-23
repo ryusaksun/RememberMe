@@ -64,6 +64,7 @@ class Persona:
     greeting_patterns: list[str] = field(default_factory=list)
     farewell_patterns: list[str] = field(default_factory=list)
     self_references: list[str] = field(default_factory=list)     # 自称方式
+    chase_ratio: float = 0.0                                      # 用户沉默后追发的概率
 
     # 话题偏好
     topic_keywords: list[str] = field(default_factory=list)
@@ -306,6 +307,31 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     burst_ratio = _analyze_burst_ratio(history)
     avg_burst_length, burst_distribution = _analyze_burst_pattern(history)
 
+    # ── 用户沉默后追发概率 ──
+    chase_count = 0
+    no_chase_count = 0
+    idx = 0
+    while idx < len(history.messages) - 1:
+        if history.messages[idx].is_target:
+            end = idx
+            while end < len(history.messages) and history.messages[end].is_target:
+                end += 1
+            if end < len(history.messages):
+                last_ts = history.messages[end - 1].timestamp
+                next_msg = history.messages[end]
+                if last_ts and next_msg.timestamp:
+                    gap = (next_msg.timestamp - last_ts).total_seconds()
+                    if gap > 300:
+                        if next_msg.is_target:
+                            chase_count += 1
+                        else:
+                            no_chase_count += 1
+            idx = end
+        else:
+            idx += 1
+    chase_total = chase_count + no_chase_count
+    chase_ratio = round(chase_count / max(chase_total, 1), 3)
+
     # ── 打招呼 & 告别 ──
     greeting_patterns, farewell_patterns = _analyze_greetings_farewells(contents)
 
@@ -338,18 +364,23 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     self_references = [label for label, pattern in self_ref_map.items()
                        if sum(1 for c in contents if re.search(pattern, c)) >= 5]
 
-    # ── 话题兴趣 ──
+    # ── 话题兴趣（精细化，区分子类别） ──
+    # 先过滤掉含 URL 的消息（避免 https 中的 ps 等误匹配）
+    contents_no_url = [c for c in contents if "http" not in c and "douyin" not in c]
     topic_defs = {
-        "游戏": r"(游戏|王者|排位|上号|吃鸡|打游戏|五排|双排|连跪|段位|吕布|联盟)",
-        "音乐": r"(听歌|歌|耳机|音乐|音乐节|专辑)",
-        "学习": r"(学习|上课|作业|考试|ppt|老师|学年|学期|宿舍)",
-        "影视": r"(电影|电视|追|剧|动漫|漫画)",
-        "美食": r"(吃|好吃|恰|麻辣|米线|外卖|饭|烧烤|奶茶)",
-        "吐槽": r"(无语|离谱|笑死|受不了|绝了|我靠|服了)",
+        "手游/王者荣耀": r"(王者|排位|上号|五排|双排|连跪|段位|钻石|铂金|星耀|吕布|韩信|甄姬|匹配|mvp|吃鸡|和平精英|荣耀)",
+        "游戏(泛)": r"(游戏|打游戏)",
+        "电竞赛事": r"(edg|dk|rng|比赛|世界赛|msi|战队)",
+        "音乐": r"(听歌|歌[^词]|耳机|音乐|音乐节|专辑|演唱会)",
+        "学习/校园": r"(学习|上课|作业|考试|ppt|老师|学年|学期|宿舍|体测)",
+        "影视/追剧": r"(电影|电视|追剧|动漫|漫画|哈利波特|弥留)",
+        "美食": r"(好吃|恰|麻辣|米线|外卖|烧烤|奶茶|火锅|肥牛)",
+        "吐槽/搞笑": r"(无语|离谱|笑死|受不了|绝了|我靠|服了|搞笑)",
+        "日常生活": r"(睡觉|起床|洗澡|出门|回家|快递|天气)",
     }
     topic_interests = {}
     for topic, pattern in topic_defs.items():
-        cnt = sum(1 for c in contents if re.search(pattern, c, re.I))
+        cnt = sum(1 for c in contents_no_url if re.search(pattern, c, re.I))
         if cnt >= 10:
             topic_interests[topic] = cnt
 
@@ -468,6 +499,7 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         burst_ratio=burst_ratio,
         avg_burst_length=avg_burst_length,
         burst_distribution=burst_distribution,
+        chase_ratio=chase_ratio,
         greeting_patterns=greeting_patterns,
         farewell_patterns=farewell_patterns,
         self_references=self_references,

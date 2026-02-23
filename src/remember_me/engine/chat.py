@@ -171,7 +171,7 @@ class ChatEngine:
             config=types.GenerateContentConfig(
                 system_instruction=system,
                 temperature=0.8,
-                max_output_tokens=512,
+                max_output_tokens=1024,
             ),
         )
 
@@ -201,7 +201,7 @@ class ChatEngine:
             config=types.GenerateContentConfig(
                 system_instruction=system,
                 temperature=0.8,
-                max_output_tokens=512,
+                max_output_tokens=1024,
             ),
         ):
             text = chunk.text or ""
