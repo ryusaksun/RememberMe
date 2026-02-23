@@ -114,11 +114,14 @@ def _build_system_prompt(persona: Persona) -> str:
 
 
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
-    """将 ||| 分隔的回复拆成多条消息。truncated=True 时丢弃最后一条不完整的消息。"""
+    """将 ||| 分隔的回复拆成多条消息。自动检测并丢弃截断的末尾消息。"""
     parts = text.split(_MSG_SEPARATOR)
     result = [p.strip() for p in parts if p.strip()]
-    if truncated and len(result) > 1:
-        result = result[:-1]
+    if len(result) > 1:
+        # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
+        avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
+        if truncated or (len(result[-1]) <= 2 and avg_len > 4):
+            result = result[:-1]
     return result
 
 
