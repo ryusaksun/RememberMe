@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re as _re
 from datetime import date
+
+logger = logging.getLogger(__name__)
 
 import requests as _requests
 from google import genai
@@ -19,6 +22,8 @@ _TOPIC_SEARCH_HINTS = {
     "游戏(泛)": "手游新闻 王者荣耀 热门手游",
     "电竞赛事": "电竞比赛 LPL赛程 英雄联盟赛事",
     "音乐": "最新音乐 新歌发布 音乐节 演唱会",
+    "音乐/rap": "姜云升 说唱 rapper 新歌 中文rap",
+    "滑板": "滑板 skateboard 滑板技巧 滑板赛事",
     "美食": "美食热搜 网红美食 新开的餐厅",
     "影视/追剧": "最新电影 热播电视剧 新番动漫",
     "学习/校园": "大学生 校园热点 大学生活",
@@ -33,6 +38,7 @@ def _brave_search(query: str, count: int = 5) -> list[dict]:
     """调用 Brave Search API 搜索。返回 [{title, description, url}]。"""
     api_key = os.environ.get("BRAVE_API_KEY", "")
     if not api_key:
+        logger.warning("BRAVE_API_KEY 未设置，跳过搜索")
         return []
 
     try:
@@ -52,7 +58,14 @@ def _brave_search(query: str, count: int = 5) -> list[dict]:
                 "url": item.get("url", ""),
             })
         return results
-    except Exception:
+    except _requests.Timeout:
+        logger.warning("Brave Search 超时: %s", query)
+        return []
+    except _requests.HTTPError as e:
+        logger.warning("Brave Search API 错误 %s: %s", e.response.status_code, query)
+        return []
+    except Exception as e:
+        logger.warning("Brave Search 异常: %s", e)
         return []
 
 
@@ -63,25 +76,40 @@ class TopicStarter:
         self._persona = persona
         self._client = client
         self._system_prompt = _build_system_prompt(persona)
-        self._used_topics: list[str] = []
+        self._used_topics: set[str] = set()
         self._cached: list[str] | None = None
         self._last_proactive: list[str] = []
         self._followup_count = 0
         self._proactive_count = 0
         self._chase_ratio = getattr(persona, "chase_ratio", 0.0)
-        if self._chase_ratio < 0.05:
+        avg_burst = getattr(persona, "avg_burst_length", 1.0)
+        # 综合评分：chase_ratio 为主，avg_burst_length 为辅
+        chase_score = self._chase_ratio * 0.7 + min((avg_burst - 1) * 0.1, 0.3)
+        if chase_score < 0.05:
             self._max_proactive_per_silence = 1
-        elif self._chase_ratio < 0.2:
+        elif chase_score < 0.15:
             self._max_proactive_per_silence = 2
         else:
             self._max_proactive_per_silence = 3
 
     def prefetch(self):
+        """后台预生成消息，不修改任何状态。"""
+        # 保存并恢复状态，防止 generate() 的副作用
+        saved_last = self._last_proactive
+        saved_followup = self._followup_count
+        saved_proactive = self._proactive_count
         self._cached = self.generate()
+        self._last_proactive = saved_last
+        self._followup_count = saved_followup
+        self._proactive_count = saved_proactive
 
     def pop_cached(self) -> list[str] | None:
         cached = self._cached
         self._cached = None
+        if cached:
+            self._last_proactive = cached
+            self._followup_count = 0
+            self._proactive_count += 1
         return cached
 
     def pick_topic(self) -> str | None:
@@ -90,12 +118,16 @@ class TopicStarter:
             return None
         available = {t: w for t, w in interests.items() if t not in self._used_topics}
         if not available:
+            # 保留上一个话题，避免清空后立即重复
+            last = self._used_topics.copy()
             self._used_topics.clear()
-            available = dict(interests)
+            available = {t: w for t, w in interests.items() if t not in last}
+            if not available:
+                available = dict(interests)
         topics = list(available.keys())
         weights = [available[t] for t in topics]
         chosen = random.choices(topics, weights=weights, k=1)[0]
-        self._used_topics.append(chosen)
+        self._used_topics.add(chosen)
         return chosen
 
     def _generate_with_context(self, prompt: str) -> list[str]:
@@ -161,6 +193,7 @@ class TopicStarter:
         if msgs:
             self._last_proactive = msgs
             self._followup_count = 0
+            self._proactive_count += 1
         return msgs
 
     def should_send_proactive(self) -> bool:
@@ -168,7 +201,6 @@ class TopicStarter:
 
     def generate_followup(self, recent_context: str = "") -> list[str]:
         """对方没回复时的行为，根据 chase_ratio 决定。"""
-        self._proactive_count += 1
 
         if self._chase_ratio < 0.05:
             self._last_proactive = []
@@ -192,6 +224,7 @@ class TopicStarter:
         msgs = self._generate_with_context(prompt)
         if msgs:
             self._followup_count += 1
+            self._proactive_count += 1
         return msgs
 
     def on_user_replied(self):

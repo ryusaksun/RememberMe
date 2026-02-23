@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import click
 from dotenv import load_dotenv
@@ -67,15 +70,17 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
     console.print(f"  [green]✓[/] 聊天记录已保存: {history_path}")
 
     # 分析人格
-    persona = analyze(history)
+    with console.status("  [dim]正在分析人格特征...[/]"):
+        persona = analyze(history)
     profile_path = PROFILES_DIR / f"{target}.json"
     persona.save(profile_path)
     console.print(f"  [green]✓[/] 人格分析完成")
     console.print(f"    说话风格: {persona.style_summary}")
 
     # 建立记忆索引
-    store = MemoryStore(CHROMA_DIR / target, persona_name=target)
-    store.index_history(history)
+    with console.status("  [dim]正在建立记忆索引...[/]"):
+        store = MemoryStore(CHROMA_DIR / target, persona_name=target)
+        store.index_history(history)
     console.print(f"  [green]✓[/] 记忆索引已建立")
 
     console.print(f"\n  人格档案已保存: [bold]{profile_path}[/]")
@@ -115,8 +120,8 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     if sticker_path.exists():
         try:
             sticker_lib = StickerLibrary.load(sticker_path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("加载表情包库失败: %s", e)
 
     engine = ChatEngine(persona=persona, memory=memory, api_key=api_key, sticker_lib=sticker_lib)
 
@@ -159,8 +164,18 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     has_topics = bool(getattr(persona, "topic_interests", None))
 
     msg_queue: Queue = Queue()
+    _activity_lock = threading.Lock()
     last_activity = _time.time()
     running = True
+
+    def _update_activity():
+        nonlocal last_activity
+        with _activity_lock:
+            last_activity = _time.time()
+
+    def _get_idle_seconds() -> float:
+        with _activity_lock:
+            return _time.time() - last_activity
 
     def _show_messages(msgs: list[str]):
         """逐条展示消息（带延迟）。支持 [sticker:path] 格式。"""
@@ -201,7 +216,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             if not has_topics or not running:
                 continue
             now = _time.time()
-            idle = now - last_activity
+            idle = _get_idle_seconds()
             if idle > 15 and now > next_proactive_at:
                 # 检查是否还应该发主动消息
                 if not topic_starter.should_send_proactive():
@@ -220,13 +235,13 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     if msgs:
                         msg_queue.put(("proactive", msgs))
                         next_proactive_at = now + proactive_cooldown + random.randint(0, 30)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("主动消息生成失败: %s", e)
                 if not topic_starter._last_proactive:
                     try:
                         topic_starter.prefetch()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("预缓存失败: %s", e)
 
     # ── 主动开场消息（在后台线程启动之前） ──
     if not no_greet and has_topics:
@@ -245,14 +260,16 @@ def chat(name: str, api_key: str | None, no_greet: bool):
         if greet_msgs:
             _show_messages(greet_msgs)
             engine.inject_proactive_message(greet_msgs)
-            last_activity = _time.time()
+            _update_activity()
             next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
             # 后台预缓存下一条
             threading.Thread(target=topic_starter.prefetch, daemon=True).start()
 
     # 开场完成后再启动后台主动消息线程
-    last_activity = _time.time()
-    next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
+    _update_activity()
+    # 仅在未被开场消息设置过时初始化 cooldown
+    if next_proactive_at <= _time.time():
+        next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
     proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
     proactive_thread.start()
 
@@ -269,8 +286,8 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             new_msgs = engine.get_new_messages(history_start_index)
             if new_msgs and memory:
                 memory.add_messages(new_msgs)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("保存会话失败: %s", e)
 
     import atexit
     atexit.register(_save_session)
@@ -298,7 +315,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     break
                 topic_starter.on_user_replied()
 
-                last_activity = _time.time()
+                _update_activity()
                 try:
                     replies = engine.send_multi(user_input)
                     _show_messages(replies)
@@ -306,7 +323,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     console.print(f"  [red]出错了: {e}[/]")
                     console.print()
 
-                last_activity = _time.time()
+                _update_activity()
                 console.print("[bold green]你: [/]", end="")
 
             elif msg_type == "proactive":
@@ -314,13 +331,13 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                 if engine.is_conversation_ended():
                     continue
                 # 刚回复完用户消息，丢弃过时的主动消息（竞态：生成期间用户发了新消息）
-                if _time.time() - last_activity < 15:
+                if _get_idle_seconds() < 15:
                     continue
                 # 主动消息打断时，先换行再显示
                 console.print()
                 _show_messages(data)
                 engine.inject_proactive_message(data)
-                last_activity = _time.time()
+                _update_activity()
                 console.print("[bold green]你: [/]", end="")
     except KeyboardInterrupt:
         console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
@@ -460,15 +477,17 @@ def import_netease(cookie: str | None):
     console.print(f"  [green]✓[/] 聊天记录已保存: {history_path}")
 
     # 分析人格
-    persona = analyze(history)
+    with console.status("  [dim]正在分析人格特征...[/]"):
+        persona = analyze(history)
     profile_path = PROFILES_DIR / f"{target_name}.json"
     persona.save(profile_path)
     console.print(f"  [green]✓[/] 人格分析完成")
     console.print(f"    说话风格: {persona.style_summary}")
 
     # 建立记忆索引
-    store = MemoryStore(CHROMA_DIR / target_name, persona_name=target_name)
-    store.index_history(history)
+    with console.status("  [dim]正在建立记忆索引...[/]"):
+        store = MemoryStore(CHROMA_DIR / target_name, persona_name=target_name)
+        store.index_history(history)
     console.print(f"  [green]✓[/] 记忆索引已建立")
 
     # 分类表情包

@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import random
+import re
+import threading
+from datetime import datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
 from google import genai
 from google.genai import types
 
 from remember_me.analyzer.persona import Persona
+from remember_me.memory.scratchpad import Scratchpad, update_scratchpad
 from remember_me.memory.store import MemoryStore
 
 _MSG_SEPARATOR = "|||"
@@ -109,12 +120,19 @@ def _split_reply(text: str) -> list[str]:
 
 
 class ChatEngine:
-    def __init__(self, persona: Persona, memory: MemoryStore | None = None, api_key: str | None = None):
+    def __init__(self, persona: Persona, memory: MemoryStore | None = None,
+                 api_key: str | None = None, sticker_lib=None):
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY 未提供，无法初始化对话引擎")
         self._persona = persona
         self._memory = memory
         self._system_prompt = _build_system_prompt(persona)
         self._client = genai.Client(api_key=api_key)
         self._history: list[types.Content] = []
+        self._sticker_lib = sticker_lib
+        self._sticker_probability = 0.14  # 约 14% 概率发表情包（基于真人数据）
+        self._scratchpad = Scratchpad()
+        self._scratchpad_updating = False
 
     @property
     def client(self) -> genai.Client:
@@ -148,20 +166,71 @@ class ChatEngine:
                 lines.append(f"{role}: {h.parts[0].text[:100]}")
         return "\n".join(lines)
 
+    def is_conversation_ended(self) -> bool:
+        """检测最近对话是否已自然结束（说了再见/去忙了）。"""
+        if not self._history:
+            return False
+        # 检查最后几条消息
+        for h in reversed(self._history[-4:]):
+            if h.parts and h.parts[0].text:
+                text = h.parts[0].text.lower()
+                if re.search(r"(再见|拜拜|bye|晚安|睡了|去了|走了|滚|不聊|去忙|"
+                             r"不说了|激情王者|大开杀戒|去打游戏|上号去)", text):
+                    return True
+        return False
+
+    _TRIVIAL_RE = re.compile(
+        r"^(嗯|好|哈+|呵呵|ok|行|对|是|啊|哦|嗯嗯|好的|可以|没|没有|知道了|了解|真的|可以吧|好吧|嘻嘻)$", re.I,
+    )
+
+    def _expand_query(self, user_input: str) -> str:
+        """对短/无意义消息用最近对话上下文扩展查询。"""
+        if len(user_input) <= 4 or self._TRIVIAL_RE.match(user_input.strip()):
+            recent = [
+                h.parts[0].text[:80]
+                for h in self._history[-6:]
+                if h.parts and h.parts[0].text
+            ]
+            if recent:
+                return " ".join(recent[-3:])
+        return user_input
+
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（基础 + RAG 上下文）。"""
-        context_parts = []
+        """构建 system prompt（基础 + 中期记忆 + RAG 上下文）。"""
+        system = self._system_prompt
+
+        # 中期记忆（scratchpad）
+        scratchpad_block = self._scratchpad.to_prompt_block()
+        if scratchpad_block:
+            system = system + "\n\n" + scratchpad_block
+
+        # 长期记忆（RAG）
         if self._memory:
-            relevant = self._memory.search(user_input, top_k=8)
-            if relevant:
-                context_parts.append("## 你们过去聊到类似话题时的真实对话（参考这些来回复，而不是编造）")
-                for fragment in relevant:
+            query = self._expand_query(user_input)
+            raw_results = self._memory.search(query, top_k=5)
+
+            # 过滤低相关性结果 + 按行重叠率去重（overlap 窗口可能返回相似内容）
+            seen_lines: set[str] = set()
+            filtered: list[str] = []
+            best_dist = raw_results[0][1] if raw_results else 0.0
+            # 相对阈值：距离不超过最优结果的 2 倍，且绝对值不超过 1.2
+            max_dist = min(best_dist * 2.0, 1.2)
+            for doc, dist in raw_results:
+                if dist > max_dist:
+                    continue
+                lines = set(doc.strip().split("\n"))
+                overlap = len(lines & seen_lines) / len(lines) if lines else 1.0
+                if overlap < 0.5:
+                    filtered.append(doc)
+                    seen_lines.update(lines)
+
+            if filtered:
+                context_parts = ["## 你们过去聊到类似话题时的真实对话（参考这些来回复，而不是编造）"]
+                for fragment in filtered[:5]:
                     context_parts.append(fragment)
                     context_parts.append("---")
+                system = system + "\n\n" + "\n".join(context_parts)
 
-        system = self._system_prompt
-        if context_parts:
-            system = system + "\n\n" + "\n".join(context_parts)
         return system
 
     def _trim_history(self):
@@ -169,29 +238,153 @@ class ChatEngine:
         if len(self._history) > max_turns:
             self._history = self._history[-max_turns:]
 
+    def save_session(self, path: str | Path):
+        """将对话历史保存到文件。"""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "name": self._persona.name,
+            "updated_at": datetime.now().isoformat(),
+            "history": [
+                {"role": h.role, "text": h.parts[0].text if h.parts else ""}
+                for h in self._history
+            ],
+            "scratchpad": self._scratchpad.to_dict(),
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_session(self, path: str | Path) -> bool:
+        """从文件恢复对话历史。返回是否成功加载。"""
+        path = Path(path)
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._history = [
+                types.Content(role=h["role"], parts=[types.Part(text=h["text"])])
+                for h in data.get("history", [])
+            ]
+            self._trim_history()
+            if data.get("scratchpad"):
+                self._scratchpad = Scratchpad.from_dict(data["scratchpad"])
+            return bool(self._history)
+        except Exception as e:
+            logger.warning("加载会话失败: %s", e)
+            return False
+
+    def get_new_messages(self, start_index: int = 0) -> list[dict]:
+        """获取从 start_index 开始的新消息（用于写入向量库）。"""
+        result = []
+        for h in self._history[start_index:]:
+            if h.parts and h.parts[0].text:
+                result.append({"role": h.role, "text": h.parts[0].text})
+        return result
+
+    # ── 中期记忆（Scratchpad）更新 ──
+
+    def _should_update_scratchpad(self) -> bool:
+        if self._scratchpad_updating:
+            return False
+        turns_since = len(self._history) - self._scratchpad.last_update_turn
+        if self._scratchpad.last_update_turn == 0 and turns_since >= 4:
+            return True
+        return turns_since >= 6
+
+    def _get_messages_since_last_update(self) -> list[dict]:
+        result = []
+        for h in self._history[self._scratchpad.last_update_turn:]:
+            if h.parts and h.parts[0].text:
+                result.append({"role": h.role, "text": h.parts[0].text})
+        return result
+
+    def _trigger_scratchpad_update(self):
+        if self._scratchpad_updating:
+            return
+        recent = self._get_messages_since_last_update()
+        if not recent:
+            return
+        self._scratchpad_updating = True
+        current_turn = len(self._history)
+
+        def _do_update():
+            try:
+                new_pad = update_scratchpad(self._client, self._scratchpad, recent)
+                new_pad.last_update_turn = current_turn
+                self._scratchpad = new_pad
+            except Exception as e:
+                logger.debug("Scratchpad 更新失败: %s", e)
+            finally:
+                self._scratchpad_updating = False
+
+        threading.Thread(target=_do_update, daemon=True).start()
+
     def send_multi(self, user_input: str) -> list[str]:
         """发送消息并获取多条回复（模拟连发）。"""
         system = self._build_system(user_input)
 
-        self._history.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
+        user_msg = types.Content(role="user", parts=[types.Part(text=user_input)])
+        self._history.append(user_msg)
 
-        response = self._client.models.generate_content(
-            model="gemini-3.1-pro-preview",
-            contents=self._history,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.8,
-                max_output_tokens=1024,
-            ),
-        )
+        try:
+            response = self._client.models.generate_content(
+                model="gemini-3.1-pro-preview",
+                contents=self._history,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.8,
+                    max_output_tokens=1024,
+                ),
+            )
+        except Exception:
+            # API 失败时回滚用户消息，避免污染历史
+            self._history.pop()
+            raise
 
         raw_reply = response.text or ""
 
         self._history.append(types.Content(role="model", parts=[types.Part(text=raw_reply)]))
         self._trim_history()
 
+        # 异步更新中期记忆
+        if self._should_update_scratchpad():
+            self._trigger_scratchpad_update()
+
         messages = _split_reply(raw_reply)
-        return messages if messages else [raw_reply]
+        result = messages if messages else [raw_reply]
+
+        # 按概率附加表情包
+        result = self._maybe_attach_sticker(result)
+        return result
+
+    def _maybe_attach_sticker(self, replies: list[str]) -> list[str]:
+        """按概率在回复后附加一张表情包。"""
+        if not self._sticker_lib or not self._sticker_lib.stickers:
+            return replies
+        if random.random() > self._sticker_probability:
+            return replies
+
+        # 根据回复内容判断情感
+        combined = " ".join(replies)
+        emotion = self._detect_emotion(combined)
+        sticker = self._sticker_lib.random_sticker(emotion)
+        if sticker:
+            replies.append(f"[sticker:{sticker.path}]")
+        return replies
+
+    @staticmethod
+    def _detect_emotion(text: str) -> str:
+        """简单情感检测。"""
+        patterns = {
+            "搞笑": r"(哈|笑|搞笑|笑死|好笑|离谱|绝了)",
+            "喜爱": r"(爱|心|宝贝|想你|喜欢|可爱|好看)",
+            "愤怒": r"(靠|妈的|吗的|操|气|烦|傻|几把|屎)",
+            "难过": r"(呜|哭|难过|伤心|惨|寄|完蛋)",
+            "震惊": r"(卧槽|我靠|天|啥|什么|真的假的)",
+        }
+        for emotion, pattern in patterns.items():
+            if re.search(pattern, text):
+                return emotion
+        return "通用"
 
     def send(self, user_input: str) -> str:
         """发送消息并获取单条回复。"""
@@ -202,23 +395,33 @@ class ChatEngine:
         """流式发送消息，yield 每个文本片段。"""
         system = self._build_system(user_input)
 
-        self._history.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
+        user_msg = types.Content(role="user", parts=[types.Part(text=user_input)])
+        self._history.append(user_msg)
 
         full_reply = []
-        for chunk in self._client.models.generate_content_stream(
-            model="gemini-3.1-pro-preview",
-            contents=self._history,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.8,
-                max_output_tokens=1024,
-            ),
-        ):
-            text = chunk.text or ""
-            full_reply.append(text)
-            yield text
+        try:
+            for chunk in self._client.models.generate_content_stream(
+                model="gemini-3.1-pro-preview",
+                contents=self._history,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.8,
+                    max_output_tokens=1024,
+                ),
+            ):
+                text = chunk.text or ""
+                full_reply.append(text)
+                yield text
+        except Exception:
+            # API 失败时回滚用户消息，避免污染历史
+            self._history.pop()
+            raise
 
         self._history.append(
             types.Content(role="model", parts=[types.Part(text="".join(full_reply))])
         )
         self._trim_history()
+
+        # 异步更新中期记忆
+        if self._should_update_scratchpad():
+            self._trigger_scratchpad_update()

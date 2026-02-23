@@ -238,7 +238,7 @@ def _analyze_topic_keywords(contents: list[str]) -> list[str]:
         # 跳过含 URL 的消息
         if "http" in c or "douyin" in c:
             continue
-        segments = re.split(r"[，。！？,.\s!?~…、；;：:""''\"'()\[\]【】]+", c)
+        segments = re.split(r"[，。！？,.\s!?~…、；;：:""''\"'()\\[\\]【】]+", c)
         for seg in segments:
             seg = seg.strip()
             if len(seg) < 2 or len(seg) > 8:
@@ -289,7 +289,7 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         r"|https?|douyin|com|www|mp4|html|//v"
         r"|哈{3,}笑|笑死哈|哈{3,}过)$"
     )
-    threshold = max(5, total * 0.001)  # 0.1% 阈值
+    threshold = max(3, total * 0.0005)  # 0.05% 阈值，捕获更多特色表达
     catchphrases = [p for p, count in phrase_counter.most_common(100)
                     if count >= threshold
                     and not _noise_phrase_re.match(p)][:30]
@@ -308,27 +308,45 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     avg_burst_length, burst_distribution = _analyze_burst_pattern(history)
 
     # ── 用户沉默后追发概率 ──
+    # 定义：target 发完一段消息后，用户超过5分钟没回复，
+    # 如果 target 又主动发了新消息（中间没有用户消息），算"追发"。
     chase_count = 0
     no_chase_count = 0
+    msgs = history.messages
     idx = 0
-    while idx < len(history.messages) - 1:
-        if history.messages[idx].is_target:
-            end = idx
-            while end < len(history.messages) and history.messages[end].is_target:
-                end += 1
-            if end < len(history.messages):
-                last_ts = history.messages[end - 1].timestamp
-                next_msg = history.messages[end]
-                if last_ts and next_msg.timestamp:
-                    gap = (next_msg.timestamp - last_ts).total_seconds()
-                    if gap > 300:
-                        if next_msg.is_target:
-                            chase_count += 1
-                        else:
-                            no_chase_count += 1
-            idx = end
-        else:
+    while idx < len(msgs):
+        if not msgs[idx].is_target:
             idx += 1
+            continue
+        # 找到 target 连发的结束位置
+        burst_end = idx
+        while burst_end < len(msgs) and msgs[burst_end].is_target:
+            burst_end += 1
+        last_target_ts = msgs[burst_end - 1].timestamp
+        # burst_end 现在指向第一条非 target 消息（或末尾）
+        if burst_end < len(msgs) and last_target_ts:
+            next_msg = msgs[burst_end]
+            if next_msg.timestamp:
+                gap = (next_msg.timestamp - last_target_ts).total_seconds()
+                if gap > 300:
+                    # 超过5分钟后，是用户回复还是 target 又追发？
+                    # 但 burst_end 处必然是用户消息，需要看得更远：
+                    # 往后找下一条 target 消息，看它和 burst_end-1 的间隔
+                    no_chase_count += 1  # 默认算用户回复了
+        # 检查：是否存在"target连发 → 长间隔 → target再发"（中间无用户消息）
+        # 即 burst_end == len(msgs)（对话结束）或者连续两段 target 之间有长间隔
+        # 实际上需要检查同一段连发内部是否有长间隔
+        if burst_end - idx >= 2 and last_target_ts:
+            for k in range(idx + 1, burst_end):
+                prev_ts = msgs[k - 1].timestamp
+                curr_ts = msgs[k].timestamp
+                if prev_ts and curr_ts:
+                    internal_gap = (curr_ts - prev_ts).total_seconds()
+                    if internal_gap > 300:
+                        # 同一段 target 连发中出现 >5分钟间隔 = 追发行为
+                        chase_count += 1
+                        break
+        idx = burst_end
     chase_total = chase_count + no_chase_count
     chase_ratio = round(chase_count / max(chase_total, 1), 3)
 
@@ -379,9 +397,10 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         "日常生活": r"(睡觉|起床|洗澡|出门|回家|快递|天气)",
     }
     topic_interests = {}
+    topic_threshold = max(3, len(contents_no_url) * 0.005)
     for topic, pattern in topic_defs.items():
         cnt = sum(1 for c in contents_no_url if re.search(pattern, c, re.I))
-        if cnt >= 10:
+        if cnt >= topic_threshold:
             topic_interests[topic] = cnt
 
     # ── 典型对话样例（均匀采样） ──

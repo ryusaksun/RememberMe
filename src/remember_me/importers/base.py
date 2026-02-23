@@ -52,10 +52,10 @@ class ChatHistory:
                 j = i + 1
                 while j < len(self.messages) and self.messages[j].is_target:
                     c = self.messages[j].content
-                    if not c.startswith("["):
+                    if not c.startswith("[") and len(c) >= 2:
                         replies.append(c)
                     j += 1
-                if replies and len(user_msg) > 1:
+                if replies and len(user_msg) >= 2:
                     segments.append((user_msg, replies))
                 i = j
             else:
