@@ -391,10 +391,11 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         "电竞赛事": r"(edg|dk|rng|比赛|世界赛|msi|战队)",
         "音乐": r"(听歌|歌[^词]|耳机|音乐|音乐节|专辑|演唱会)",
         "学习/校园": r"(学习|上课|作业|考试|ppt|老师|学年|学期|宿舍|体测)",
-        "影视/追剧": r"(电影|电视|追剧|动漫|漫画|哈利波特|弥留)",
+        "影视/追剧": r"(电影|电视|追剧|动漫|漫画|哈利波特|弥留|B站|b站|番剧)",
         "美食": r"(好吃|恰|麻辣|米线|外卖|烧烤|奶茶|火锅|肥牛)",
         "吐槽/搞笑": r"(无语|离谱|笑死|受不了|绝了|我靠|服了|搞笑)",
         "日常生活": r"(睡觉|起床|洗澡|出门|回家|快递|天气)",
+        "热搜/社交": r"(热搜|微博|知乎|最右|b站|B站|抖音|小红书|豆瓣|吃瓜|八卦|热帖)",
     }
     topic_interests = {}
     topic_threshold = max(3, len(contents_no_url) * 0.005)
@@ -402,6 +403,9 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         cnt = sum(1 for c in contents_no_url if re.search(pattern, c, re.I))
         if cnt >= topic_threshold:
             topic_interests[topic] = cnt
+    # 兜底：保证"热搜/社交"始终存在（低权重），让主动消息有更多话题来源
+    if "热搜/社交" not in topic_interests:
+        topic_interests["热搜/社交"] = max(1, topic_threshold)
 
     # ── 典型对话样例（均匀采样） ──
     pairs = history.as_dialogue_pairs()
