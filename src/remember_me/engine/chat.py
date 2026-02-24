@@ -250,7 +250,7 @@ class ChatEngine:
         with self._state_lock:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
-            burst_hint = self._emotion_state.burst_hint(self._persona, user_input) if emotion_block else ""
+            burst_hint = self._emotion_state.burst_hint(self._persona) if emotion_block else ""
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
@@ -414,7 +414,7 @@ class ChatEngine:
         with self._state_lock:
             self._emotion_state.decay(self._persona)
             mods = self._emotion_state.get_modifiers(self._persona)
-            burst_range = self._emotion_state.compute_burst_range(self._persona, user_input)
+            burst_range = self._emotion_state.compute_burst_range(self._persona)
 
         # 根据 burst 范围动态计算 token 预算（下限 512，保证多条短消息有足够空间）
         _low, high = burst_range
