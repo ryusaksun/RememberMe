@@ -44,7 +44,7 @@ class EmotionModifiers:
     sticker_probability: float = 0.14
     reply_delay_factor: float = 1.0
     proactive_cooldown_factor: float = 1.0
-    max_output_tokens: int = 2048
+    max_output_tokens: int = 1024
 
 
 @dataclass
@@ -202,13 +202,13 @@ class EmotionState:
         else:
             mods.proactive_cooldown_factor = 1.0
 
-        # max_output_tokens
+        # max_output_tokens（控制总输出长度，防止过多条消息）
         if v < -0.3 and a < 0:
-            mods.max_output_tokens = 1024
+            mods.max_output_tokens = 512
         elif v < -0.3 and a > 0.3:
-            mods.max_output_tokens = 1536
+            mods.max_output_tokens = 768
         else:
-            mods.max_output_tokens = 2048
+            mods.max_output_tokens = 1024
 
         return mods
 
@@ -245,14 +245,14 @@ class EmotionState:
         mods = self.get_modifiers()
         bias = mods.burst_count_bias
         if bias >= 2:
-            return "你现在话很多，倾向于发 3-5 条甚至更多。"
+            return "你现在话很多，倾向于发 3-5 条，但绝不超过 5 条。"
         elif bias == 1:
             return "你现在话比较多，倾向于发 2-4 条。"
         elif bias == -1:
             return "你现在话比较少，倾向于只发 1-2 条。"
         elif bias <= -2:
             return "你现在不太想说话，大多数时候只回 1 条，而且很短。"
-        return "有时 1 条，有时 2-5 条，自然随机。"
+        return "大多数时候 1-3 条，偶尔最多 5 条。"
 
     # ── 序列化 ──
 

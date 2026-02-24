@@ -83,7 +83,7 @@ def _build_system_prompt(persona: Persona) -> str:
 
     if burst_ratio > 0.2:
         lines.append("## 回复格式")
-        lines.append(f"你习惯连发消息。有时 1 条，有时 2-5 条，自然随机。")
+        lines.append(f"你习惯连发消息。大多数时候 1-3 条，偶尔最多 5 条，绝不超过 5 条。")
         lines.append(f"多条消息用 {sep} 分隔。每条都很短。")
         lines.append("")
 
@@ -115,6 +115,9 @@ def _build_system_prompt(persona: Persona) -> str:
     return "\n".join(lines)
 
 
+_MAX_BURST = 6  # 单次回复最大消息条数硬上限
+
+
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
     """将 ||| 分隔的回复拆成多条消息。自动检测并丢弃截断的末尾消息。"""
     parts = text.split(_MSG_SEPARATOR)
@@ -124,6 +127,9 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
         avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
         if truncated or (len(result[-1]) <= 2 and avg_len > 4):
             result = result[:-1]
+    # 硬上限：防止 LLM 输出过多条消息
+    if len(result) > _MAX_BURST:
+        result = result[:_MAX_BURST]
     return result
 
 
