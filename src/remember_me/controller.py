@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
+from remember_me.analyzer.relationship_extractor import RelationshipExtractor
 from remember_me.memory.governance import MemoryGovernance
+from remember_me.memory.relationship import RelationshipMemoryStore
 
 load_dotenv()
 
@@ -47,6 +49,8 @@ class ChatController:
         self._topic_starter = None
         self._memory = None
         self._memory_governance: MemoryGovernance | None = None
+        self._relationship_store: RelationshipMemoryStore | None = None
+        self._relationship_extractor: RelationshipExtractor | None = None
         self._event_tracker = None
         self._on_message: Callable[[list[str], str], None] | None = None  # (msgs, msg_type)
         self._on_typing: Callable[[bool], None] | None = None
@@ -57,6 +61,8 @@ class ChatController:
         self._history_start_index = 0
         self._event_extract_index = 0  # 上次事件提取时的历史位置
         self._event_extract_task: asyncio.Task | None = None
+        self._relationship_extract_index = 0
+        self._relationship_extract_task: asyncio.Task | None = None
         self._session_loaded = False
         self._has_topics = False
         self._proactive_cooldown = 60
@@ -282,6 +288,9 @@ class ChatController:
         # 核心记忆治理：导入历史是唯一真源
         self._memory_governance = MemoryGovernance(self._name, data_dir=DATA_DIR)
         self._memory_governance.ensure_core_from_persona(persona)
+        self._relationship_store = RelationshipMemoryStore(self._name, data_dir=DATA_DIR)
+        self._relationship_extractor = RelationshipExtractor()
+        self._memory_governance.set_relationship_store(self._relationship_store)
 
         # 加载记忆
         chroma_path = CHROMA_DIR / self._name
@@ -339,6 +348,7 @@ class ChatController:
         from remember_me.engine.pending_events import PendingEventTracker
         self._event_tracker = PendingEventTracker(persona_name=self._name, data_dir=DATA_DIR)
         self._event_extract_index = len(self._engine._history)
+        self._relationship_extract_index = len(self._engine._history)
 
         self._update_activity()
         self._reply_checkin_wait = self._sample_reply_checkin_wait()
@@ -449,6 +459,15 @@ class ChatController:
                 and (not self._event_extract_task or self._event_extract_task.done())
             ):
                 self._event_extract_task = asyncio.create_task(self._extract_pending_events())
+            if (
+                history_len - self._relationship_extract_index >= 8
+                and self._relationship_extractor
+                and self._relationship_store
+                and (not self._relationship_extract_task or self._relationship_extract_task.done())
+            ):
+                self._relationship_extract_task = asyncio.create_task(
+                    self._extract_relationship_facts()
+                )
 
             return replies
         finally:
@@ -479,6 +498,48 @@ class ChatController:
             self._event_extract_index = snapshot_index
         except Exception as e:
             logger.warning("事件提取失败: %s", e)
+
+    async def _extract_relationship_facts(self):
+        """异步提取关系记忆（低频增量，不阻塞主回复）。"""
+        if not self._engine or not self._relationship_extractor or not self._relationship_store:
+            return
+        try:
+            snapshot_index = len(self._engine._history)
+            messages = []
+            for h in self._engine._history[self._relationship_extract_index:snapshot_index]:
+                if h.parts and h.parts[0].text:
+                    messages.append({"role": h.role, "text": h.parts[0].text})
+            if not messages:
+                return
+
+            loop = asyncio.get_event_loop()
+
+            def _validator(text: str):
+                if not self._memory_governance:
+                    return False, ""
+                return self._memory_governance.validate_against_imported_history(
+                    text, persona=self._persona,
+                )
+
+            facts = await loop.run_in_executor(
+                None,
+                lambda: self._relationship_extractor.extract_from_messages(
+                    messages,
+                    client=self._engine.client,
+                    source="runtime_session",
+                    conflict_validator=_validator,
+                ),
+            )
+            if not facts:
+                self._relationship_extract_index = snapshot_index
+                return
+            await loop.run_in_executor(None, lambda: self._relationship_store.upsert_facts(facts))
+            await loop.run_in_executor(None, lambda: self._relationship_store.promote_candidates(
+                min_confidence=0.78, min_evidence=2,
+            ))
+            self._relationship_extract_index = snapshot_index
+        except Exception as e:
+            logger.warning("关系记忆提取失败: %s", e)
 
     async def _proactive_loop(self):
         """后台主动消息循环。
@@ -582,7 +643,12 @@ class ChatController:
         """停止控制器，保存会话。"""
         self._running = False
         self._set_phase("ending", reason="controller_stop")
-        for task in (self._greeting_task, self._proactive_task, self._event_extract_task):
+        for task in (
+            self._greeting_task,
+            self._proactive_task,
+            self._event_extract_task,
+            self._relationship_extract_task,
+        ):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -592,6 +658,7 @@ class ChatController:
         self._greeting_task = None
         self._proactive_task = None
         self._event_extract_task = None
+        self._relationship_extract_task = None
         self._save_session()
         self._emit_metric("session_stopped")
 
@@ -610,6 +677,34 @@ class ChatController:
                     )
                 if to_add:
                     self._memory.add_messages(to_add)
+
+            # 会话结束时补提取关系记忆（防止后台任务未触发或中断）
+            if self._relationship_extractor and self._relationship_store:
+                rel_msgs = []
+                for h in self._engine._history[self._relationship_extract_index:]:
+                    if h.parts and h.parts[0].text:
+                        rel_msgs.append({"role": h.role, "text": h.parts[0].text})
+                if rel_msgs:
+                    def _validator(text: str):
+                        if not self._memory_governance:
+                            return False, ""
+                        return self._memory_governance.validate_against_imported_history(
+                            text, persona=self._persona,
+                        )
+
+                    facts = self._relationship_extractor.extract_from_messages(
+                        rel_msgs,
+                        client=self._engine.client,
+                        source="runtime_session",
+                        conflict_validator=_validator,
+                    )
+                    if facts:
+                        self._relationship_store.upsert_facts(facts)
+                        self._relationship_store.promote_candidates(
+                            min_confidence=0.78, min_evidence=2,
+                        )
+                    self._relationship_extract_index = len(self._engine._history)
+
             # 会话结束时提取待跟进事件（确保不遗漏）
             if self._event_tracker:
                 remaining = []
@@ -707,6 +802,30 @@ class ChatController:
 
         if on_progress:
             on_progress(f"人格分析完成 — {persona.style_summary[:60]}")
+
+        if on_progress:
+            on_progress("正在提取关系记忆...")
+        rel_store = RelationshipMemoryStore(target_name, data_dir=DATA_DIR)
+        rel_extractor = RelationshipExtractor()
+
+        def _validator(text: str):
+            return governance.validate_against_imported_history(text, persona=persona)
+
+        rel_facts = await loop.run_in_executor(
+            None,
+            lambda: rel_extractor.extract_from_history(
+                history, conflict_validator=_validator,
+            ),
+        )
+        if rel_facts:
+            await loop.run_in_executor(None, lambda: rel_store.upsert_facts(rel_facts))
+            await loop.run_in_executor(
+                None,
+                lambda: rel_store.promote_candidates(min_confidence=0.78, min_evidence=2),
+            )
+        confirmed_rel = await loop.run_in_executor(None, lambda: len(rel_store.list_confirmed(limit=200)))
+        if on_progress:
+            on_progress(f"关系记忆提取完成 — 已确认 {confirmed_rel} 条")
 
         # 建立记忆索引
         if on_progress:

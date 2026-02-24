@@ -389,11 +389,13 @@ def test_controller_stop_cancels_event_extract_task() -> None:
         c._greeting_task = asyncio.create_task(_sleep_long())
         c._proactive_task = asyncio.create_task(_sleep_long())
         c._event_extract_task = asyncio.create_task(_sleep_long())
+        c._relationship_extract_task = asyncio.create_task(_sleep_long())
 
         await c.stop()
 
         assert c._greeting_task is None
         assert c._proactive_task is None
         assert c._event_extract_task is None
+        assert c._relationship_extract_task is None
 
     asyncio.run(_run())

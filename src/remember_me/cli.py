@@ -19,9 +19,11 @@ from rich.panel import Panel
 from rich.text import Text
 
 from remember_me.analyzer.persona import Persona, analyze
+from remember_me.analyzer.relationship_extractor import RelationshipExtractor
 from remember_me.engine.chat import ChatEngine
 from remember_me.importers import json_parser, plain_text, wechat
 from remember_me.memory.governance import MemoryGovernance
+from remember_me.memory.relationship import RelationshipMemoryStore
 from remember_me.memory.store import MemoryStore
 
 console = Console()
@@ -83,6 +85,21 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
     governance.bootstrap_core_from_persona(persona, force=True)
     console.print(f"  [green]✓[/] 核心记忆快照已更新")
 
+    with console.status("  [dim]正在提取关系记忆...[/]"):
+        rel_store = RelationshipMemoryStore(target, data_dir=DATA_DIR)
+        rel_extractor = RelationshipExtractor()
+        rel_facts = rel_extractor.extract_from_history(
+            history,
+            conflict_validator=lambda text: governance.validate_against_imported_history(
+                text, persona=persona,
+            ),
+        )
+        if rel_facts:
+            rel_store.upsert_facts(rel_facts)
+            rel_store.promote_candidates(min_confidence=0.78, min_evidence=2)
+        confirmed_rel = len(rel_store.list_confirmed(limit=200))
+    console.print(f"  [green]✓[/] 关系记忆已提取（已确认 {confirmed_rel} 条）")
+
     # 建立记忆索引
     with console.status("  [dim]正在建立记忆索引...[/]"):
         store = MemoryStore(CHROMA_DIR / target, persona_name=target)
@@ -131,6 +148,9 @@ def chat(name: str, api_key: str | None, no_greet: bool):
 
     governance = MemoryGovernance(name, data_dir=DATA_DIR)
     governance.ensure_core_from_persona(persona)
+    rel_store = RelationshipMemoryStore(name, data_dir=DATA_DIR)
+    rel_extractor = RelationshipExtractor()
+    governance.set_relationship_store(rel_store)
 
     engine = ChatEngine(
         persona=persona,
@@ -347,6 +367,18 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                 )
                 if to_add:
                     memory.add_messages(to_add)
+            if new_msgs:
+                facts = rel_extractor.extract_from_messages(
+                    new_msgs,
+                    client=engine.client,
+                    source="runtime_session",
+                    conflict_validator=lambda text: governance.validate_against_imported_history(
+                        text, persona=persona,
+                    ),
+                )
+                if facts:
+                    rel_store.upsert_facts(facts)
+                    rel_store.promote_candidates(min_confidence=0.78, min_evidence=2)
         except Exception as e:
             logger.warning("保存会话失败: %s", e)
 

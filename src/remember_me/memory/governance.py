@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from remember_me.analyzer.persona import Persona
+from remember_me.memory.relationship import RelationshipMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ class MemoryGovernance:
         self._path = self._data_dir / "memories" / f"{persona_name}.json"
         self._records: list[MemoryRecord] = []
         self._core_profile_snapshot: dict = {}
+        self._relationship_store: RelationshipMemoryStore | None = None
         self.load()
 
     def load(self):
@@ -429,3 +431,15 @@ class MemoryGovernance:
             conflict_block = "\n".join(lines)
 
         return core_block, session_block, conflict_block
+
+    def set_relationship_store(self, store: RelationshipMemoryStore | None):
+        self._relationship_store = store
+
+    def build_relationship_block(self, limit: int = 10) -> str:
+        if not self._relationship_store:
+            return ""
+        try:
+            return self._relationship_store.build_prompt_block(limit=limit)
+        except Exception as e:
+            logger.warning("关系记忆块构建失败: %s", e)
+            return ""

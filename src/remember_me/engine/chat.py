@@ -515,7 +515,7 @@ class ChatEngine:
         return user_input
 
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（导入核心事实 > 导入检索 > 会话短期上下文）。"""
+        """构建 system prompt（核心事实 > 关系记忆 > 导入检索 > 会话上下文）。"""
         # 注入当前时间（使用用户时区，非服务器时区）
         now = datetime.now(_TIMEZONE)
         time_block = (
@@ -531,6 +531,7 @@ class ChatEngine:
         expanded_query = self._expand_query(user_input)
         burst_hint = ""
         gov_core_block = ""
+        gov_relationship_block = ""
         gov_session_block = ""
         gov_conflict_block = ""
         governance = getattr(self, "_memory_governance", None)
@@ -541,10 +542,14 @@ class ChatEngine:
                 gov_core_block, gov_session_block, gov_conflict_block = governance.build_prompt_blocks(
                     core_limit=6, session_limit=5, conflict_limit=2,
                 )
+                if hasattr(governance, "build_relationship_block"):
+                    gov_relationship_block = governance.build_relationship_block(limit=10)
             except Exception as e:
                 logger.warning("核心记忆块构建失败: %s", e)
         if gov_core_block:
             system = system + "\n\n" + gov_core_block
+        if gov_relationship_block:
+            system = system + "\n\n" + gov_relationship_block
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
