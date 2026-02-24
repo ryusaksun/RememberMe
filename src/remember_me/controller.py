@@ -22,6 +22,7 @@ PROFILES_DIR = DATA_DIR / "profiles"
 CHROMA_DIR = DATA_DIR / "chroma"
 HISTORY_DIR = DATA_DIR / "history"
 SESSIONS_DIR = DATA_DIR / "sessions"
+NOTES_DIR = DATA_DIR / "notes"
 
 
 class ChatController:
@@ -48,6 +49,35 @@ class ChatController:
     @property
     def persona_name(self) -> str:
         return self._name
+
+    def _load_notes(self) -> list[str]:
+        """加载手动备注。"""
+        notes_path = NOTES_DIR / f"{self._name}.json"
+        if not notes_path.exists():
+            return []
+        try:
+            return json.loads(notes_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("加载备注失败: %s", e)
+            return []
+
+    @staticmethod
+    def save_notes(persona_name: str, notes: list[str]):
+        """保存手动备注。"""
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        notes_path = NOTES_DIR / f"{persona_name}.json"
+        notes_path.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def load_notes(persona_name: str) -> list[str]:
+        """加载手动备注（静态方法，供外部调用）。"""
+        notes_path = NOTES_DIR / f"{persona_name}.json"
+        if not notes_path.exists():
+            return []
+        try:
+            return json.loads(notes_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
 
     @property
     def session_loaded(self) -> bool:
@@ -97,9 +127,13 @@ class ChatController:
             except Exception as e:
                 logger.debug("加载表情包库失败: %s", e)
 
+        # 加载手动备注
+        notes = self._load_notes()
+
         self._engine = ChatEngine(
             persona=persona, memory=self._memory,
             api_key=self._api_key, sticker_lib=sticker_lib,
+            notes=notes,
         )
 
         # 加载上次对话

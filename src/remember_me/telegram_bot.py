@@ -243,6 +243,60 @@ class TelegramBot:
             f"直接发消息开始对话，/stop 结束。"
         )
 
+    async def _cmd_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_allowed(update.effective_user.id):
+            return
+
+        args = update.message.text.split(maxsplit=2)  # /note [subcmd] [content]
+        if len(args) < 2:
+            await update.message.reply_text(
+                "用法：\n"
+                "/note add <内容> — 添加备注\n"
+                "/note list — 查看所有备注\n"
+                "/note del <序号> — 删除备注\n\n"
+                "备注会注入 system prompt，让 TA \"知道\"这些事。\n"
+                "修改后需 /stop 重新开始对话才生效。"
+            )
+            return
+
+        subcmd = args[1].lower()
+        notes = ChatController.load_notes(PERSONA_NAME)
+
+        if subcmd == "list":
+            if not notes:
+                await update.message.reply_text("暂无备注。")
+            else:
+                lines = [f"{i+1}. {n}" for i, n in enumerate(notes)]
+                await update.message.reply_text("\n".join(lines))
+
+        elif subcmd == "add":
+            if len(args) < 3 or not args[2].strip():
+                await update.message.reply_text("用法：/note add <内容>")
+                return
+            content = args[2].strip()
+            notes.append(content)
+            ChatController.save_notes(PERSONA_NAME, notes)
+            await update.message.reply_text(f"已添加第 {len(notes)} 条备注：{content}")
+
+        elif subcmd == "del":
+            if len(args) < 3:
+                await update.message.reply_text("用法：/note del <序号>")
+                return
+            try:
+                idx = int(args[2]) - 1
+            except ValueError:
+                await update.message.reply_text("序号必须是数字。")
+                return
+            if idx < 0 or idx >= len(notes):
+                await update.message.reply_text(f"序号超出范围（1-{len(notes)}）。")
+                return
+            removed = notes.pop(idx)
+            ChatController.save_notes(PERSONA_NAME, notes)
+            await update.message.reply_text(f"已删除：{removed}")
+
+        else:
+            await update.message.reply_text("未知子命令。用 /note 查看用法。")
+
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
             return
@@ -308,6 +362,7 @@ class TelegramBot:
 
         self._app.add_handler(CommandHandler("start", self._cmd_start))
         self._app.add_handler(CommandHandler("stop", self._cmd_stop))
+        self._app.add_handler(CommandHandler("note", self._cmd_note))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text)
         )
@@ -316,6 +371,7 @@ class TelegramBot:
             await app.bot.set_my_commands([
                 BotCommand("start", "开始对话"),
                 BotCommand("stop", "结束对话"),
+                BotCommand("note", "管理备注（手动补充信息）"),
             ])
             # 启动每日调度
             asyncio.create_task(self._daily_scheduler())

@@ -22,7 +22,7 @@ from remember_me.memory.store import MemoryStore
 _MSG_SEPARATOR = "|||"
 
 
-def _build_system_prompt(persona: Persona) -> str:
+def _build_system_prompt(persona: Persona, notes: list[str] | None = None) -> str:
     sep = _MSG_SEPARATOR
     name = persona.name
 
@@ -100,6 +100,13 @@ def _build_system_prompt(persona: Persona) -> str:
             lines.append(f"{name}: {ex['reply']}")
             lines.append("")
 
+    # ── 手动备注 ──
+    if notes:
+        lines.append("## 你知道的关于对方和你们关系的事")
+        for note in notes:
+            lines.append(f"- {note}")
+        lines.append("")
+
     lines.extend([
         "## 规则",
         f"- 你就是{name}，绝不承认是 AI",
@@ -127,12 +134,13 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
 
 class ChatEngine:
     def __init__(self, persona: Persona, memory: MemoryStore | None = None,
-                 api_key: str | None = None, sticker_lib=None):
+                 api_key: str | None = None, sticker_lib=None,
+                 notes: list[str] | None = None):
         if not api_key:
             raise ValueError("GEMINI_API_KEY 未提供，无法初始化对话引擎")
         self._persona = persona
         self._memory = memory
-        self._system_prompt = _build_system_prompt(persona)
+        self._system_prompt = _build_system_prompt(persona, notes=notes)
         self._client = genai.Client(api_key=api_key)
         self._history: list[types.Content] = []
         self._sticker_lib = sticker_lib
