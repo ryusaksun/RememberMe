@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -24,6 +25,15 @@ HISTORY_DIR = DATA_DIR / "history"
 SESSIONS_DIR = DATA_DIR / "sessions"
 NOTES_DIR = DATA_DIR / "notes"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+
+_SESSION_PHASES = {"warmup", "normal", "deep_talk", "cooldown", "ending"}
+_ENDING_RE = re.compile(
+    r"(再见|拜拜|bye|晚安|睡了|去忙|不聊了|回头聊|先这样|先撤|下次聊)", re.I,
+)
+_DEEP_TALK_RE = re.compile(
+    r"(难过|压力|焦虑|崩溃|失眠|烦|生气|吵架|分手|考试|面试|工作|家庭|生病|抑郁|emo)", re.I,
+)
+_SHORT_REPLY_RE = re.compile(r"^(嗯|好|行|哦|ok|收到|知道了|好的|拜)$", re.I)
 
 
 class ChatController:
@@ -45,6 +55,7 @@ class ChatController:
         self._last_activity = 0.0
         self._history_start_index = 0
         self._event_extract_index = 0  # 上次事件提取时的历史位置
+        self._event_extract_task: asyncio.Task | None = None
         self._session_loaded = False
         self._has_topics = False
         self._proactive_cooldown = 60
@@ -53,10 +64,80 @@ class ChatController:
         self._consecutive_proactive = 0  # 连续主动消息计数（用户回复后归零）
         self._last_interaction_type: str = "none"  # "reply" | "proactive" | "none"
         self._fresh_session = True  # 新开 GUI 页面，跳过 is_conversation_ended 检查
+        self._session_phase = "warmup"
+        self._user_turn_count = 0
+        self._phase_updated_at = 0.0
+        self._telemetry_seq = 0
 
     @property
     def persona_name(self) -> str:
         return self._name
+
+    @property
+    def session_phase(self) -> str:
+        return self._session_phase
+
+    def _emit_metric(self, event: str, **fields):
+        self._telemetry_seq += 1
+        payload = {
+            "event": event,
+            "persona": self._name,
+            "phase": self._session_phase,
+            "ts": round(time.time(), 3),
+            "seq": self._telemetry_seq,
+            **fields,
+        }
+        logger.info("telemetry %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    def _set_phase(self, phase: str, reason: str):
+        if phase not in _SESSION_PHASES:
+            phase = "normal"
+        if phase == self._session_phase:
+            return
+        prev = self._session_phase
+        self._session_phase = phase
+        self._phase_updated_at = time.time()
+        if self._engine:
+            self._engine.set_session_phase(phase)
+        self._emit_metric("phase_changed", reason=reason, prev=prev, new=phase)
+
+    def _estimate_initial_phase(self) -> str:
+        if not self._engine:
+            return "warmup"
+        if self._engine.is_conversation_ended():
+            return "ending"
+        history = list(getattr(self._engine, "_history", []))
+        self._user_turn_count = sum(1 for h in history if getattr(h, "role", "") == "user")
+        if self._user_turn_count <= 2:
+            return "warmup"
+        return "normal"
+
+    def _derive_phase_from_user_input(self, text: str, idle_before: float) -> str:
+        message = (text or "").strip()
+        if not message:
+            return self._session_phase
+        if _ENDING_RE.search(message):
+            return "ending"
+        if self._engine and self._engine.is_conversation_ended():
+            return "ending"
+        if _DEEP_TALK_RE.search(message) or len(message) >= 42:
+            return "deep_talk"
+        if self._session_phase == "deep_talk" and (idle_before > 240 or _SHORT_REPLY_RE.match(message)):
+            return "cooldown"
+        if self._session_phase == "cooldown" and not _SHORT_REPLY_RE.match(message):
+            return "normal"
+        if self._user_turn_count <= 2:
+            return "warmup"
+        return "normal"
+
+    def _derive_phase_from_idle(self, idle_seconds: float) -> str:
+        if self._session_phase == "ending":
+            return "ending"
+        if idle_seconds > 900:
+            return "cooldown"
+        if self._session_phase == "warmup" and self._user_turn_count > 2:
+            return "normal"
+        return self._session_phase
 
     @staticmethod
     def _profile_bounds(
@@ -239,6 +320,14 @@ class ChatController:
         session_path = SESSIONS_DIR / f"{self._name}.json"
         self._session_loaded = self._engine.load_session(session_path)
         self._history_start_index = len(self._engine._history)
+        self._user_turn_count = sum(
+            1 for h in self._engine._history if getattr(h, "role", "") == "user"
+        )
+        # 会话阶段：优先使用已加载会话，否则按历史估算
+        loaded_phase = self._engine.session_phase if self._session_loaded else self._estimate_initial_phase()
+        self._session_phase = loaded_phase if loaded_phase in _SESSION_PHASES else self._estimate_initial_phase()
+        self._engine.set_session_phase(self._session_phase)
+        self._phase_updated_at = time.time()
 
         self._topic_starter = TopicStarter(persona=persona, client=self._engine.client)
         self._has_topics = bool(getattr(persona, "topic_interests", None))
@@ -251,6 +340,12 @@ class ChatController:
         self._update_activity()
         self._reply_checkin_wait = self._sample_reply_checkin_wait()
         self._next_proactive_at = time.time() + self._sample_initial_proactive_delay()
+        self._emit_metric(
+            "session_started",
+            session_loaded=self._session_loaded,
+            has_topics=self._has_topics,
+            user_turns=self._user_turn_count,
+        )
 
         # 主动开场
         if not no_greet and self._has_topics:
@@ -276,6 +371,8 @@ class ChatController:
                 self._last_interaction_type = "proactive"
                 self._consecutive_proactive = 1
                 self._next_proactive_at = time.time() + self._sample_proactive_cooldown()
+                self._set_phase("warmup", reason="greeting")
+                self._emit_metric("greeting_sent", reply_count=len(greet_msgs))
                 if self._on_message:
                     self._on_message(greet_msgs, "greet")
                 # 后台预缓存
@@ -303,6 +400,10 @@ class ChatController:
         if not self._engine:
             raise RuntimeError("引擎未初始化，请先调用 start()")
 
+        idle_before = self._get_idle_seconds()
+        self._user_turn_count += 1
+        next_phase = self._derive_phase_from_user_input(text, idle_before=idle_before)
+        self._set_phase(next_phase, reason="user_input")
         self._topic_starter.on_user_replied()
         self._update_activity()
         self._consecutive_proactive = 0
@@ -313,6 +414,7 @@ class ChatController:
             self._on_typing(True)
         try:
             loop = asyncio.get_event_loop()
+            start_at = time.perf_counter()
             replies = await loop.run_in_executor(
                 None, lambda: self._engine.send_multi(text, image=image)
             )
@@ -320,11 +422,19 @@ class ChatController:
             # 回复后按人格节奏等待一段时间，再考虑接话
             self._reply_checkin_wait = self._sample_reply_checkin_wait()
             self._next_proactive_at = time.time() + self._reply_checkin_wait
+            elapsed_ms = int((time.perf_counter() - start_at) * 1000)
+            self._emit_metric(
+                "reply_generated",
+                latency_ms=elapsed_ms,
+                reply_count=len(replies),
+                has_image=bool(image),
+                input_len=len(text or ""),
+            )
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
             if history_len - self._event_extract_index >= 6:
-                asyncio.create_task(self._extract_pending_events())
+                self._event_extract_task = asyncio.create_task(self._extract_pending_events())
 
             return replies
         finally:
@@ -370,10 +480,14 @@ class ChatController:
                 continue
             now = time.time()
             idle = self._get_idle_seconds()
+            self._set_phase(self._derive_phase_from_idle(idle), reason="idle")
             if idle <= 30 or now <= self._next_proactive_at:
+                continue
+            if self._session_phase == "ending":
                 continue
             # 新 GUI 会话跳过"对话已结束"检查（用户主动打开页面说明想聊）
             if not self._fresh_session and self._engine.is_conversation_ended():
+                self._set_phase("ending", reason="conversation_ended")
                 continue
 
             try:
@@ -424,6 +538,7 @@ class ChatController:
                     if self._get_idle_seconds() < 15:
                         continue
                     if not self._fresh_session and self._engine.is_conversation_ended():
+                        self._set_phase("ending", reason="conversation_ended")
                         continue
                     self._engine.inject_proactive_message(msgs)
                     self._update_activity()
@@ -434,6 +549,13 @@ class ChatController:
                     if self._engine:
                         cooldown *= self._engine.proactive_cooldown_factor
                     self._next_proactive_at = now + cooldown
+                    self._set_phase("cooldown", reason="proactive_sent")
+                    self._emit_metric(
+                        "proactive_sent",
+                        reply_count=len(msgs),
+                        idle_seconds=int(idle),
+                        cooldown_seconds=int(cooldown),
+                    )
                     if self._on_message:
                         self._on_message(msgs, "proactive")
             except Exception as e:
@@ -445,6 +567,7 @@ class ChatController:
     async def stop(self):
         """停止控制器，保存会话。"""
         self._running = False
+        self._set_phase("ending", reason="controller_stop")
         for task in (self._greeting_task, self._proactive_task):
             if task and not task.done():
                 task.cancel()
@@ -455,6 +578,7 @@ class ChatController:
         self._greeting_task = None
         self._proactive_task = None
         self._save_session()
+        self._emit_metric("session_stopped")
 
     def _save_session(self):
         if not self._engine:

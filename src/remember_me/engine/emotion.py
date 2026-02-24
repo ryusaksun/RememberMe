@@ -108,24 +108,31 @@ class EmotionState:
         # 只以用户输入为主，避免模型自己的措辞反向放大情绪漂移。
         user_text = user_input or ""
 
+        # 冷却：距上次调整不足 30 秒，幅度减半（避免连续相同刺激线性叠加）
+        try:
+            elapsed = (datetime.now() - datetime.fromisoformat(self.updated_at)).total_seconds()
+        except (ValueError, TypeError):
+            elapsed = 999
+        scale = 0.5 if elapsed < 30 else 1.0
+
         # 正向情绪
         if _POSITIVE_RE.search(user_text):
-            self.valence = _clamp(self.valence + 0.1, -1, 1)
-            self.arousal = _clamp(self.arousal + 0.08, -1, 1)
+            self.valence = _clamp(self.valence + 0.1 * scale, -1, 1)
+            self.arousal = _clamp(self.arousal + 0.08 * scale, -1, 1)
 
         # 负向高激动（用户骂人/表达不满）
         if _NEGATIVE_RE.search(user_input):
-            self.valence = _clamp(self.valence - 0.15, -1, 1)
-            self.arousal = _clamp(self.arousal + 0.15, -1, 1)
+            self.valence = _clamp(self.valence - 0.15 * scale, -1, 1)
+            self.arousal = _clamp(self.arousal + 0.15 * scale, -1, 1)
 
         # 低落情绪
         if _SAD_RE.search(user_input):
-            self.valence = _clamp(self.valence - 0.12, -1, 1)
-            self.arousal = _clamp(self.arousal - 0.1, -1, 1)
+            self.valence = _clamp(self.valence - 0.12 * scale, -1, 1)
+            self.arousal = _clamp(self.arousal - 0.1 * scale, -1, 1)
 
         # 惊叹（高激动但方向不定）
         if _EXCITED_RE.search(user_text):
-            self.arousal = _clamp(self.arousal + 0.12, -1, 1)
+            self.arousal = _clamp(self.arousal + 0.12 * scale, -1, 1)
 
         # 话题情绪（如果 persona 有 topic_valence）
         if persona:

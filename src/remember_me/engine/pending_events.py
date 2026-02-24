@@ -147,7 +147,7 @@ class PendingEventTracker:
                 minutes = int(item.get("followup_after_minutes", 60))
             except (TypeError, ValueError):
                 minutes = 60
-            followup_at = now + timedelta(minutes=max(minutes, 10))
+            followup_at = now + timedelta(minutes=max(10, min(minutes, 1440)))
 
             # 去重：如果已有类似事件（关键词重叠），跳过
             event_text = str(item.get("event", "") or "").strip()

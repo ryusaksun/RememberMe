@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import random
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,6 +35,7 @@ PERSONA_NAME = os.environ.get("PERSONA_NAME", "阴暗扭曲爬行_-_-")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
 DATA_DIR = Path("data")
 PROFILES_DIR = DATA_DIR / "profiles"
+_SENTENCE_END_RE = re.compile(r"[。！？!?~…]$")
 
 
 class TelegramBot:
@@ -43,6 +46,8 @@ class TelegramBot:
     COALESCE_PEEK = 0.8
     # 连发模式的 debounce（秒）：每条新消息重置此计时器
     COALESCE_DEBOUNCE = 2.0
+    # 消息像“说完一句”时，尽快 flush（秒）
+    COALESCE_ENDING_DEBOUNCE = 0.55
     # 从第一条消息算起的最大等待（秒）：超过此时间无论如何都处理
     COALESCE_MAX_WAIT = 8.0
 
@@ -62,11 +67,58 @@ class TelegramBot:
         # 每日调度
         self._daily_times: list[datetime] = []
         self._daily_date: str = ""  # 当前计划对应的日期
+        self._bg_tasks: set[asyncio.Task] = set()
 
     def _is_allowed(self, user_id: int) -> bool:
         if self._allowed_users is None:
             return True
         return user_id in self._allowed_users
+
+    def _track_task(self, task: asyncio.Task, name: str) -> asyncio.Task:
+        """统一管理后台任务，避免 shutdown 时留下 pending task。"""
+        self._bg_tasks.add(task)
+
+        def _on_done(done: asyncio.Task):
+            self._bg_tasks.discard(done)
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            if exc:
+                logger.warning("后台任务失败 [%s]: %s", name, exc)
+
+        task.add_done_callback(_on_done)
+        return task
+
+    def _cancel_coalesce_timer(self):
+        if self._coalesce_timer and not self._coalesce_timer.done():
+            self._coalesce_timer.cancel()
+        self._coalesce_timer = None
+
+    async def _shutdown_background_tasks(self):
+        self._cancel_coalesce_timer()
+        tasks = [t for t in self._bg_tasks if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+    @staticmethod
+    def _is_sentence_finished(text: str) -> bool:
+        return bool(_SENTENCE_END_RE.search((text or "").strip()))
+
+    def _compute_coalesce_delay(self, text: str, is_first: bool) -> float:
+        if is_first:
+            return self.COALESCE_ENDING_DEBOUNCE if self._is_sentence_finished(text) else self.COALESCE_PEEK
+        elapsed = max(0.0, time.monotonic() - self._coalesce_first_at)
+        remaining = max(0.05, self.COALESCE_MAX_WAIT - elapsed)
+        debounce = (
+            self.COALESCE_ENDING_DEBOUNCE
+            if self._is_sentence_finished(text)
+            else self.COALESCE_DEBOUNCE
+        )
+        return min(debounce, remaining)
 
     # ── Persona 数据加载 ──
 
@@ -140,17 +192,21 @@ class TelegramBot:
                         time_strs = [t.strftime("%H:%M") for t in self._daily_times]
                         logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
                     # 触发知识库每日更新
-                    asyncio.create_task(self._update_knowledge())
+                    self._track_task(asyncio.create_task(self._update_knowledge()), "daily_knowledge_update")
 
-                # 检查是否到了计划时刻
+                # 检查是否到了计划时刻（每次最多触发 1 条，避免连发）
                 remaining = []
+                sent = False
                 for planned_time in self._daily_times:
-                    if now >= planned_time:
+                    if not sent and now >= planned_time:
                         await self._try_send_daily_message()
+                        sent = True
                     else:
                         remaining.append(planned_time)
                 self._daily_times = remaining
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.exception("每日调度异常: %s", e)
 
@@ -202,6 +258,8 @@ class TelegramBot:
             # 清理过期条目
             await loop.run_in_executor(None, store.evict)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("知识库更新失败: %s", e)
 
@@ -268,7 +326,7 @@ class TelegramBot:
 
             # 发送到 Telegram
             bot = self._app.bot
-            await self._deliver_messages(bot, chat_id, msgs)
+            await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
             logger.info("每日主动消息已发送: %d 条", len(msgs))
 
         except Exception as e:
@@ -289,12 +347,22 @@ class TelegramBot:
         bot = self._app.bot
 
         def on_message(msgs: list[str], msg_type: str):
-            asyncio.create_task(self._deliver_messages(bot, chat_id, msgs))
+            is_followup = msg_type in {"proactive", "greet"}
+            self._track_task(
+                asyncio.create_task(
+                    self._deliver_messages(
+                        bot, chat_id, msgs,
+                        first_delay_phase="followup" if is_followup else "first",
+                    )
+                ),
+                f"deliver_{msg_type}",
+            )
 
         def on_typing(is_typing: bool):
             if is_typing:
-                asyncio.create_task(
-                    bot.send_chat_action(chat_id, ChatAction.TYPING)
+                self._track_task(
+                    asyncio.create_task(bot.send_chat_action(chat_id, ChatAction.TYPING)),
+                    "typing_indicator",
                 )
 
         try:
@@ -404,6 +472,10 @@ class TelegramBot:
         await self._controller.stop()
         self._controller = None
         self._chat_id = None
+        async with self._coalesce_lock:
+            self._cancel_coalesce_timer()
+            self._coalesce_buffer.clear()
+            self._coalesce_first_at = 0.0
         await update.message.reply_text(
             f"已结束与 {PERSONA_NAME} 的对话。会话已保存。"
         )
@@ -429,26 +501,24 @@ class TelegramBot:
             self._coalesce_buffer.append(text)
 
             # 取消旧的定时器
-            if self._coalesce_timer and not self._coalesce_timer.done():
-                self._coalesce_timer.cancel()
+            self._cancel_coalesce_timer()
 
             if is_first:
                 # 第一条消息：记录时间戳，设置短探测延迟
                 self._coalesce_first_at = time.monotonic()
-                delay = self.COALESCE_PEEK
-            else:
-                # 后续消息：使用较长 debounce，但受 max_wait 限制
-                elapsed = time.monotonic() - self._coalesce_first_at
-                remaining = self.COALESCE_MAX_WAIT - elapsed
-                delay = min(self.COALESCE_DEBOUNCE, max(remaining, 0.1))
+            delay = self._compute_coalesce_delay(text, is_first=is_first)
 
-            self._coalesce_timer = asyncio.create_task(
-                self._flush_coalesce(chat_id, delay)
+            self._coalesce_timer = self._track_task(
+                asyncio.create_task(self._flush_coalesce(chat_id, delay)),
+                "coalesce_flush",
             )
 
     async def _flush_coalesce(self, chat_id: int, delay: float):
         """等待指定延迟后，将缓冲区中的消息合并发送给 LLM。"""
-        await asyncio.sleep(delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
 
         async with self._coalesce_lock:
             if not self._coalesce_buffer:
@@ -469,7 +539,7 @@ class TelegramBot:
 
             try:
                 replies = await self._controller.send_message(merged)
-                await self._deliver_messages(bot, chat_id, replies)
+                await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送消息失败")
                 await bot.send_message(chat_id, f"出错了：{e}")
@@ -488,8 +558,7 @@ class TelegramBot:
 
         # 图片消息到达时，先把缓冲区里的文字消息冲掉（合并到图片的 caption 里）
         async with self._coalesce_lock:
-            if self._coalesce_timer and not self._coalesce_timer.done():
-                self._coalesce_timer.cancel()
+            self._cancel_coalesce_timer()
             buffered = list(self._coalesce_buffer)
             self._coalesce_buffer.clear()
             self._coalesce_first_at = 0.0
@@ -512,12 +581,18 @@ class TelegramBot:
                 replies = await self._controller.send_message(
                     caption, image=(bytes(image_bytes), "image/jpeg"),
                 )
-                await self._deliver_messages(bot, chat_id, replies)
+                await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送图片消息失败")
                 await update.message.reply_text(f"出错了：{e}")
 
-    async def _deliver_messages(self, bot, chat_id: int, msgs: list[str]):
+    async def _deliver_messages(
+        self,
+        bot,
+        chat_id: int,
+        msgs: list[str],
+        first_delay_phase: str = "first",
+    ):
         """逐条发送消息（带打字间隔）。"""
         msgs = [m for m in msgs if m and m.strip()]
         if not msgs:
@@ -525,22 +600,39 @@ class TelegramBot:
 
         # 获取情绪驱动的延迟系数
         delay_factor = 1.0
+        engine = None
         if self._controller and self._controller._engine:
-            delay_factor = self._controller._engine.reply_delay_factor
+            engine = self._controller._engine
+            delay_factor = engine.reply_delay_factor
 
         for i, msg in enumerate(msgs):
+            # 第一条也加延迟，区分正常回复 / 主动接话
+            if i == 0:
+                if engine:
+                    delay = engine.sample_inter_message_delay(first_delay_phase) * delay_factor
+                else:
+                    delay = (0.45 + random.random() * 0.9) * delay_factor
+                await asyncio.sleep(max(0.05, delay))
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+
             if msg.startswith("[sticker:"):
                 sticker_path = Path(msg[9:].rstrip("]"))
-                if sticker_path.exists():
-                    with open(sticker_path, "rb") as f:
-                        await bot.send_photo(chat_id, photo=f)
-                else:
-                    logger.warning("表情包文件不存在: %s", sticker_path)
+                try:
+                    if sticker_path.exists():
+                        with open(sticker_path, "rb") as f:
+                            await bot.send_photo(chat_id, photo=f)
+                    else:
+                        logger.warning("表情包文件不存在: %s", sticker_path)
+                except Exception as e:
+                    logger.warning("发送表情包失败: %s", e)
             else:
                 await bot.send_message(chat_id, msg)
 
             if i < len(msgs) - 1:
-                delay = (0.4 + random.random() * 0.8) * delay_factor
+                if engine:
+                    delay = engine.sample_inter_message_delay("burst") * delay_factor
+                else:
+                    delay = (0.4 + random.random() * 0.8) * delay_factor
                 await asyncio.sleep(delay)
                 await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
@@ -565,9 +657,18 @@ class TelegramBot:
                 BotCommand("note", "管理备注（手动补充信息）"),
             ])
             # 启动每日调度
-            asyncio.create_task(self._daily_scheduler())
+            self._track_task(asyncio.create_task(self._daily_scheduler()), "daily_scheduler")
+
+        async def post_shutdown(app: Application):
+            await self._shutdown_background_tasks()
+            if self._controller:
+                with contextlib.suppress(Exception):
+                    await self._controller.stop()
+            self._controller = None
+            self._chat_id = None
 
         self._app.post_init = post_init
+        self._app.post_shutdown = post_shutdown
 
         logger.info("Telegram Bot 启动中... persona=%s", PERSONA_NAME)
         self._app.run_polling(drop_pending_updates=True)

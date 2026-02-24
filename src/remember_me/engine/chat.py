@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
-import os
 import threading
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,7 +25,7 @@ from remember_me.analyzer.persona import Persona
 from remember_me.engine.emotion import EmotionState
 from remember_me.memory.scratchpad import Scratchpad, update_scratchpad
 from remember_me.memory.store import MemoryStore
-from remember_me.models import MODEL_MAIN
+from remember_me.models import MODEL_LIGHT, MODEL_MAIN
 
 _MSG_SEPARATOR = "|||"
 
@@ -133,6 +135,16 @@ def _build_system_prompt(persona: Persona) -> str:
 
 
 _MAX_BURST = 8  # 单次回复最大消息条数安全上限（正常由 burst_range 引导）
+_MEMORY_CACHE_MAX_SIZE = 64
+_MEMORY_CACHE_TTL_SEC = 120.0
+
+_SESSION_PHASE_GUIDE = {
+    "warmup": "你们刚进入聊天，语气自然热身，不要突然沉重也别过度输出。",
+    "normal": "按平时节奏聊，优先回应当下话题。",
+    "deep_talk": "当前对话偏走心或严肃，先共情再表达观点，语气要稳。",
+    "cooldown": "刚经历密集聊天，语气收一点，短句但要把意思说完整。",
+    "ending": "对话接近收尾，不主动扩展新话题，语气自然结束。",
+}
 
 
 # 检测 LLM 推理泄漏：中文内容后跟随英文句子
@@ -157,9 +169,9 @@ def _is_reasoning_leak_msg(msg: str) -> bool:
     stripped = msg.strip()
     if len(stripped) < 5:
         return False
-    # 1) 纯英文消息（中文 persona 不应发纯英文）
+    # 1) 纯英文消息（中文 persona 不应发纯英文，但短消息如 "OK" 不过滤）
     non_ascii = sum(1 for c in stripped if ord(c) > 127)
-    if len(stripped) > 10 and non_ascii / len(stripped) < 0.1:
+    if len(stripped) > 20 and non_ascii / len(stripped) < 0.1:
         return True
     # 2) 中文推理片段：消息前 6 字符内出现孤立右括号（无匹配左括号）
     #    如 "冬），直接改个字眼..." —— 这是 LLM 推理块被截断的尾部碎片
@@ -183,7 +195,9 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     result = [m for m in result if m and not _is_reasoning_leak_msg(m)]
     if len(result) > 1:
         # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
-        avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
+        # 计算 avg 时排除 ≤2 字的消息，避免被极短反应词拉低
+        meaningful = [len(m) for m in result[:-1] if len(m) > 2]
+        avg_len = sum(meaningful) / len(meaningful) if meaningful else 10
         if truncated or (len(result[-1]) <= 2 and avg_len > 4):
             result = result[:-1]
     # 硬上限：防止 LLM 输出过多条消息
@@ -206,6 +220,27 @@ def _introduce_minor_typo(text: str) -> str:
     return text[:idx] + text[idx] + text[idx:]
 
 
+def _tokenize_for_similarity(text: str) -> set[str]:
+    """将文本切成可用于简单相似度判断的 token（中英混合）。"""
+    text = (text or "").strip().lower()
+    if not text:
+        return set()
+    words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
+    tokens: set[str] = set()
+    for w in words:
+        if not w:
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fff]+", w):
+            if len(w) == 1:
+                tokens.add(w)
+                continue
+            for i in range(len(w) - 1):
+                tokens.add(w[i : i + 2])
+        else:
+            tokens.add(w)
+    return tokens
+
+
 class ChatEngine:
     def __init__(self, persona: Persona, memory: MemoryStore | None = None,
                  api_key: str | None = None, sticker_lib=None,
@@ -222,6 +257,7 @@ class ChatEngine:
         self._history: list[types.Content] = []
         self._sticker_lib = sticker_lib
         self._sticker_probability = 0.14  # 约 14% 概率发表情包（基于真人数据）
+        self._session_phase = "warmup"
         self._human_noise_probability = max(
             0.01,
             min(0.06, 0.02 + getattr(persona, "short_msg_ratio", 0.0) * 0.03),
@@ -230,6 +266,7 @@ class ChatEngine:
         self._scratchpad_updating = False
         self._emotion_state = EmotionState()
         self._state_lock = threading.Lock()  # 保护 scratchpad/emotion 的跨线程访问
+        self._memory_cache: OrderedDict[str, tuple[float, list[tuple[str, float]]]] = OrderedDict()
 
     @property
     def client(self) -> genai.Client:
@@ -244,6 +281,94 @@ class ChatEngine:
     def proactive_cooldown_factor(self) -> float:
         """情绪驱动的主动消息冷却系数。"""
         return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
+
+    @property
+    def session_phase(self) -> str:
+        return self._session_phase
+
+    def set_session_phase(self, phase: str):
+        if phase not in _SESSION_PHASE_GUIDE:
+            phase = "normal"
+        self._session_phase = phase
+
+    @staticmethod
+    def _thread_similarity(query: str, thread: str) -> float:
+        q_tokens = _tokenize_for_similarity(query)
+        t_tokens = _tokenize_for_similarity(thread)
+        if not q_tokens or not t_tokens:
+            return 0.0
+        union = q_tokens | t_tokens
+        overlap = q_tokens & t_tokens
+        score = len(overlap) / max(1, len(union))
+        q = (query or "").strip().lower()
+        t = (thread or "").strip().lower()
+        if q and t and (q in t or t in q):
+            score += 0.25
+        return min(1.0, score)
+
+    def _rank_open_threads(self, user_input: str, threads: list[str], top_k: int = 3) -> list[str]:
+        cleaned = [t.strip() for t in threads if t and t.strip()]
+        if not cleaned:
+            return []
+        query = (user_input or "").strip()
+        if not query:
+            return cleaned[:top_k]
+
+        scored = [(t, self._thread_similarity(query, t)) for t in cleaned]
+        strong = sorted((item for item in scored if item[1] >= 0.30), key=lambda x: x[1], reverse=True)
+        medium = sorted((item for item in scored if 0.14 <= item[1] < 0.30), key=lambda x: x[1], reverse=True)
+        weak = sorted((item for item in scored if item[1] < 0.14), key=lambda x: x[1], reverse=True)
+        ordered = strong + medium + weak
+        return [t for t, _score in ordered[:top_k]]
+
+    def _build_phase_prompt_block(self) -> str:
+        phase = getattr(self, "_session_phase", "normal")
+        guide = _SESSION_PHASE_GUIDE.get(phase)
+        if not guide:
+            return ""
+        return "\n".join([
+            "## 当前对话阶段",
+            f"阶段：{phase}",
+            f"- {guide}",
+        ])
+
+    def _cache_memory_result(self, key: str, value: list[tuple[str, float]]):
+        if not hasattr(self, "_memory_cache"):
+            self._memory_cache = OrderedDict()
+        self._memory_cache[key] = (time.time(), value)
+        self._memory_cache.move_to_end(key)
+        while len(self._memory_cache) > _MEMORY_CACHE_MAX_SIZE:
+            self._memory_cache.popitem(last=False)
+
+    def _search_memory_cached(self, query: str, top_k: int) -> list[tuple[str, float]]:
+        key = f"{top_k}:{query.strip()}"
+        now_ts = time.time()
+        cache = getattr(self, "_memory_cache", None)
+        if cache is None:
+            self._memory_cache = OrderedDict()
+            cache = self._memory_cache
+        cached = cache.get(key)
+        if cached:
+            ts, value = cached
+            if now_ts - ts <= _MEMORY_CACHE_TTL_SEC:
+                cache.move_to_end(key)
+                return value
+            cache.pop(key, None)
+        if not self._memory:
+            return []
+        results = self._memory.search(query, top_k=top_k)
+        self._cache_memory_result(key, results)
+        return results
+
+    def _pick_generation_model(self, user_input: str, image: tuple[bytes, str] | None) -> str:
+        if image:
+            return MODEL_MAIN
+        text = (user_input or "").strip()
+        if not text:
+            return MODEL_MAIN
+        if len(text) <= 8 and self._TRIVIAL_RE.match(text) and not re.search(r"[?？!！]", text):
+            return MODEL_LIGHT
+        return MODEL_MAIN
 
     @staticmethod
     def _sample_delay_from_profile(
@@ -267,9 +392,12 @@ class ChatEngine:
         hi = max(lo + 0.05, min(p75 * hi_scale, hi_cap))
         return random.uniform(lo, hi)
 
-    def sample_inter_message_delay(self, burst_continuation: bool) -> float:
-        """采样展示延迟（用于 GUI/CLI 打字节奏），单位秒。"""
-        if burst_continuation:
+    def sample_inter_message_delay(self, phase: str | bool = "first") -> float:
+        """采样展示延迟（用于 GUI/CLI/Telegram 打字节奏），单位秒。"""
+        if isinstance(phase, bool):
+            phase = "burst" if phase else "first"
+
+        if phase == "burst":
             return self._sample_delay_from_profile(
                 getattr(self._persona, "burst_delay_profile", {}),
                 fallback=(0.40, 1.20),
@@ -278,6 +406,17 @@ class ChatEngine:
                 lo_cap=2.0,
                 hi_cap=4.0,
             )
+
+        if phase == "followup":
+            return self._sample_delay_from_profile(
+                getattr(self._persona, "response_delay_profile", {}),
+                fallback=(0.28, 0.95),
+                lo_scale=1 / 18.0,
+                hi_scale=1 / 12.0,
+                lo_cap=1.5,
+                hi_cap=3.0,
+            )
+
         return self._sample_delay_from_profile(
             getattr(self._persona, "response_delay_profile", {}),
             fallback=(0.55, 1.45),
@@ -355,6 +494,10 @@ class ChatEngine:
             f"请根据当前时间自然地回复，不要在白天叫对方去睡觉，也不要在深夜像白天一样精力充沛。"
         )
         system = self._system_prompt + time_block
+        phase_block = self._build_phase_prompt_block()
+        if phase_block:
+            system = system + "\n\n" + phase_block
+        expanded_query = self._expand_query(user_input)
 
         # 手动备注（动态读取，修改后即时生效）
         if self._notes:
@@ -368,7 +511,9 @@ class ChatEngine:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
             burst_hint = self._emotion_state.burst_hint(self._persona)
-            open_threads = list(self._scratchpad.open_threads[:3])
+            open_threads = self._rank_open_threads(
+                user_input, list(self._scratchpad.open_threads),
+            )
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
@@ -378,17 +523,18 @@ class ChatEngine:
                 "## 回复优先级",
                 "- 如果对方这条消息和未完话题相关，优先把未完的话题聊完。",
                 "- 只有在对方明显切换到新话题时，才放下未完话题。",
-                "未完话题：",
+                f"- 当前最相关的未完话题：{open_threads[0]}",
             ]
-            for thread in open_threads:
-                lines.append(f"- {thread}")
+            if len(open_threads) > 1:
+                lines.append("其他未完话题：")
+                for thread in open_threads[1:]:
+                    lines.append(f"- {thread}")
             system = system + "\n\n" + "\n".join(lines)
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
             try:
-                query = self._expand_query(user_input)
-                kb_items = self._knowledge_store.search(query, top_k=3)
+                kb_items = self._knowledge_store.search(expanded_query, top_k=3)
                 if kb_items:
                     kb_lines = ["## 你最近关注的新闻和动态（自然地提到，不要像背课文）"]
                     for item in kb_items:
@@ -399,8 +545,7 @@ class ChatEngine:
 
         # 长期记忆（RAG）
         if self._memory:
-            query = self._expand_query(user_input)
-            raw_results = self._memory.search(query, top_k=5)
+            raw_results = self._search_memory_cached(expanded_query, top_k=5)
 
             # 过滤低相关性结果 + 按行重叠率去重（overlap 窗口可能返回相似内容）
             seen_lines: set[str] = set()
@@ -451,6 +596,7 @@ class ChatEngine:
                 {"role": h.role, "text": next((p.text for p in h.parts if p.text), "") if h.parts else ""}
                 for h in self._history
             ],
+            "session_phase": self._session_phase,
             "scratchpad": self._scratchpad.to_dict(),
             "emotion_state": self._emotion_state.to_dict(),
         }
@@ -476,6 +622,7 @@ class ChatEngine:
             )
             if data.get("emotion_state"):
                 self._emotion_state = EmotionState.from_dict(data["emotion_state"])
+            self.set_session_phase(str(data.get("session_phase", "normal")))
             return bool(self._history)
         except Exception as e:
             logger.warning("加载会话失败: %s", e)
@@ -561,10 +708,13 @@ class ChatEngine:
         self._history.append(user_msg)
 
         temperature = max(0.1, min(1.5, 0.8 + mods.temperature_delta))
+        model = self._pick_generation_model(user_input, image)
+        if model == MODEL_LIGHT:
+            mods.max_output_tokens = min(mods.max_output_tokens, 768)
 
         try:
             response = self._client.models.generate_content(
-                model=MODEL_MAIN,
+                model=model,
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
@@ -602,14 +752,33 @@ class ChatEngine:
         result = messages if messages else [raw_reply]
 
         # 低频人类噪声：偶尔打错字并自我修正，避免回复过于“工整”
-        result = self._apply_human_noise(result)
+        result, noise_applied = self._apply_human_noise_with_flag(result)
 
         # 按概率附加表情包
-        result = self._maybe_attach_sticker(result)
+        result = self._maybe_attach_sticker(result, allow_sticker=not noise_applied)
         return result
 
     def _apply_human_noise(self, replies: list[str]) -> list[str]:
-        if not replies or random.random() > self._human_noise_probability:
+        out, _applied = self._apply_human_noise_with_flag(replies)
+        return out
+
+    def _apply_human_noise_with_flag(self, replies: list[str]) -> tuple[list[str], bool]:
+        capped = min(max(self._human_noise_probability, 0.0), 0.08)
+        if not replies or random.random() > capped:
+            return replies, False
+
+        if random.random() < 0.7:
+            strategies = [self._apply_typo_noise, self._apply_hesitation_noise]
+        else:
+            strategies = [self._apply_hesitation_noise, self._apply_typo_noise]
+        for strategy in strategies:
+            mutated = strategy(replies)
+            if mutated != replies:
+                return mutated[:_MAX_BURST], True
+        return replies, False
+
+    def _apply_typo_noise(self, replies: list[str]) -> list[str]:
+        if not replies:
             return replies
 
         candidates = [
@@ -630,11 +799,29 @@ class ChatEngine:
             out.insert(idx + 1, f"打错字了，{msg}")
         return out[:_MAX_BURST]
 
-    def _maybe_attach_sticker(self, replies: list[str]) -> list[str]:
+    def _apply_hesitation_noise(self, replies: list[str]) -> list[str]:
+        candidates = [
+            (i, m.strip()) for i, m in enumerate(replies)
+            if 4 <= len(m.strip()) <= 35 and not m.startswith("[sticker:")
+        ]
+        if not candidates:
+            return replies
+        idx, msg = random.choice(candidates)
+        if msg.startswith(("呃", "额", "嗯", "啊")):
+            return replies
+        prefix = random.choice(["呃，", "等下，", "啊对了，"])
+        out = list(replies)
+        out[idx] = f"{prefix}{msg}"
+        return out
+
+    def _maybe_attach_sticker(self, replies: list[str], allow_sticker: bool = True) -> list[str]:
         """按概率在回复后附加一张表情包。"""
+        if not allow_sticker:
+            return replies
         if not self._sticker_lib or not self._sticker_lib.stickers:
             return replies
-        if random.random() > self._sticker_probability:
+        sticker_prob = max(0.01, min(0.35, self._sticker_probability))
+        if random.random() > sticker_prob:
             return replies
 
         # 根据回复内容判断情感
