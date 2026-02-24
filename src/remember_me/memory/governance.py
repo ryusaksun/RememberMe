@@ -291,6 +291,7 @@ class MemoryGovernance:
         ttl_seconds: int | None = None,
         tags: list[str] | None = None,
         confidence: float = 0.55,
+        persist: bool = True,
     ) -> MemoryRecord | None:
         message = (text or "").strip()
         if not message or len(message) < 4 or _TRIVIAL_SESSION_RE.match(message):
@@ -323,7 +324,8 @@ class MemoryGovernance:
             expires_at=expires_at,
         )
         self._records.append(record)
-        self.save()
+        if persist:
+            self.save()
         return record
 
     def filter_messages_for_long_term(
@@ -370,6 +372,7 @@ class MemoryGovernance:
                 ttl_seconds=None,
                 tags=["manual", "session_note"],
                 confidence=0.75,
+                persist=False,
             )
         self.save()
 

@@ -444,7 +444,10 @@ class ChatController:
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
-            if history_len - self._event_extract_index >= 6:
+            if (
+                history_len - self._event_extract_index >= 6
+                and (not self._event_extract_task or self._event_extract_task.done())
+            ):
                 self._event_extract_task = asyncio.create_task(self._extract_pending_events())
 
             return replies
@@ -579,7 +582,7 @@ class ChatController:
         """停止控制器，保存会话。"""
         self._running = False
         self._set_phase("ending", reason="controller_stop")
-        for task in (self._greeting_task, self._proactive_task):
+        for task in (self._greeting_task, self._proactive_task, self._event_extract_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -588,6 +591,7 @@ class ChatController:
                     pass
         self._greeting_task = None
         self._proactive_task = None
+        self._event_extract_task = None
         self._save_session()
         self._emit_metric("session_stopped")
 

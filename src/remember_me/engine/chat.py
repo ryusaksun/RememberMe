@@ -198,8 +198,11 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
         # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
         # 计算 avg 时排除 ≤2 字的消息，避免被极短反应词拉低
         meaningful = [len(m) for m in result[:-1] if len(m) > 2]
-        avg_len = sum(meaningful) / len(meaningful) if meaningful else 10
-        if truncated or (len(result[-1]) <= 2 and avg_len > 4):
+        should_drop_short_tail = False
+        if meaningful:
+            avg_len = sum(meaningful) / len(meaningful)
+            should_drop_short_tail = len(result[-1]) <= 2 and avg_len > 4
+        if truncated or should_drop_short_tail:
             result = result[:-1]
     # 硬上限：防止 LLM 输出过多条消息
     if len(result) > _MAX_BURST:

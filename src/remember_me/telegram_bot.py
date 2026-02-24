@@ -469,13 +469,18 @@ class TelegramBot:
             await update.message.reply_text("当前没有进行中的对话。")
             return
 
-        await self._controller.stop()
-        self._controller = None
-        self._chat_id = None
         async with self._coalesce_lock:
             self._cancel_coalesce_timer()
             self._coalesce_buffer.clear()
             self._coalesce_first_at = 0.0
+        async with self._send_lock:
+            controller = self._controller
+            if not controller or self._chat_id != update.effective_chat.id:
+                await update.message.reply_text("当前没有进行中的对话。")
+                return
+            await controller.stop()
+            self._controller = None
+            self._chat_id = None
         await update.message.reply_text(
             f"已结束与 {PERSONA_NAME} 的对话。会话已保存。"
         )
@@ -535,10 +540,14 @@ class TelegramBot:
 
         async with self._send_lock:
             bot = self._app.bot
+            controller = self._controller
+            if not controller or self._chat_id != chat_id:
+                logger.info("聚合消息发送前会话已结束，丢弃本次缓冲内容")
+                return
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
             try:
-                replies = await self._controller.send_message(merged)
+                replies = await controller.send_message(merged)
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送消息失败")
@@ -575,10 +584,14 @@ class TelegramBot:
 
         async with self._send_lock:
             bot = self._app.bot
+            controller = self._controller
+            if not controller or self._chat_id != chat_id:
+                await update.message.reply_text("当前会话已结束，请先 /start。")
+                return
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
             try:
-                replies = await self._controller.send_message(
+                replies = await controller.send_message(
                     caption, image=(bytes(image_bytes), "image/jpeg"),
                 )
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")

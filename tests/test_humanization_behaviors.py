@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections import OrderedDict
@@ -7,7 +8,7 @@ from datetime import datetime, timedelta
 
 from remember_me.analyzer.persona import Persona, analyze
 from remember_me.controller import ChatController
-from remember_me.engine.chat import ChatEngine
+from remember_me.engine.chat import ChatEngine, _split_reply
 from remember_me.engine.emotion import EmotionState
 from remember_me.engine.pending_events import PendingEvent, PendingEventTracker
 from remember_me.importers.base import ChatHistory, ChatMessage
@@ -207,6 +208,11 @@ def test_chat_engine_model_routing_short_ack_uses_light_model() -> None:
     assert e._pick_generation_model("你为什么这么说？", image=None) == MODEL_MAIN
 
 
+def test_split_reply_keeps_all_short_segments_when_not_truncated() -> None:
+    assert _split_reply("嗯|||好|||哦") == ["嗯", "好", "哦"]
+    assert _split_reply("嗯|||好|||哦", truncated=True) == ["嗯", "好"]
+
+
 def test_controller_phase_transitions_deep_to_cooldown() -> None:
     class _StubEngine:
         def __init__(self):
@@ -286,6 +292,23 @@ def test_memory_governance_filter_long_term_blocks_conflict(tmp_path) -> None:
     assert out == [{"role": "user", "text": "我下周要去上海出差"}]
 
 
+def test_memory_governance_replace_manual_notes_saves_once(tmp_path, monkeypatch) -> None:
+    store = MemoryGovernance("小明", data_dir=tmp_path)
+    calls = {"n": 0}
+    original_save = store.save
+
+    def _save_wrapper():
+        calls["n"] += 1
+        return original_save()
+
+    monkeypatch.setattr(store, "save", _save_wrapper)
+    store.replace_manual_notes(
+        ["这是第一条备注", "这是第二条备注"],
+        persona=Persona(name="小明"),
+    )
+    assert calls["n"] == 1
+
+
 def test_chat_engine_prompt_orders_core_before_session_memory() -> None:
     class _Gov:
         def build_prompt_blocks(self, **kwargs):
@@ -341,3 +364,25 @@ def test_controller_save_session_append_runtime_memory_with_filter() -> None:
     c._save_session()
     assert c._memory.called == 1
     assert c._memory.last_messages == [{"role": "user", "text": "保留的新消息"}]
+
+
+def test_controller_stop_cancels_event_extract_task() -> None:
+    async def _run():
+        c = ChatController("x")
+        c._running = True
+        c._event_tracker = None
+
+        async def _sleep_long():
+            await asyncio.sleep(60)
+
+        c._greeting_task = asyncio.create_task(_sleep_long())
+        c._proactive_task = asyncio.create_task(_sleep_long())
+        c._event_extract_task = asyncio.create_task(_sleep_long())
+
+        await c.stop()
+
+        assert c._greeting_task is None
+        assert c._proactive_task is None
+        assert c._event_extract_task is None
+
+    asyncio.run(_run())
