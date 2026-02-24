@@ -224,15 +224,39 @@ class TopicStarter:
     def should_send_proactive(self) -> bool:
         return self._proactive_count < self._max_proactive_per_silence
 
-    def generate_followup(self, recent_context: str = "") -> list[str]:
+    def generate_checkin(self, recent_context: str) -> list[str]:
+        """对方回了消息后沉默了一段时间，接着聊或关心对方。不引入新话题。"""
+        name = self._persona.name
+        prompt = (
+            f"你们刚刚在聊的内容：\n{recent_context}\n\n"
+            f"对方已经好一会儿没说话了。\n"
+            f"用{name}的语气，自然地接一句（比如追问刚才的话题、关心对方去忙什么了）。\n"
+            f"不要引入全新的话题，不要分享新闻。\n\n"
+            f"要求：\n"
+            f"- 像是随口一问，不要太正式\n"
+            f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果需要）\n"
+            f"- 1 条短消息就够了\n"
+        )
+        msgs = self._generate_with_context(prompt)
+        if msgs:
+            self._last_proactive = msgs
+            self._followup_count = 0
+            self._proactive_count += 1
+        return msgs
+
+    def generate_followup(self, recent_context: str = "", allow_new_topic: bool = True) -> list[str]:
         """对方没回复时的行为，根据 chase_ratio 决定。"""
 
         if self._chase_ratio < 0.05:
+            if not allow_new_topic:
+                return []
             self._last_proactive = []
             self._followup_count = 0
             return self.generate(recent_context=recent_context)
 
         if self._followup_count >= max(1, round(self._chase_ratio * 10)):
+            if not allow_new_topic:
+                return []
             self._last_proactive = []
             self._followup_count = 0
             return self.generate(recent_context=recent_context)

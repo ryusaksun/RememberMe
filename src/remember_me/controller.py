@@ -49,7 +49,7 @@ class ChatController:
         self._proactive_cooldown = 60
         self._next_proactive_at = 0.0
         self._consecutive_proactive = 0  # 连续主动消息计数（用户回复后归零）
-        self._max_consecutive_proactive = 1  # 最多连续发 1 条主动消息
+        self._last_interaction_type: str = "none"  # "reply" | "proactive" | "none"
         self._fresh_session = True  # 新开 GUI 页面，跳过 is_conversation_ended 检查
 
     @property
@@ -193,6 +193,8 @@ class ChatController:
             if greet_msgs:
                 self._engine.inject_proactive_message(greet_msgs)
                 self._update_activity()
+                self._last_interaction_type = "proactive"
+                self._consecutive_proactive = 1
                 self._next_proactive_at = time.time() + self._proactive_cooldown + random.randint(0, 30)
                 if self._on_message:
                     self._on_message(greet_msgs, "greet")
@@ -223,7 +225,8 @@ class ChatController:
 
         self._topic_starter.on_user_replied()
         self._update_activity()
-        self._consecutive_proactive = 0  # 用户回复了，重置连续主动消息计数
+        self._consecutive_proactive = 0
+        self._last_interaction_type = "reply"
         self._fresh_session = False
 
         if self._on_typing:
@@ -234,8 +237,8 @@ class ChatController:
                 None, lambda: self._engine.send_multi(text, image=image)
             )
             self._update_activity()
-            # 回复后重置主动消息冷却，防止回复刚发完就触发主动话题
-            self._next_proactive_at = time.time() + self._proactive_cooldown + random.randint(0, 30)
+            # 回复后长冷却（5-6 分钟），不在对话中途插入新话题
+            self._next_proactive_at = time.time() + 300 + random.randint(0, 60)
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
@@ -273,17 +276,20 @@ class ChatController:
             logger.warning("事件提取失败: %s", e)
 
     async def _proactive_loop(self):
-        """后台主动消息循环（替代 cli.py 中的 proactive_worker 线程）。"""
+        """后台主动消息循环。
+
+        两种沉默场景，两种应对：
+        - 回复后沉默（用户聊完不回了）→ 5 分钟后接话/关心，不引新话题
+        - 主动消息后沉默（Bot 发了东西对方没理）→ 60 秒后追问一次
+        新话题仅从每日调度触发，不在此循环中生成。
+        """
         while self._running:
             await asyncio.sleep(2)
             if not self._running:
                 continue
             now = time.time()
             idle = self._get_idle_seconds()
-            if idle <= 15 or now <= self._next_proactive_at:
-                continue
-            # 连续主动消息上限：用户不回复就不再骚扰
-            if self._consecutive_proactive >= self._max_consecutive_proactive:
+            if idle <= 30 or now <= self._next_proactive_at:
                 continue
             # 新 GUI 会话跳过"对话已结束"检查（用户主动打开页面说明想聊）
             if not self._fresh_session and self._engine.is_conversation_ended():
@@ -296,8 +302,8 @@ class ChatController:
                 loop = asyncio.get_event_loop()
                 msgs = None
 
-                # 优先级 1：检查待跟进事件
-                if self._event_tracker:
+                # 优先级 1：待跟进事件（上下文相关，始终可触发）
+                if self._event_tracker and idle > 60:
                     due_events = self._event_tracker.get_due_events()
                     if due_events:
                         event = due_events[0]
@@ -310,18 +316,26 @@ class ChatController:
                         if msgs:
                             self._event_tracker.mark_done(event.id)
 
-                # 优先级 2：常规主动话题
-                if not msgs and self._has_topics and self._topic_starter.should_send_proactive():
-                    ctx = self._engine.get_recent_context()
-                    if self._topic_starter._last_proactive:
+                # 优先级 2：根据上次交互类型决定
+                if not msgs:
+                    if self._last_interaction_type == "reply":
+                        # 回复后沉默 → 接话/关心，不引新话题
+                        if idle < 300 or self._consecutive_proactive >= 1:
+                            continue
+                        ctx = self._engine.get_recent_context()
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate_followup(recent_context=ctx)
+                            None, lambda: self._topic_starter.generate_checkin(ctx)
                         )
                     else:
-                        msgs = self._topic_starter.pop_cached()
-                        if not msgs:
+                        # 主动消息后沉默 → 追问（最多 1 次追问，加上原始消息共 2 条）
+                        if self._consecutive_proactive >= 2:
+                            continue
+                        if self._topic_starter._last_proactive:
+                            ctx = self._engine.get_recent_context()
                             msgs = await loop.run_in_executor(
-                                None, lambda: self._topic_starter.generate(recent_context=ctx)
+                                None, lambda: self._topic_starter.generate_followup(
+                                    recent_context=ctx, allow_new_topic=False,
+                                )
                             )
 
                 if msgs:
@@ -333,19 +347,14 @@ class ChatController:
                     self._engine.inject_proactive_message(msgs)
                     self._update_activity()
                     self._consecutive_proactive += 1
-                    self._fresh_session = False  # 第一条主动消息发出后恢复正常检查
+                    self._last_interaction_type = "proactive"
+                    self._fresh_session = False
                     cooldown = self._proactive_cooldown
                     if self._engine:
                         cooldown *= self._engine.proactive_cooldown_factor
                     self._next_proactive_at = now + cooldown + random.randint(0, 30)
                     if self._on_message:
                         self._on_message(msgs, "proactive")
-
-                if self._has_topics and not self._topic_starter._last_proactive:
-                    try:
-                        await loop.run_in_executor(None, self._topic_starter.prefetch)
-                    except Exception:
-                        pass
             except Exception as e:
                 logger.warning("主动消息生成失败: %s", e)
             finally:
