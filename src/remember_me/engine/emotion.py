@@ -35,6 +35,30 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _estimate_content_factor(user_input: str) -> float:
+    """分析用户输入的内容复杂度，返回 0.6~1.6 的系数。"""
+    length = len(user_input)
+    if length <= 4:
+        factor = 0.6
+    elif length <= 15:
+        factor = 0.8
+    elif length <= 40:
+        factor = 1.0
+    elif length <= 80:
+        factor = 1.2
+    else:
+        factor = 1.4
+
+    # 包含问句 → 需要回答
+    if "？" in user_input or "?" in user_input:
+        factor += 0.1
+    # 包含分享词 → 对方在分享，需要回应
+    if re.search(r"(今天|刚才|告诉你|跟你说|你猜|你知道)", user_input):
+        factor += 0.2
+
+    return min(factor, 1.6)
+
+
 @dataclass
 class EmotionModifiers:
     """情绪对各项行为参数的修正。"""
@@ -202,13 +226,8 @@ class EmotionState:
         else:
             mods.proactive_cooldown_factor = 1.0
 
-        # max_output_tokens（控制总输出长度，防止过多条消息）
-        if v < -0.3 and a < 0:
-            mods.max_output_tokens = 512
-        elif v < -0.3 and a > 0.3:
-            mods.max_output_tokens = 768
-        else:
-            mods.max_output_tokens = 1024
+        # max_output_tokens 不再硬编码，由 compute_burst_range() 驱动
+        # 保留默认值 1024，send_multi() 会根据 burst 范围覆盖
 
         return mods
 
@@ -240,19 +259,45 @@ class EmotionState:
         lines.append("注意：不要刻意提到自己的情绪，自然地通过说话方式表现出来。")
         return "\n".join(lines)
 
-    def burst_hint(self) -> str:
-        """根据情绪生成动态 burst 条数提示。"""
+    def compute_burst_range(self, persona, user_input: str) -> tuple[int, int]:
+        """返回 (min_burst, max_burst) 建议范围。"""
+        # persona 基线
+        base = getattr(persona, "avg_burst_length", 2.0)
+
+        # 情绪系数
+        mods = self.get_modifiers(persona)
+        bias = mods.burst_count_bias  # -2 ~ +2
+        emotion_factor = 1.0 + bias * 0.25  # 0.5 ~ 1.5
+
+        # 内容系数
+        content_factor = _estimate_content_factor(user_input)
+
+        # 综合计算
+        center = base * emotion_factor * content_factor
+        low = max(1, round(center * 0.7))
+        high = max(low, min(8, round(center * 1.3)))
+
+        return (low, high)
+
+    def burst_hint(self, persona=None, user_input: str = "") -> str:
+        """根据情绪+内容+persona 生成动态 burst 条数提示。"""
+        if persona and user_input:
+            low, high = self.compute_burst_range(persona, user_input)
+            if low == high:
+                return f"这次回复 {low} 条左右。"
+            return f"这次回复 {low}-{high} 条。"
+        # 降级：没有 persona/user_input 时用旧逻辑
         mods = self.get_modifiers()
         bias = mods.burst_count_bias
         if bias >= 2:
-            return "你现在话很多，倾向于发 3-5 条，但绝不超过 5 条。"
+            return "你现在话很多，倾向于发 3-5 条。"
         elif bias == 1:
             return "你现在话比较多，倾向于发 2-4 条。"
         elif bias == -1:
             return "你现在话比较少，倾向于只发 1-2 条。"
         elif bias <= -2:
             return "你现在不太想说话，大多数时候只回 1 条，而且很短。"
-        return "大多数时候 1-3 条，偶尔最多 5 条。"
+        return "大多数时候 1-3 条。"
 
     # ── 序列化 ──
 

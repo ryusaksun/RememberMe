@@ -79,12 +79,14 @@ def _build_system_prompt(persona: Persona) -> str:
 
     # ── 连发格式 ──
     burst_ratio = getattr(persona, "burst_ratio", 0)
+    avg_burst_length = getattr(persona, "avg_burst_length", 1.0)
     burst_examples = getattr(persona, "burst_examples", [])
 
     if burst_ratio > 0.2:
         lines.append("## 回复格式")
-        lines.append(f"你习惯连发消息。大多数时候 1-3 条，偶尔最多 5 条，绝不超过 5 条。")
+        lines.append(f"你习惯连发消息，平均每次发 {avg_burst_length:.0f} 条左右。")
         lines.append(f"多条消息用 {sep} 分隔。每条都很短。")
+        lines.append("具体发几条，看情况：对方就说了个嗯，你回 1 条就行；聊到感兴趣的话题可以多说几条。")
         lines.append("")
 
     # ── 真实对话示例 ──
@@ -115,7 +117,7 @@ def _build_system_prompt(persona: Persona) -> str:
     return "\n".join(lines)
 
 
-_MAX_BURST = 6  # 单次回复最大消息条数硬上限
+_MAX_BURST = 8  # 单次回复最大消息条数安全上限（正常由 burst_range 引导）
 
 
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
@@ -248,7 +250,7 @@ class ChatEngine:
         with self._state_lock:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
-            burst_hint = self._emotion_state.burst_hint() if emotion_block else ""
+            burst_hint = self._emotion_state.burst_hint(self._persona, user_input) if emotion_block else ""
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
@@ -412,6 +414,12 @@ class ChatEngine:
         with self._state_lock:
             self._emotion_state.decay(self._persona)
             mods = self._emotion_state.get_modifiers(self._persona)
+            burst_range = self._emotion_state.compute_burst_range(self._persona, user_input)
+
+        # 根据 burst 范围动态计算 token 预算
+        _low, high = burst_range
+        tokens_per_msg = 80  # 中文短消息预估 40-60 tokens，给余量
+        mods.max_output_tokens = min(1536, max(256, high * tokens_per_msg))
 
         system = self._build_system(user_input)
 
