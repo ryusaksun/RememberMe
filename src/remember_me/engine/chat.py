@@ -6,9 +6,13 @@ import json
 import logging
 import random
 import re
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_TIMEZONE = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
 
 logger = logging.getLogger(__name__)
 
@@ -249,8 +253,8 @@ class ChatEngine:
 
     def _build_system(self, user_input: str) -> str:
         """构建 system prompt（基础 + 备注 + 中期记忆 + RAG 上下文）。"""
-        # 注入当前时间，让 persona 有时间感知
-        now = datetime.now()
+        # 注入当前时间（使用用户时区，非服务器时区）
+        now = datetime.now(_TIMEZONE)
         time_block = (
             f"\n\n## 当前时间\n"
             f"现在是 {now.strftime('%Y年%m月%d日 %H:%M')}，"
