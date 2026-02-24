@@ -120,9 +120,10 @@ def _build_system_prompt(persona: Persona) -> str:
 _MAX_BURST = 8  # 单次回复最大消息条数安全上限（正常由 burst_range 引导）
 
 
-# 检测 LLM 推理泄漏：中文内容后跟随英文句子（如 `"). Let's ask about...`）
+# 检测 LLM 推理泄漏：中文内容后跟随英文句子
+# 匹配过渡符（引号、括号、标点、破折号等）+ 大写字母开头的英文长句
 _REASONING_LEAK_RE = re.compile(
-    r'["\')}\]]+\s*\.?\s*[A-Z][a-zA-Z\s,\'"\-]{8,}$'
+    r'[\s"\')}\]\.\-,;:。！？…—]+[A-Z][a-zA-Z\s,\'\"\-\*\(\)\.!?;:]{8,}$'
 )
 
 
