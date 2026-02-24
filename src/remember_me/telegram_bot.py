@@ -38,8 +38,13 @@ PROFILES_DIR = DATA_DIR / "profiles"
 class TelegramBot:
     """单 persona Telegram Bot，含每日主动消息调度。"""
 
-    # 消息聚合等待时间（秒）：收到消息后等待这么久，期间的新消息会合并处理
-    MSG_BATCH_DELAY = 1.5
+    # ── 消息聚合参数 ──
+    # 单条消息的短探测延迟（秒）：等这么久看看有没有后续消息
+    COALESCE_PEEK = 0.8
+    # 连发模式的 debounce（秒）：每条新消息重置此计时器
+    COALESCE_DEBOUNCE = 2.0
+    # 从第一条消息算起的最大等待（秒）：超过此时间无论如何都处理
+    COALESCE_MAX_WAIT = 8.0
 
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
@@ -49,10 +54,11 @@ class TelegramBot:
         self._send_lock = asyncio.Lock()
         self._app: Application | None = None
         self._last_user_activity: float = 0.0  # 用户最后交互时间
-        # 消息聚合缓冲
-        self._msg_buffer: list[str] = []
-        self._msg_buffer_lock = asyncio.Lock()
-        self._batch_timer: asyncio.Task | None = None
+        # 消息聚合状态
+        self._coalesce_buffer: list[str] = []
+        self._coalesce_first_at: float = 0.0  # 缓冲区第一条消息的时间戳（monotonic）
+        self._coalesce_timer: asyncio.Task | None = None
+        self._coalesce_lock = asyncio.Lock()
         # 每日调度
         self._daily_times: list[datetime] = []
         self._daily_date: str = ""  # 当前计划对应的日期
@@ -393,26 +399,44 @@ class TelegramBot:
         if not text:
             return
 
-        # 消息聚合：将文本放入缓冲区，重置定时器
-        async with self._msg_buffer_lock:
-            self._msg_buffer.append(text)
-            # 取消上一个定时器（如果有）
-            if self._batch_timer and not self._batch_timer.done():
-                self._batch_timer.cancel()
-            # 启动新的定时器
-            self._batch_timer = asyncio.create_task(
-                self._flush_msg_buffer(chat_id)
+        async with self._coalesce_lock:
+            is_first = len(self._coalesce_buffer) == 0
+            self._coalesce_buffer.append(text)
+
+            # 取消旧的定时器
+            if self._coalesce_timer and not self._coalesce_timer.done():
+                self._coalesce_timer.cancel()
+
+            if is_first:
+                # 第一条消息：记录时间戳，设置短探测延迟
+                self._coalesce_first_at = time.monotonic()
+                delay = self.COALESCE_PEEK
+            else:
+                # 后续消息：使用较长 debounce，但受 max_wait 限制
+                elapsed = time.monotonic() - self._coalesce_first_at
+                remaining = self.COALESCE_MAX_WAIT - elapsed
+                delay = min(self.COALESCE_DEBOUNCE, max(remaining, 0.1))
+
+            self._coalesce_timer = asyncio.create_task(
+                self._flush_coalesce(chat_id, delay)
             )
 
-    async def _flush_msg_buffer(self, chat_id: int):
-        """等待聚合窗口结束后，将缓冲区内所有消息合并发送给 LLM。"""
-        await asyncio.sleep(self.MSG_BATCH_DELAY)
+    async def _flush_coalesce(self, chat_id: int, delay: float):
+        """等待指定延迟后，将缓冲区中的消息合并发送给 LLM。"""
+        await asyncio.sleep(delay)
 
-        async with self._msg_buffer_lock:
-            if not self._msg_buffer:
+        async with self._coalesce_lock:
+            if not self._coalesce_buffer:
                 return
-            merged = "\n".join(self._msg_buffer)
-            self._msg_buffer.clear()
+            messages = list(self._coalesce_buffer)
+            self._coalesce_buffer.clear()
+            self._coalesce_first_at = 0.0
+
+        # 单条消息直接发，多条消息加聚合提示
+        if len(messages) == 1:
+            merged = messages[0]
+        else:
+            merged = f"（对方连续发了 {len(messages)} 条消息）\n" + "\n".join(messages)
 
         async with self._send_lock:
             bot = self._app.bot
@@ -438,11 +462,12 @@ class TelegramBot:
             return
 
         # 图片消息到达时，先把缓冲区里的文字消息冲掉（合并到图片的 caption 里）
-        async with self._msg_buffer_lock:
-            if self._batch_timer and not self._batch_timer.done():
-                self._batch_timer.cancel()
-            buffered = list(self._msg_buffer)
-            self._msg_buffer.clear()
+        async with self._coalesce_lock:
+            if self._coalesce_timer and not self._coalesce_timer.done():
+                self._coalesce_timer.cancel()
+            buffered = list(self._coalesce_buffer)
+            self._coalesce_buffer.clear()
+            self._coalesce_first_at = 0.0
 
         # 下载最大分辨率的图片
         photo = update.message.photo[-1]
