@@ -15,6 +15,8 @@ _SCRATCHPAD_MODEL = "gemini-3-flash-preview"
 _UPDATE_PROMPT = """\
 你是一个对话记录员。分析下面的对话片段，更新对话笔记。
 
+你正在记录的人物是「{persona_name}」。
+
 当前笔记状态:
 {current}
 
@@ -28,8 +30,18 @@ _UPDATE_PROMPT = """\
   ],
   "facts": ["对方/你提到的重要事实，每条一句话"],
   "emotional_tone": "当前对话的情绪氛围",
-  "open_threads": ["还没结束的话题/问题"]
+  "open_threads": ["还没结束的话题/问题"],
+  "emotion": {{
+    "valence": 0.0,
+    "arousal": 0.0,
+    "trigger": "导致当前情绪的原因"
+  }}
 }}
+
+emotion 字段说明（基于「{persona_name}」的性格来判断 TA 的情绪）:
+- valence: -1.0(极不爽) ~ 0(平静) ~ 1.0(极开心)。聊到喜欢的话题/收到好消息→正值；被冒犯/无聊→负值
+- arousal: -1.0(低沉/困) ~ 0(正常) ~ 1.0(极亢奋)。话题激烈/争论/游戏→高值；闲聊/困了→低值
+- 如果对话平淡，valence 和 arousal 都接近 0
 
 规则:
 - 保留之前笔记中仍然相关的内容
@@ -48,6 +60,7 @@ class Scratchpad:
     facts: list[str] = field(default_factory=list)
     emotional_tone: str = ""
     open_threads: list[str] = field(default_factory=list)
+    emotion_raw: dict = field(default_factory=dict)  # LLM 输出的结构化情绪
     last_update_turn: int = 0
     last_update_time: str = ""
 
@@ -108,6 +121,7 @@ def update_scratchpad(
     client: genai.Client,
     scratchpad: Scratchpad,
     recent_history: list[dict],
+    persona_name: str = "",
 ) -> Scratchpad:
     """调用 LLM 更新 scratchpad。recent_history: [{"role": "user"|"model", "text": str}]"""
     current_json = json.dumps(scratchpad.to_dict(), ensure_ascii=False, indent=2)
@@ -116,7 +130,11 @@ def update_scratchpad(
         for m in recent_history
     )
 
-    prompt = _UPDATE_PROMPT.format(current=current_json, messages=messages_text)
+    prompt = _UPDATE_PROMPT.format(
+        current=current_json,
+        messages=messages_text,
+        persona_name=persona_name or "对方",
+    )
 
     response = client.models.generate_content(
         model=_SCRATCHPAD_MODEL,
@@ -136,5 +154,6 @@ def update_scratchpad(
     new_pad.topics = new_pad.topics[:8]
     new_pad.facts = new_pad.facts[:10]
     new_pad.open_threads = new_pad.open_threads[:5]
+    new_pad.emotion_raw = data.get("emotion", {})
     new_pad.last_update_time = datetime.now().isoformat()
     return new_pad

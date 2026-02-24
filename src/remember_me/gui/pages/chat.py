@@ -147,8 +147,12 @@ def create_chat_page(persona_name: str):
             all_text = "".join(replies)
             is_excited = all_text.count("!") >= 2 or all_text.count("！") >= 2
 
+            delay_factor = 1.0
+            if controller._engine:
+                delay_factor = controller._engine.reply_delay_factor
+
             for i, msg in enumerate(replies):
-                await asyncio.sleep(0.4 + random.random() * 0.8)
+                await asyncio.sleep((0.4 + random.random() * 0.8) * delay_factor)
                 with messages_container:
                     render_message(
                         msg, persona_name, is_target=True,
@@ -200,9 +204,13 @@ def create_chat_page(persona_name: str):
             try:
                 msgs, msg_type = _msg_queue.get_nowait()
                 msgs_clean = [m for m in msgs if m and m.strip()]
+                delay_factor = 1.0
+                if controller._engine:
+                    delay_factor = controller._engine.reply_delay_factor
+
                 for i, msg in enumerate(msgs_clean):
                     if i > 0:
-                        await asyncio.sleep(0.4 + random.random() * 0.8)
+                        await asyncio.sleep((0.4 + random.random() * 0.8) * delay_factor)
                     with messages_container:
                         render_message(
                             msg, persona_name, is_target=True,

@@ -323,7 +323,10 @@ class ChatController:
                     self._engine.inject_proactive_message(msgs)
                     self._update_activity()
                     self._fresh_session = False  # 第一条主动消息发出后恢复正常检查
-                    self._next_proactive_at = now + self._proactive_cooldown + random.randint(0, 30)
+                    cooldown = self._proactive_cooldown
+                    if self._engine:
+                        cooldown *= self._engine.proactive_cooldown_factor
+                    self._next_proactive_at = now + cooldown + random.randint(0, 30)
                     if self._on_message:
                         self._on_message(msgs, "proactive")
 

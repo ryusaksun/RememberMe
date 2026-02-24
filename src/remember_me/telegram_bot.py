@@ -516,6 +516,11 @@ class TelegramBot:
         if not msgs:
             return
 
+        # 获取情绪驱动的延迟系数
+        delay_factor = 1.0
+        if self._controller and self._controller._engine:
+            delay_factor = self._controller._engine.reply_delay_factor
+
         for i, msg in enumerate(msgs):
             if msg.startswith("[sticker:"):
                 sticker_path = Path(msg[9:].rstrip("]"))
@@ -528,7 +533,7 @@ class TelegramBot:
                 await bot.send_message(chat_id, msg)
 
             if i < len(msgs) - 1:
-                delay = 0.4 + random.random() * 0.8
+                delay = (0.4 + random.random() * 0.8) * delay_factor
                 await asyncio.sleep(delay)
                 await bot.send_chat_action(chat_id, ChatAction.TYPING)
 

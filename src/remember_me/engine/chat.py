@@ -16,6 +16,7 @@ from google import genai
 from google.genai import types
 
 from remember_me.analyzer.persona import Persona
+from remember_me.engine.emotion import EmotionState
 from remember_me.memory.scratchpad import Scratchpad, update_scratchpad
 from remember_me.memory.store import MemoryStore
 
@@ -143,10 +144,21 @@ class ChatEngine:
         self._sticker_probability = 0.14  # 约 14% 概率发表情包（基于真人数据）
         self._scratchpad = Scratchpad()
         self._scratchpad_updating = False
+        self._emotion_state = EmotionState()
 
     @property
     def client(self) -> genai.Client:
         return self._client
+
+    @property
+    def reply_delay_factor(self) -> float:
+        """情绪驱动的回复延迟系数，供外部（telegram_bot/gui）使用。"""
+        return self._emotion_state.get_modifiers(self._persona).reply_delay_factor
+
+    @property
+    def proactive_cooldown_factor(self) -> float:
+        """情绪驱动的主动消息冷却系数。"""
+        return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
 
     def inject_proactive_message(self, messages: list[str]):
         """将主动消息注入对话历史（作为 model 的发言）。"""
@@ -229,6 +241,14 @@ class ChatEngine:
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
 
+        # 情绪引导
+        emotion_block = self._emotion_state.to_prompt_block(self._persona)
+        if emotion_block:
+            system = system + "\n\n" + emotion_block
+            burst_hint = self._emotion_state.burst_hint()
+            if burst_hint:
+                system = system + "\n" + burst_hint
+
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
             try:
@@ -288,6 +308,7 @@ class ChatEngine:
                 for h in self._history
             ],
             "scratchpad": self._scratchpad.to_dict(),
+            "emotion_state": self._emotion_state.to_dict(),
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -305,6 +326,8 @@ class ChatEngine:
             self._trim_history()
             if data.get("scratchpad"):
                 self._scratchpad = Scratchpad.from_dict(data["scratchpad"])
+            if data.get("emotion_state"):
+                self._emotion_state = EmotionState.from_dict(data["emotion_state"])
             return bool(self._history)
         except Exception as e:
             logger.warning("加载会话失败: %s", e)
@@ -346,9 +369,15 @@ class ChatEngine:
 
         def _do_update():
             try:
-                new_pad = update_scratchpad(self._client, self._scratchpad, recent)
+                new_pad = update_scratchpad(
+                    self._client, self._scratchpad, recent,
+                    persona_name=self._persona.name,
+                )
                 new_pad.last_update_turn = current_turn
                 self._scratchpad = new_pad
+                # 从 Scratchpad LLM 输出同步情绪（覆盖规则引擎微调）
+                if new_pad.emotion_raw:
+                    self._emotion_state.sync_from_scratchpad(new_pad.emotion_raw)
             except Exception as e:
                 logger.debug("Scratchpad 更新失败: %s", e)
             finally:
@@ -362,6 +391,10 @@ class ChatEngine:
 
         image: 可选 (bytes, mime_type) 图片数据，与文本一起发送给 LLM。
         """
+        # 情绪衰减（距上次更新到现在的时间回归）
+        self._emotion_state.decay(self._persona)
+        mods = self._emotion_state.get_modifiers(self._persona)
+
         system = self._build_system(user_input)
 
         parts = [types.Part(text=user_input)]
@@ -371,14 +404,16 @@ class ChatEngine:
         user_msg = types.Content(role="user", parts=parts)
         self._history.append(user_msg)
 
+        temperature = max(0.1, min(1.5, 0.8 + mods.temperature_delta))
+
         try:
             response = self._client.models.generate_content(
                 model="gemini-3.1-pro-preview",
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
-                    temperature=0.8,
-                    max_output_tokens=2048,
+                    temperature=temperature,
+                    max_output_tokens=mods.max_output_tokens,
                 ),
             )
         except Exception:
@@ -395,6 +430,11 @@ class ChatEngine:
 
         self._history.append(types.Content(role="model", parts=[types.Part(text=raw_reply)]))
         self._trim_history()
+
+        # 即时情绪微调（关键词规则）
+        self._emotion_state.quick_adjust(user_input, raw_reply, self._persona)
+        # 动态更新表情包概率
+        self._sticker_probability = mods.sticker_probability
 
         # 异步更新中期记忆
         if self._should_update_scratchpad():

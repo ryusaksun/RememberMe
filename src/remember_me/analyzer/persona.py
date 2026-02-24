@@ -74,6 +74,9 @@ class Persona:
     example_dialogues: list[dict[str, str]] = field(default_factory=list)
     burst_examples: list[dict] = field(default_factory=list)
 
+    # 情绪画像（用于情绪系统基线）
+    emotion_profile: dict = field(default_factory=dict)
+
     # 综合描述
     style_summary: str = ""
 
@@ -253,6 +256,64 @@ def _analyze_topic_keywords(contents: list[str]) -> list[str]:
     return [w for w, count in word_counter.most_common(50) if count >= threshold][:20]
 
 
+_POSITIVE_WORDS_RE = re.compile(r"(哈{2,}|笑死|绝了|牛逼|666|好家伙|太好了|开心|爽|赢了|嘻嘻|好耶)")
+_NEGATIVE_WORDS_RE = re.compile(r"(傻逼|妈的|操|滚|烦死|恶心|吐了|无语|服了|气死)")
+_SAD_WORDS_RE = re.compile(r"(难过|心累|呜|哭|寄了|完蛋|废了|裂开|emo|伤心)")
+_EXCITED_WORDS_RE = re.compile(r"(！{2,}|？{2,}|卧槽|我靠|天|啊{2,}|真的假的)")
+
+
+def _analyze_emotion_profile(history: ChatHistory, contents_no_url: list[str],
+                             topic_interests: dict[str, int]) -> dict:
+    """从历史数据中提取情绪画像：基线 valence/arousal + 话题情绪倾向。"""
+    if not contents_no_url:
+        return {}
+
+    # 统计正/负/悲/兴奋关键词出现率，推算基线 valence/arousal
+    total = len(contents_no_url)
+    pos_count = sum(1 for c in contents_no_url if _POSITIVE_WORDS_RE.search(c))
+    neg_count = sum(1 for c in contents_no_url if _NEGATIVE_WORDS_RE.search(c))
+    sad_count = sum(1 for c in contents_no_url if _SAD_WORDS_RE.search(c))
+    excited_count = sum(1 for c in contents_no_url if _EXCITED_WORDS_RE.search(c))
+
+    pos_ratio = pos_count / total
+    neg_ratio = neg_count / total
+    sad_ratio = sad_count / total
+    excited_ratio = excited_count / total
+
+    # 基线 valence：正向词越多越偏正，负向词越多越偏负
+    default_valence = round((pos_ratio - neg_ratio - sad_ratio) * 2, 2)
+    default_valence = max(-0.5, min(0.5, default_valence))
+
+    # 基线 arousal：兴奋词和负面高激动词越多越高，悲伤词拉低
+    default_arousal = round((excited_ratio + neg_ratio * 0.5 - sad_ratio * 0.5) * 2, 2)
+    default_arousal = max(-0.5, min(0.5, default_arousal))
+
+    # 话题情绪倾向：每个话题中正/负关键词出现的比例差异
+    topic_valence: dict[str, float] = {}
+    topic_defs = {
+        "游戏": r"(王者|游戏|上号|排位|吃鸡)",
+        "音乐": r"(听歌|歌|音乐|演唱会|专辑)",
+        "学习": r"(学习|上课|作业|考试|老师)",
+        "美食": r"(好吃|外卖|奶茶|火锅|烧烤)",
+        "影视": r"(电影|电视|追剧|动漫|B站)",
+    }
+    for topic, pattern in topic_defs.items():
+        related = [c for c in contents_no_url if re.search(pattern, c, re.I)]
+        if len(related) < 5:
+            continue
+        t_pos = sum(1 for c in related if _POSITIVE_WORDS_RE.search(c))
+        t_neg = sum(1 for c in related if _NEGATIVE_WORDS_RE.search(c))
+        t_ratio = (t_pos - t_neg) / len(related)
+        if abs(t_ratio) > 0.05:
+            topic_valence[topic] = round(t_ratio * 3, 2)
+
+    return {
+        "default_valence": default_valence,
+        "default_arousal": default_arousal,
+        "topic_valence": topic_valence,
+    }
+
+
 def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     target_msgs = history.target_messages
     if not target_msgs:
@@ -407,6 +468,9 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     if "热搜/社交" not in topic_interests:
         topic_interests["热搜/社交"] = max(1, topic_threshold)
 
+    # ── 情绪画像 ──
+    emotion_profile = _analyze_emotion_profile(history, contents_no_url, topic_interests)
+
     # ── 典型对话样例（均匀采样） ──
     pairs = history.as_dialogue_pairs()
     pairs = [(u, r) for u, r in pairs
@@ -530,5 +594,6 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         topic_interests=topic_interests,
         example_dialogues=example_dialogues,
         burst_examples=burst_examples,
+        emotion_profile=emotion_profile,
         style_summary=style_summary,
     )
