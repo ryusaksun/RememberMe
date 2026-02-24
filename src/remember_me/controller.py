@@ -187,8 +187,12 @@ class ChatController:
     def _get_idle_seconds(self) -> float:
         return time.time() - self._last_activity
 
-    async def send_message(self, text: str) -> list[str]:
-        """发送用户消息，返回回复列表。"""
+    async def send_message(self, text: str,
+                           image: tuple[bytes, str] | None = None) -> list[str]:
+        """发送用户消息，返回回复列表。
+
+        image: 可选 (bytes, mime_type) 图片。
+        """
         if not self._engine:
             raise RuntimeError("引擎未初始化，请先调用 start()")
 
@@ -200,7 +204,9 @@ class ChatController:
             self._on_typing(True)
         try:
             loop = asyncio.get_event_loop()
-            replies = await loop.run_in_executor(None, self._engine.send_multi, text)
+            replies = await loop.run_in_executor(
+                None, lambda: self._engine.send_multi(text, image=image)
+            )
             self._update_activity()
             return replies
         finally:

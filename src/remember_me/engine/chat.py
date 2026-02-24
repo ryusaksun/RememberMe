@@ -261,7 +261,7 @@ class ChatEngine:
             "name": self._persona.name,
             "updated_at": datetime.now().isoformat(),
             "history": [
-                {"role": h.role, "text": h.parts[0].text if h.parts else ""}
+                {"role": h.role, "text": next((p.text for p in h.parts if p.text), "") if h.parts else ""}
                 for h in self._history
             ],
             "scratchpad": self._scratchpad.to_dict(),
@@ -333,11 +333,19 @@ class ChatEngine:
 
         threading.Thread(target=_do_update, daemon=True).start()
 
-    def send_multi(self, user_input: str) -> list[str]:
-        """发送消息并获取多条回复（模拟连发）。"""
+    def send_multi(self, user_input: str,
+                   image: tuple[bytes, str] | None = None) -> list[str]:
+        """发送消息并获取多条回复（模拟连发）。
+
+        image: 可选 (bytes, mime_type) 图片数据，与文本一起发送给 LLM。
+        """
         system = self._build_system(user_input)
 
-        user_msg = types.Content(role="user", parts=[types.Part(text=user_input)])
+        parts = [types.Part(text=user_input)]
+        if image:
+            img_bytes, mime_type = image
+            parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+        user_msg = types.Content(role="user", parts=parts)
         self._history.append(user_msg)
 
         try:

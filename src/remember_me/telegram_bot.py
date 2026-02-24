@@ -346,6 +346,38 @@ class TelegramBot:
                 logger.exception("发送消息失败")
                 await update.message.reply_text(f"出错了：{e}")
 
+    async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_allowed(update.effective_user.id):
+            return
+
+        chat_id = update.effective_chat.id
+        self._last_user_activity = time.time()
+
+        ok = await self._ensure_session(chat_id)
+        if not ok:
+            await update.message.reply_text("Bot 正在被其他用户使用。")
+            return
+
+        # 下载最大分辨率的图片
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+
+        caption = (update.message.caption or "").strip() or "[图片]"
+
+        async with self._send_lock:
+            bot = self._app.bot
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+            try:
+                replies = await self._controller.send_message(
+                    caption, image=(bytes(image_bytes), "image/jpeg"),
+                )
+                await self._deliver_messages(bot, chat_id, replies)
+            except Exception as e:
+                logger.exception("发送图片消息失败")
+                await update.message.reply_text(f"出错了：{e}")
+
     async def _deliver_messages(self, bot, chat_id: int, msgs: list[str]):
         """逐条发送消息（带打字间隔）。"""
         msgs = [m for m in msgs if m and m.strip()]
@@ -372,6 +404,9 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("note", self._cmd_note))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text)
+        )
+        self._app.add_handler(
+            MessageHandler(filters.PHOTO, self._handle_photo)
         )
 
         async def post_init(app: Application):
