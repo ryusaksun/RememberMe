@@ -19,6 +19,7 @@ dependencies = [
     "requests>=2.31.0",
     "Pillow>=10.0.0",
     "nicegui>=2.0.0",
+    "python-telegram-bot>=21.0",
 ]
 
 [dependency-groups]
@@ -29,6 +30,7 @@ dev = [
 [project.scripts]
 remember-me = "remember_me.cli:cli"
 remember-me-gui = "remember_me.gui.app:main"
+remember-me-tg = "remember_me.telegram_bot:main"
 
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10.0"]
