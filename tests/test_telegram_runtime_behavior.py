@@ -208,3 +208,71 @@ def test_note_rel_list_confirm_reject_flow() -> None:
         assert "已拒绝" in msg_reject.replies[-1]
 
     asyncio.run(_run())
+
+
+def test_daily_proactive_uses_rhythm_policy() -> None:
+    class _FakeEngine:
+        def __init__(self):
+            self.policy_calls: list[tuple[str, str]] = []
+            self.injected: list[str] | None = None
+
+        def plan_rhythm_policy(self, *, kind: str, user_input: str = ""):
+            self.policy_calls.append((kind, user_input))
+            return SimpleNamespace(
+                min_count=1,
+                max_count=2,
+                prefer_count=1,
+                min_len=6,
+                max_len=22,
+                prefer_len=12,
+                allow_single_short_ack=False,
+            )
+
+        def get_recent_context(self) -> str:
+            return "最近在聊游戏和工作"
+
+        def inject_proactive_message(self, msgs: list[str]):
+            self.injected = list(msgs)
+
+    class _FakeStarter:
+        def __init__(self):
+            self.last_policy = None
+
+        def generate(self, recent_context: str = "", count_policy=None):
+            self.last_policy = count_policy
+            return ["在吗"]
+
+    class _FakeBot:
+        pass
+
+    bot = TelegramBot("token")
+    engine = _FakeEngine()
+    starter = _FakeStarter()
+    bot._controller = SimpleNamespace(
+        _engine=engine,
+        _topic_starter=starter,
+        _event_tracker=None,
+        _update_activity=lambda: None,
+    )
+    bot._chat_id = 123
+    bot._last_user_activity = 0.0
+    bot._app = SimpleNamespace(bot=_FakeBot())
+
+    async def _ensure_session(chat_id: int, no_greet: bool = False) -> bool:
+        return True
+
+    delivered: dict[str, object] = {}
+
+    async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+        delivered["chat_id"] = chat_id
+        delivered["msgs"] = list(msgs)
+        delivered["phase"] = first_delay_phase
+
+    bot._ensure_session = _ensure_session  # type: ignore[assignment]
+    bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+    asyncio.run(bot._try_send_daily_message())
+    assert starter.last_policy is not None
+    assert engine.policy_calls and engine.policy_calls[0][0] == "proactive"
+    assert engine.injected == ["在吗"]
+    assert delivered["msgs"] == ["在吗"]

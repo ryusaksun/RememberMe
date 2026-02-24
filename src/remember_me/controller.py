@@ -410,8 +410,12 @@ class ChatController:
         try:
             ctx = self._engine.get_recent_context() if self._session_loaded else ""
             loop = asyncio.get_event_loop()
+            greet_policy = self._engine.plan_rhythm_policy(kind="greet", user_input=ctx)
             greet_msgs = await loop.run_in_executor(
-                None, lambda: self._topic_starter.generate(recent_context=ctx)
+                None, lambda: self._topic_starter.generate(
+                    recent_context=ctx,
+                    count_policy=greet_policy,
+                )
             )
             greet_msgs = [m for m in greet_msgs if m and m.strip()]
             if greet_msgs:
@@ -611,10 +615,17 @@ class ChatController:
                     due_events = self._event_tracker.get_due_events()
                     if due_events:
                         event = due_events[0]
+                        event_policy = self._engine.plan_rhythm_policy(
+                            kind="event_followup",
+                            user_input=f"{event.event}\n{event.context}\n{event.followup_hint}",
+                        )
                         logger.info("触发事件追问: %s", event.event)
                         msgs = await loop.run_in_executor(
                             None, lambda: self._topic_starter.generate_event_followup(
-                                event.event, event.context, event.followup_hint
+                                event.event,
+                                event.context,
+                                event.followup_hint,
+                                count_policy=event_policy,
                             )
                         )
                         if msgs:
@@ -625,6 +636,10 @@ class ChatController:
                     fact = self._pick_shared_event_fact()
                     if fact:
                         ctx = self._engine.get_recent_context()
+                        rel_policy = self._engine.plan_rhythm_policy(
+                            kind="relationship_followup",
+                            user_input=f"{ctx}\n{fact.content}",
+                        )
                         relation_fact_id = fact.id
                         msgs = await loop.run_in_executor(
                             None, lambda: self._topic_starter.generate_relationship_followup(
@@ -632,6 +647,7 @@ class ChatController:
                                 fact_content=fact.content,
                                 fact_meta=fact.meta,
                                 recent_context=ctx,
+                                count_policy=rel_policy,
                             ),
                         )
 
@@ -642,8 +658,15 @@ class ChatController:
                         if idle < self._reply_checkin_wait or self._consecutive_proactive >= 1:
                             continue
                         ctx = self._engine.get_recent_context()
+                        checkin_policy = self._engine.plan_rhythm_policy(
+                            kind="followup",
+                            user_input=ctx,
+                        )
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate_checkin(ctx)
+                            None, lambda: self._topic_starter.generate_checkin(
+                                ctx,
+                                count_policy=checkin_policy,
+                            )
                         )
                     else:
                         # 主动消息后沉默 → 追问（最多 1 次追问，加上原始消息共 2 条）
@@ -651,9 +674,15 @@ class ChatController:
                             continue
                         if self._topic_starter._last_proactive:
                             ctx = self._engine.get_recent_context()
+                            followup_policy = self._engine.plan_rhythm_policy(
+                                kind="followup",
+                                user_input=ctx,
+                            )
                             msgs = await loop.run_in_executor(
                                 None, lambda: self._topic_starter.generate_followup(
-                                    recent_context=ctx, allow_new_topic=False,
+                                    recent_context=ctx,
+                                    allow_new_topic=False,
+                                    count_policy=followup_policy,
                                 )
                             )
 

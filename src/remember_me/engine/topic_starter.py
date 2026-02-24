@@ -14,7 +14,13 @@ from google.genai import types
 
 from remember_me.analyzer.persona import Persona
 from remember_me.engine.brave import brave_search
-from remember_me.engine.chat import _MSG_SEPARATOR, _build_system_prompt, _split_reply
+from remember_me.engine.chat import (
+    RhythmPolicy,
+    _MSG_SEPARATOR,
+    _build_system_prompt,
+    _split_reply,
+    normalize_messages_by_policy,
+)
 
 # 每个话题对应多个搜索词，随机选一个，避免每次搜到同样内容
 _TOPIC_SEARCH_HINTS: dict[str, list[str]] = {
@@ -137,7 +143,37 @@ class TopicStarter:
         self._used_topics.add(chosen)
         return chosen
 
-    def _generate_with_context(self, prompt: str) -> list[str]:
+    @staticmethod
+    def _fallback_policy() -> RhythmPolicy:
+        return RhythmPolicy(
+            min_count=1,
+            max_count=2,
+            prefer_count=1,
+            min_len=6,
+            max_len=22,
+            prefer_len=12,
+            allow_single_short_ack=False,
+        )
+
+    @staticmethod
+    def _policy_prompt_line(policy: RhythmPolicy) -> str:
+        if policy.min_count == policy.max_count:
+            count_text = f"{policy.max_count} 条"
+        else:
+            count_text = f"{policy.min_count}-{policy.max_count} 条"
+        if policy.min_len == policy.max_len:
+            len_text = f"{policy.max_len} 字"
+        else:
+            len_text = f"{policy.min_len}-{policy.max_len} 字"
+        return f"回复 {count_text}，单条大约 {len_text}"
+
+    def _generate_with_context(
+        self,
+        prompt: str,
+        *,
+        count_policy: RhythmPolicy | None = None,
+        user_input: str = "",
+    ) -> list[str]:
         """用 Gemini 3.1 Pro 生成消息。"""
         response = self._client.models.generate_content(
             model=_MODEL,
@@ -155,10 +191,17 @@ class TopicStarter:
             and response.candidates[0].finish_reason.name == "MAX_TOKENS"
         )
         messages = _split_reply(raw, truncated=truncated)
-        return [m for m in messages if m]
+        policy = count_policy or self._fallback_policy()
+        return normalize_messages_by_policy(messages, policy, user_input=user_input)
 
-    def generate(self, topic: str | None = None, recent_context: str = "") -> list[str]:
+    def generate(
+        self,
+        topic: str | None = None,
+        recent_context: str = "",
+        count_policy: RhythmPolicy | None = None,
+    ) -> list[str]:
         """搜索热点 + 生成主动消息。会参考当前对话内容决定如何切入。"""
+        policy = count_policy or self._fallback_policy()
         if topic is None:
             topic = self.pick_topic()
         if topic is None:
@@ -200,7 +243,7 @@ class TopicStarter:
                 f"- 像是随手在聊天窗口打字，不要像新闻播报\n"
                 f"- 加上自己的评价/吐槽\n"
                 f"- 用 {_MSG_SEPARATOR} 分隔多条消息\n"
-                f"- 1-3 条短消息就够了\n"
+                f"- {self._policy_prompt_line(policy)}\n"
             )
         else:
             prompt = (
@@ -211,10 +254,14 @@ class TopicStarter:
                 f"要求：\n"
                 f"- 像是随手在聊天窗口打字，自然随意\n"
                 f"- 用 {_MSG_SEPARATOR} 分隔多条消息\n"
-                f"- 1-3 条短消息就够了\n"
+                f"- {self._policy_prompt_line(policy)}\n"
             )
 
-        msgs = self._generate_with_context(prompt)
+        msgs = self._generate_with_context(
+            prompt,
+            count_policy=policy,
+            user_input=recent_context,
+        )
         if msgs:
             self._last_proactive = msgs
             self._followup_count = 0
@@ -224,8 +271,13 @@ class TopicStarter:
     def should_send_proactive(self) -> bool:
         return self._proactive_count < self._max_proactive_per_silence
 
-    def generate_checkin(self, recent_context: str) -> list[str]:
+    def generate_checkin(
+        self,
+        recent_context: str,
+        count_policy: RhythmPolicy | None = None,
+    ) -> list[str]:
         """对方回了消息后沉默了一段时间，接着聊或关心对方。不引入新话题。"""
+        policy = count_policy or self._fallback_policy()
         name = self._persona.name
         prompt = (
             f"你们刚刚在聊的内容：\n{recent_context}\n\n"
@@ -235,31 +287,41 @@ class TopicStarter:
             f"要求：\n"
             f"- 像是随口一问，不要太正式\n"
             f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果需要）\n"
-            f"- 1 条短消息就够了\n"
+            f"- {self._policy_prompt_line(policy)}\n"
         )
-        msgs = self._generate_with_context(prompt)
+        msgs = self._generate_with_context(
+            prompt,
+            count_policy=policy,
+            user_input=recent_context,
+        )
         if msgs:
             self._last_proactive = msgs
             self._followup_count = 0
             self._proactive_count += 1
         return msgs
 
-    def generate_followup(self, recent_context: str = "", allow_new_topic: bool = True) -> list[str]:
+    def generate_followup(
+        self,
+        recent_context: str = "",
+        allow_new_topic: bool = True,
+        count_policy: RhythmPolicy | None = None,
+    ) -> list[str]:
         """对方没回复时的行为，根据 chase_ratio 决定。"""
+        policy = count_policy or self._fallback_policy()
 
         if self._chase_ratio < 0.05:
             if not allow_new_topic:
                 return []
             self._last_proactive = []
             self._followup_count = 0
-            return self.generate(recent_context=recent_context)
+            return self.generate(recent_context=recent_context, count_policy=policy)
 
         if self._followup_count >= max(1, round(self._chase_ratio * 10)):
             if not allow_new_topic:
                 return []
             self._last_proactive = []
             self._followup_count = 0
-            return self.generate(recent_context=recent_context)
+            return self.generate(recent_context=recent_context, count_policy=policy)
 
         name = self._persona.name
         last_msg = _MSG_SEPARATOR.join(self._last_proactive)
@@ -267,18 +329,29 @@ class TopicStarter:
         prompt = (
             f"你刚刚跟对方说了：「{last_msg}」\n"
             f"但对方没有回复。你想追问一下。\n\n"
-            f"用{name}的语气，自然地追一句，1 条短消息就行。\n"
+            f"用{name}的语气自然地追一句。\n"
+            f"要求：{self._policy_prompt_line(policy)}。\n"
         )
 
-        msgs = self._generate_with_context(prompt)
+        msgs = self._generate_with_context(
+            prompt,
+            count_policy=policy,
+            user_input=recent_context,
+        )
         if msgs:
             self._followup_count += 1
             self._proactive_count += 1
         return msgs
 
-    def generate_event_followup(self, event_desc: str, event_context: str,
-                                followup_hint: str) -> list[str]:
+    def generate_event_followup(
+        self,
+        event_desc: str,
+        event_context: str,
+        followup_hint: str,
+        count_policy: RhythmPolicy | None = None,
+    ) -> list[str]:
         """为待跟进事件生成追问消息。"""
+        policy = count_policy or self._fallback_policy()
         name = self._persona.name
 
         prompt = (
@@ -288,11 +361,15 @@ class TopicStarter:
             f"用{name}的语气，自然地问一句。要求：\n"
             f"- 像是突然想起来随口一问，不要太正式\n"
             f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果需要）\n"
-            f"- 1-2 条短消息就够了\n"
+            f"- {self._policy_prompt_line(policy)}\n"
             f"- 不要重复对方原话，用自己的方式表达关心\n"
         )
 
-        msgs = self._generate_with_context(prompt)
+        msgs = self._generate_with_context(
+            prompt,
+            count_policy=policy,
+            user_input=event_context,
+        )
         if msgs:
             self._last_proactive = msgs
             self._followup_count = 0
@@ -305,8 +382,10 @@ class TopicStarter:
         fact_content: str,
         fact_meta: dict | None = None,
         recent_context: str = "",
+        count_policy: RhythmPolicy | None = None,
     ) -> list[str]:
         """基于已确认关系记忆生成主动接话（shared_event 优先）。"""
+        policy = count_policy or self._fallback_policy()
         name = self._persona.name
         meta = fact_meta if isinstance(fact_meta, dict) else {}
         context = ""
@@ -353,14 +432,19 @@ class TopicStarter:
             f"{context}"
             f"你们关系记忆里有一条：{memory_line}\n"
             f"{intent}\n"
-            f"用{name}的语气发 1 条短消息，必要时最多 2 条。\n"
+            f"用{name}的语气发消息。\n"
             f"要求：\n"
             f"- 像平时聊天，不要解释“我记得你”\n"
             f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果有）\n"
             f"- 不要太正式，不要写成长段\n"
+            f"- {self._policy_prompt_line(policy)}\n"
         )
 
-        msgs = self._generate_with_context(prompt)
+        msgs = self._generate_with_context(
+            prompt,
+            count_policy=policy,
+            user_input=recent_context or fact_content,
+        )
         if msgs:
             self._last_proactive = msgs
             self._followup_count = 0

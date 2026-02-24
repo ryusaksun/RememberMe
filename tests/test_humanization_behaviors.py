@@ -8,7 +8,13 @@ from datetime import datetime, timedelta
 
 from remember_me.analyzer.persona import Persona, analyze
 from remember_me.controller import ChatController
-from remember_me.engine.chat import ChatEngine, _sanitize_reply_messages, _split_reply
+from remember_me.engine.chat import (
+    ChatEngine,
+    RhythmPolicy,
+    _sanitize_reply_messages,
+    _split_reply,
+    normalize_messages_by_policy,
+)
 from remember_me.engine.emotion import EmotionState
 from remember_me.engine.pending_events import PendingEvent, PendingEventTracker
 from remember_me.importers.base import ChatHistory, ChatMessage
@@ -217,6 +223,89 @@ def test_split_reply_filters_internal_monologue_markers() -> None:
     leaked = "(Internal Monologue/Trial)**:\n* *Message 1*: 就那个唱外"
     assert _split_reply(leaked) == []
     assert _split_reply(f"你嘛|||{leaked}|||好") == ["你嘛", "好"]
+
+
+def test_rhythm_policy_event_priority_over_emotion() -> None:
+    e = ChatEngine.__new__(ChatEngine)
+    e._persona = Persona(name="x", avg_burst_length=2.0, avg_length=10.0)
+    e._state_lock = threading.Lock()
+    e._emotion_state = EmotionState(valence=-0.8, arousal=-0.8)
+    e._session_phase = "normal"
+    e._history = []
+
+    policy = e.plan_rhythm_policy(kind="reply", user_input="明天面试结果要出了，我有点焦虑")
+    assert policy.min_count >= 2
+    assert policy.max_len >= 20
+
+
+def test_rhythm_policy_deep_talk_reduces_fragmentation() -> None:
+    e = ChatEngine.__new__(ChatEngine)
+    e._persona = Persona(name="x", avg_burst_length=4.2, avg_length=14.0)
+    e._state_lock = threading.Lock()
+    e._emotion_state = EmotionState(valence=0.0, arousal=0.0)
+    e._session_phase = "deep_talk"
+    e._history = []
+
+    policy = e.plan_rhythm_policy(kind="reply", user_input="我们认真聊聊最近状态")
+    assert policy.max_count <= 3
+    assert policy.min_len >= 6
+
+
+def test_normalize_messages_by_policy_enforces_count_and_len() -> None:
+    policy = RhythmPolicy(
+        min_count=2,
+        max_count=3,
+        prefer_count=2,
+        min_len=5,
+        max_len=10,
+        prefer_len=8,
+        allow_single_short_ack=False,
+    )
+    out = normalize_messages_by_policy(
+        ["这是一段非常非常长而且没有标点分隔需要拆开的句子"],
+        policy,
+        user_input="展开说说",
+    )
+    assert 2 <= len(out) <= 3
+    assert all(len(x) <= 15 for x in out)
+    assert all(x.strip() for x in out)
+
+
+def test_normalize_messages_short_ack_can_keep_single() -> None:
+    policy = RhythmPolicy(
+        min_count=2,
+        max_count=3,
+        prefer_count=2,
+        min_len=4,
+        max_len=12,
+        prefer_len=8,
+        allow_single_short_ack=True,
+    )
+    out = normalize_messages_by_policy(["嗯"], policy, user_input="嗯")
+    assert out == ["嗯"]
+
+
+def test_sticker_attach_respects_max_count(monkeypatch) -> None:
+    class _Sticker:
+        path = "a.png"
+
+    class _StickerLib:
+        stickers = [1]
+
+        def random_sticker(self, emotion: str):
+            return _Sticker()
+
+    e = ChatEngine.__new__(ChatEngine)
+    e._sticker_lib = _StickerLib()
+    e._sticker_probability = 1.0
+    monkeypatch.setattr("random.random", lambda: 0.0)
+
+    capped = e._maybe_attach_sticker(["第一条", "第二条"], allow_sticker=True, max_count=2)
+    assert len(capped) == 2
+
+    allowed = e._maybe_attach_sticker(["第一条", "第二条"], allow_sticker=True, max_count=3)
+    assert len(allowed) == 3
+    assert allowed[-1].startswith("[sticker:")
 
 
 def test_sanitize_reply_messages_uses_safe_fallback_for_leak_only() -> None:

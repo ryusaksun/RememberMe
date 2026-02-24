@@ -309,10 +309,17 @@ class TelegramBot:
                 due_events = controller._event_tracker.get_due_events()
                 if due_events:
                     event = due_events[0]
+                    event_policy = controller._engine.plan_rhythm_policy(
+                        kind="event_followup",
+                        user_input=f"{event.event}\n{event.context}\n{event.followup_hint}",
+                    )
                     logger.info("每日消息触发事件追问: %s", event.event)
                     msgs = await loop.run_in_executor(
                         None, lambda: controller._topic_starter.generate_event_followup(
-                            event.event, event.context, event.followup_hint
+                            event.event,
+                            event.context,
+                            event.followup_hint,
+                            count_policy=event_policy,
                         )
                     )
                     if msgs:
@@ -321,8 +328,15 @@ class TelegramBot:
             # 优先级 2：常规新话题
             if not msgs:
                 ctx = controller._engine.get_recent_context() if controller._engine else ""
+                proactive_policy = controller._engine.plan_rhythm_policy(
+                    kind="proactive",
+                    user_input=ctx,
+                )
                 msgs = await loop.run_in_executor(
-                    None, lambda: controller._topic_starter.generate(recent_context=ctx)
+                    None, lambda: controller._topic_starter.generate(
+                        recent_context=ctx,
+                        count_policy=proactive_policy,
+                    )
                 )
 
             msgs = [m for m in (msgs or []) if m and m.strip()]

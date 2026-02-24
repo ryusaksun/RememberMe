@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,6 +30,12 @@ from remember_me.memory.store import MemoryStore
 from remember_me.models import MODEL_LIGHT, MODEL_MAIN
 
 _MSG_SEPARATOR = "|||"
+
+_SHORT_ACK_RE = re.compile(r"^(嗯+|哦+|好+|行|ok|好的?|收到|知道了|明白|了解|是的?)$", re.I)
+_EVENT_IMPORTANT_RE = re.compile(
+    r"(面试|考试|体检|手术|住院|生病|离职|裁员|分手|吵架|deadline|ddl|汇报|开会|签约|搬家|相亲|见家长|复合|焦虑|崩溃|失眠|抑郁|emo)",
+    re.I,
+)
 
 
 def _build_system_prompt(persona: Persona) -> str:
@@ -148,6 +155,32 @@ _SESSION_PHASE_GUIDE = {
 }
 
 
+@dataclass(frozen=True)
+class RhythmInputs:
+    kind: str
+    user_input: str
+    session_phase: str
+    event_score: float
+    emotion_valence: float
+    emotion_arousal: float
+    persona_avg_burst: float
+    persona_avg_len: float
+    context_density: float
+    burst_low: int
+    burst_high: int
+
+
+@dataclass(frozen=True)
+class RhythmPolicy:
+    min_count: int
+    max_count: int
+    prefer_count: int
+    min_len: int
+    max_len: int
+    prefer_len: int
+    allow_single_short_ack: bool = False
+
+
 # 检测 LLM 推理泄漏：中文内容后跟随英文句子
 # 匹配过渡符（引号、括号、标点、破折号等）+ 大写字母开头的英文长句
 _REASONING_LEAK_RE = re.compile(
@@ -222,6 +255,159 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     if len(result) > _MAX_BURST:
         result = result[:_MAX_BURST]
     return result
+
+
+def _is_short_ack(text: str) -> bool:
+    return bool(_SHORT_ACK_RE.match((text or "").strip()))
+
+
+def _split_long_message_to_segments(
+    text: str,
+    target_parts: int,
+    *,
+    min_len: int = 4,
+    max_len: int = 24,
+) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if target_parts <= 1:
+        return [raw]
+
+    parts = re.split(r"(?<=[，。！？!?；;、\n])", raw)
+    punct_segments = [p.strip() for p in parts if p and p.strip()]
+    punct_segments = [p for p in punct_segments if p]
+
+    segments: list[str] = []
+    if punct_segments and len(punct_segments) >= 2:
+        segments = punct_segments
+    else:
+        chunk = max(min_len, min(max_len, max(4, len(raw) // target_parts)))
+        cursor = 0
+        while cursor < len(raw):
+            end = min(len(raw), cursor + chunk)
+            segments.append(raw[cursor:end].strip())
+            cursor = end
+
+    merged: list[str] = []
+    for seg in segments:
+        if not seg:
+            continue
+        if merged and len(merged[-1]) < min_len:
+            candidate = f"{merged[-1]}{seg}"
+            if len(candidate) <= max_len + min_len:
+                merged[-1] = candidate
+                continue
+        merged.append(seg)
+
+    return [s for s in merged if s]
+
+
+def _merge_overflow_segments(messages: list[str], target_count: int) -> list[str]:
+    if target_count <= 0:
+        return []
+    out = [m.strip() for m in messages if m and m.strip()]
+    if not out:
+        return []
+    while len(out) > target_count and len(out) >= 2:
+        tail = out.pop()
+        head = out.pop()
+        glue = "" if head.endswith(("，", "。", "！", "？", "!", "?")) else "，"
+        out.append(f"{head}{glue}{tail}")
+    return out
+
+
+def normalize_messages_by_policy(
+    messages: list[str],
+    policy: RhythmPolicy,
+    *,
+    user_input: str = "",
+) -> list[str]:
+    rows = [str(m).strip() for m in (messages or []) if str(m).strip()]
+    if not rows:
+        return []
+
+    max_count = max(1, min(_MAX_BURST, int(policy.max_count)))
+    min_count = max(1, min(max_count, int(policy.min_count)))
+    min_len = max(2, int(policy.min_len))
+    max_len = max(min_len + 2, int(policy.max_len))
+    prefer_len = max(min_len, min(max_len, int(policy.prefer_len)))
+
+    stickers = [m for m in rows if m.startswith("[sticker:")]
+    texts = [m for m in rows if not m.startswith("[sticker:")]
+    if not texts:
+        return rows[:max_count]
+
+    # 先按单条上限拆分过长文本
+    expanded: list[str] = []
+    for msg in texts:
+        if len(msg) <= max_len:
+            expanded.append(msg)
+            continue
+        est_parts = max(2, round(len(msg) / max(1, prefer_len)))
+        est_parts = min(max_count, max(2, est_parts))
+        expanded.extend(
+            _split_long_message_to_segments(
+                msg,
+                est_parts,
+                min_len=min_len,
+                max_len=max_len,
+            )
+        )
+    texts = [m for m in expanded if m]
+
+    # 条数超上限时先合并文本，再丢弃贴纸，最后硬裁
+    while len(texts) + len(stickers) > max_count and len(texts) > 1:
+        texts = _merge_overflow_segments(texts, len(texts) - 1)
+    while len(texts) + len(stickers) > max_count and stickers:
+        stickers.pop()
+    if len(texts) + len(stickers) > max_count:
+        keep_text = max(1, max_count - len(stickers))
+        texts = _merge_overflow_segments(texts, keep_text)[:keep_text]
+
+    should_relax_min = policy.allow_single_short_ack and _is_short_ack(user_input)
+    if not should_relax_min and len(texts) + len(stickers) < min_count and texts:
+        need = min_count - (len(texts) + len(stickers))
+        for _ in range(need):
+            idx = max(range(len(texts)), key=lambda i: len(texts[i]), default=-1)
+            if idx < 0:
+                break
+            msg = texts[idx]
+            if len(msg) < max(min_len * 2, 8):
+                break
+            parts = _split_long_message_to_segments(msg, 2, min_len=min_len, max_len=max_len)
+            if len(parts) < 2:
+                break
+            texts[idx:idx + 1] = parts
+            if len(texts) + len(stickers) >= min_count:
+                break
+
+    # 消除过短碎片：和后句合并
+    i = 0
+    while i < len(texts) - 1:
+        cur = texts[i]
+        nxt = texts[i + 1]
+        if len(cur) >= min_len:
+            i += 1
+            continue
+        glue = "" if cur.endswith(("，", "。", "！", "？", "!", "?")) else "，"
+        merged = f"{cur}{glue}{nxt}"
+        if len(merged) <= max_len + min_len:
+            texts[i] = merged
+            del texts[i + 1]
+            continue
+        i += 1
+
+    # 最终安全限流
+    while len(texts) + len(stickers) > max_count and len(texts) > 1:
+        texts = _merge_overflow_segments(texts, len(texts) - 1)
+    while len(texts) + len(stickers) > max_count and stickers:
+        stickers.pop()
+
+    output = texts + stickers
+    if not output:
+        return rows[:1]
+    return output[:max_count]
 
 
 def _sanitize_reply_messages(raw_reply: str, truncated: bool = False) -> list[str]:
@@ -457,6 +643,173 @@ class ChatEngine:
             hi_cap=5.0,
         )
 
+    def _estimate_context_density(self, user_input: str) -> float:
+        text = (user_input or "").strip()
+        if not text:
+            return 0.2
+        recent = self.get_recent_context()
+        recent_len = len(recent.replace("\n", ""))
+        text_len = len(text)
+        raw = min(1.0, (recent_len / 360.0) * 0.5 + (text_len / 120.0) * 0.5)
+        return max(0.0, raw)
+
+    @staticmethod
+    def _estimate_event_score(kind: str, user_input: str) -> float:
+        kind_key = str(kind or "").strip().lower()
+        if kind_key == "event_followup":
+            return 1.0
+        if kind_key == "relationship_followup":
+            return 0.85
+        if kind_key in {"greet", "proactive"}:
+            base = 0.35
+        elif kind_key == "followup":
+            base = 0.45
+        else:
+            base = 0.30
+
+        text = (user_input or "").strip()
+        if not text:
+            return base
+        if _EVENT_IMPORTANT_RE.search(text):
+            return max(base, 0.82)
+        if re.search(r"(上次|那次|还记得|之后|后来|结果|进展|怎么样了)", text):
+            return max(base, 0.62)
+        return base
+
+    def build_rhythm_inputs(
+        self,
+        *,
+        kind: str,
+        user_input: str = "",
+        event_score: float | None = None,
+    ) -> RhythmInputs:
+        with self._state_lock:
+            valence = float(self._emotion_state.valence)
+            arousal = float(self._emotion_state.arousal)
+            burst_low, burst_high = self._emotion_state.compute_burst_range(self._persona)
+        persona_avg_burst = float(getattr(self._persona, "avg_burst_length", 2.0) or 2.0)
+        persona_avg_len = float(getattr(self._persona, "avg_length", 12.0) or 12.0)
+        score = float(event_score) if event_score is not None else self._estimate_event_score(kind, user_input)
+        score = max(0.0, min(1.0, score))
+        return RhythmInputs(
+            kind=str(kind or "reply"),
+            user_input=str(user_input or ""),
+            session_phase=str(getattr(self, "_session_phase", "normal") or "normal"),
+            event_score=score,
+            emotion_valence=max(-1.0, min(1.0, valence)),
+            emotion_arousal=max(-1.0, min(1.0, arousal)),
+            persona_avg_burst=persona_avg_burst,
+            persona_avg_len=persona_avg_len,
+            context_density=self._estimate_context_density(user_input),
+            burst_low=max(1, min(_MAX_BURST, int(burst_low))),
+            burst_high=max(1, min(_MAX_BURST, int(burst_high))),
+        )
+
+    def plan_rhythm_policy(
+        self,
+        *,
+        kind: str,
+        user_input: str = "",
+        event_score: float | None = None,
+    ) -> RhythmPolicy:
+        inputs = self.build_rhythm_inputs(kind=kind, user_input=user_input, event_score=event_score)
+        kind_key = inputs.kind.lower()
+
+        if kind_key == "reply":
+            min_count = max(1, min(_MAX_BURST, inputs.burst_low))
+            max_count = max(min_count, min(_MAX_BURST, inputs.burst_high))
+            prefer_count = max(min_count, min(max_count, round((min_count + max_count) / 2)))
+            base_len = max(8, min(26, round(inputs.persona_avg_len)))
+            min_len = max(4, min(16, base_len - 5))
+            max_len = max(min_len + 4, min(38, base_len + 9))
+            prefer_len = max(min_len, min(max_len, base_len))
+            allow_single_short_ack = True
+        else:
+            min_count, max_count, prefer_count = 1, 2, 1
+            min_len, max_len, prefer_len = 6, 22, 12
+            allow_single_short_ack = False
+
+        # 事件优先：关键事件优先保证信息完整
+        if inputs.event_score >= 0.8:
+            min_count = min(_MAX_BURST, min_count + 1)
+            max_count = min(_MAX_BURST, max(max_count, min_count + 1))
+            prefer_count = min(max_count, prefer_count + 1)
+            min_len = min(28, min_len + 4)
+            max_len = min(44, max_len + 8)
+            prefer_len = min(max_len, prefer_len + 5)
+        elif inputs.event_score >= 0.5:
+            max_count = min(_MAX_BURST, max_count + 1)
+            prefer_count = min(max_count, prefer_count + 1)
+            min_len = min(26, min_len + 2)
+            max_len = min(40, max_len + 4)
+            prefer_len = min(max_len, prefer_len + 2)
+
+        # 情绪微调：不覆盖事件优先，只做轻量偏移
+        if inputs.emotion_arousal > 0.45:
+            max_count = min(_MAX_BURST, max_count + 1)
+            prefer_count = min(max_count, prefer_count + 1)
+            min_len = max(4, min_len - 1)
+            max_len = max(min_len + 4, max_len - 2)
+        elif inputs.emotion_arousal < -0.35 or inputs.emotion_valence < -0.45:
+            max_count = max(min_count, max_count - 1)
+            prefer_count = max(min_count, prefer_count - 1)
+            min_len = min(30, min_len + 2)
+            max_len = min(46, max_len + 4)
+
+        phase = inputs.session_phase
+        if phase == "deep_talk":
+            max_count = max(min_count, min(max_count, 3))
+            min_len = min(30, min_len + 2)
+            max_len = min(42, max_len + 2)
+        elif phase == "cooldown":
+            max_count = max(min_count, min(max_count, 2))
+            prefer_count = min(prefer_count, 2)
+            max_len = min(max_len, 22)
+        elif phase == "ending":
+            max_count = max(min_count, min(max_count, 2))
+            prefer_count = 1
+            max_len = min(max_len, 18)
+        elif phase == "warmup":
+            max_count = max(min_count, min(max_count, 3))
+
+        max_count = max(1, min(_MAX_BURST, max_count))
+        min_count = max(1, min(max_count, min_count))
+        prefer_count = max(min_count, min(max_count, prefer_count))
+        min_len = max(2, min(min_len, 40))
+        max_len = max(min_len + 2, min(max_len, 48))
+        prefer_len = max(min_len, min(max_len, prefer_len))
+
+        return RhythmPolicy(
+            min_count=min_count,
+            max_count=max_count,
+            prefer_count=prefer_count,
+            min_len=min_len,
+            max_len=max_len,
+            prefer_len=prefer_len,
+            allow_single_short_ack=allow_single_short_ack,
+        )
+
+    @staticmethod
+    def format_rhythm_hint(policy: RhythmPolicy) -> str:
+        if policy.min_count == policy.max_count:
+            count_hint = f"{policy.max_count}条"
+        else:
+            count_hint = f"{policy.min_count}-{policy.max_count}条"
+        if policy.min_len == policy.max_len:
+            len_hint = f"{policy.max_len}字"
+        else:
+            len_hint = f"{policy.min_len}-{policy.max_len}字"
+        return f"这次回复 {count_hint}，单条大约 {len_hint}。"
+
+    def normalize_messages_by_rhythm(
+        self,
+        messages: list[str],
+        policy: RhythmPolicy,
+        *,
+        user_input: str = "",
+    ) -> list[str]:
+        return normalize_messages_by_policy(messages, policy, user_input=user_input)
+
     def inject_proactive_message(self, messages: list[str]):
         """将主动消息注入对话历史（作为 model 的发言）。"""
         raw = _MSG_SEPARATOR.join(messages)
@@ -530,6 +883,7 @@ class ChatEngine:
             system = system + "\n\n" + phase_block
         expanded_query = self._expand_query(user_input)
         burst_hint = ""
+        rhythm_hint = ""
         gov_core_block = ""
         gov_relationship_block = ""
         gov_boundary_block = ""
@@ -610,6 +964,9 @@ class ChatEngine:
             open_threads = self._rank_open_threads(
                 user_input, list(self._scratchpad.open_threads),
             )
+        rhythm_hint = self.format_rhythm_hint(
+            self.plan_rhythm_policy(kind="reply", user_input=user_input)
+        )
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
@@ -629,7 +986,12 @@ class ChatEngine:
 
         # burst_hint 放在最末尾，确保 LLM 注意力最高
         if burst_hint:
-            system = system + f"\n\n⚠️ {burst_hint}用 ||| 分隔多条消息。记住：反应词之后必须跟实际回应。"
+            system = system + (
+                f"\n\n⚠️ {burst_hint}{rhythm_hint}用 ||| 分隔多条消息。"
+                "记住：反应词之后必须跟实际回应。"
+            )
+        elif rhythm_hint:
+            system = system + f"\n\n⚠️ {rhythm_hint}用 ||| 分隔多条消息。"
 
         return system
 
@@ -763,12 +1125,11 @@ class ChatEngine:
         with self._state_lock:
             self._emotion_state.decay(self._persona)
             mods = self._emotion_state.get_modifiers(self._persona)
-            burst_range = self._emotion_state.compute_burst_range(self._persona)
+        rhythm_policy = self.plan_rhythm_policy(kind="reply", user_input=user_input)
 
-        # 根据 burst 范围动态计算 token 预算（下限 512，保证多条短消息有足够空间）
-        _low, high = burst_range
-        tokens_per_msg = 120
-        mods.max_output_tokens = min(1536, max(512, high * tokens_per_msg))
+        # 根据节奏策略动态计算 token 预算（下限 512，保证多条短消息有足够空间）
+        tokens_per_msg = max(80, min(180, rhythm_policy.prefer_len * 8))
+        mods.max_output_tokens = min(1536, max(512, rhythm_policy.max_count * tokens_per_msg))
 
         system = self._build_system(user_input)
 
@@ -825,9 +1186,16 @@ class ChatEngine:
 
         # 低频人类噪声：偶尔打错字并自我修正，避免回复过于“工整”
         result, noise_applied = self._apply_human_noise_with_flag(result)
+        result = self.normalize_messages_by_rhythm(
+            result, rhythm_policy, user_input=user_input,
+        )
 
-        # 按概率附加表情包
-        result = self._maybe_attach_sticker(result, allow_sticker=not noise_applied)
+        # 按概率附加表情包（计入条数上限）
+        result = self._maybe_attach_sticker(
+            result,
+            allow_sticker=not noise_applied,
+            max_count=rhythm_policy.max_count,
+        )
         return result
 
     def _apply_human_noise(self, replies: list[str]) -> list[str]:
@@ -886,15 +1254,23 @@ class ChatEngine:
         out[idx] = f"{prefix}{msg}"
         return out
 
-    def _maybe_attach_sticker(self, replies: list[str], allow_sticker: bool = True) -> list[str]:
+    def _maybe_attach_sticker(
+        self,
+        replies: list[str],
+        allow_sticker: bool = True,
+        max_count: int = _MAX_BURST,
+    ) -> list[str]:
         """按概率在回复后附加一张表情包。"""
         if not allow_sticker:
             return replies
         if not self._sticker_lib or not self._sticker_lib.stickers:
             return replies
+        max_count = max(1, min(_MAX_BURST, int(max_count)))
+        if len(replies) >= max_count:
+            return replies[:max_count]
         sticker_prob = max(0.01, min(0.35, self._sticker_probability))
         if random.random() > sticker_prob:
-            return replies
+            return replies[:max_count]
 
         # 根据回复内容判断情感
         combined = " ".join(replies)
@@ -902,7 +1278,7 @@ class ChatEngine:
         sticker = self._sticker_lib.random_sticker(emotion)
         if sticker:
             replies.append(f"[sticker:{sticker.path}]")
-        return replies
+        return replies[:max_count]
 
     @staticmethod
     def _detect_emotion(text: str) -> str:
