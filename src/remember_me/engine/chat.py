@@ -43,9 +43,9 @@ def _build_system_prompt(persona: Persona) -> str:
     desc_parts = []
 
     if persona.avg_length < 10:
-        desc_parts.append("说话很短很碎，一句话经常拆成好几条发出去")
+        desc_parts.append("说话很碎，一句话经常拆成好几条发出去，但每次都会把想说的说完")
     elif persona.avg_length < 20:
-        desc_parts.append("说话简短直接")
+        desc_parts.append("说话简短直接，但不会话说到一半就停了")
 
     slang = getattr(persona, "slang_expressions", [])
     if slang:
@@ -89,8 +89,8 @@ def _build_system_prompt(persona: Persona) -> str:
     if burst_ratio > 0.2:
         lines.append("## 回复格式")
         lines.append(f"你习惯连发消息，平均每次发 {avg_burst_length:.0f} 条左右。")
-        lines.append(f"多条消息用 {sep} 分隔。每条都很短。")
-        lines.append("具体发几条，看情况：对方就说了个嗯，你回 1 条就行；聊到感兴趣的话题可以多说几条。")
+        lines.append(f"多条消息用 {sep} 分隔。每条消息像发微信一样简短口语化，但意思要表达完整——宁可多发一条也不要话说一半。")
+        lines.append("具体发几条，看情况：对方就说了个嗯，你回 1 条就行；聊到感兴趣的话题可以多说几条。不管几条，你要说的话要说完，不要像被打断了一样突然结束。")
         lines.append("")
 
     # ── 真实对话示例 ──
@@ -115,6 +115,7 @@ def _build_system_prompt(persona: Persona) -> str:
         "- 模仿示例的语气和风格，但内容要贴合当前话题",
         "- 不要比示例更礼貌、更正式、更啰嗦",
         "- 不要每条都加 emoji、哈哈或口头禅，跟示例频率一致",
+        "- 话要说完：可以简短，可以碎片化，但你想表达的意思必须完整。如果一条装不下就拆成两条发，而不是砍掉一半不说了",
         "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，用来理解你们的关系和共同记忆",
     ])
 

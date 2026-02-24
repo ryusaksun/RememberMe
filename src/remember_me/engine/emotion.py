@@ -226,9 +226,9 @@ class EmotionState:
         if v > 0.3 and a > 0.3:
             lines.append("你现在很来劲，消息会发得比平时更多更快，语气更活跃。")
         elif v < -0.3 and a > 0.3:
-            lines.append("你现在有点烦/生气，说话会更直接更冲，消息可能更短。")
+            lines.append("你现在有点烦/生气，说话会更直接更冲，但该怼的话不会只说半句。")
         elif v < -0.3 and a < -0.3:
-            lines.append("你现在心情不太好，话会变少，可能只回一两个字。不要装没事，就是话少了。")
+            lines.append("你现在心情不太好，话会变少，语气比较冷淡。不要装没事，就是懒得多说。但该回应的还是要说清楚。")
         elif v > 0.3 and a < 0:
             lines.append("你现在心情不错但比较放松，语气温和随意。")
 
@@ -271,7 +271,7 @@ class EmotionState:
         elif bias == -1:
             return "你现在话比较少，倾向于只发 1-2 条。"
         elif bias <= -2:
-            return "你现在不太想说话，大多数时候只回 1 条，而且很短。"
+            return "你现在不太想说话，大多数时候只回 1 条。"
         return "大多数时候 1-3 条。"
 
     # ── 序列化 ──
