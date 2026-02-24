@@ -177,6 +177,49 @@ def chat(name: str, api_key: str | None, no_greet: bool):
         with _activity_lock:
             return _time.time() - last_activity
 
+    def _profile_bounds(
+        profile: dict,
+        fallback: tuple[int, int],
+        lo_scale: float,
+        hi_scale: float,
+        lo_cap: int,
+        hi_cap: int,
+    ) -> tuple[int, int]:
+        if not isinstance(profile, dict) or not profile:
+            return fallback
+        try:
+            p25 = float(profile.get("p25", 0))
+            p75 = float(profile.get("p75", 0))
+        except (TypeError, ValueError):
+            return fallback
+        if p25 <= 0 or p75 <= 0:
+            return fallback
+        lo = max(fallback[0], min(int(p25 * lo_scale), lo_cap))
+        hi = max(lo + 5, min(int(p75 * hi_scale), hi_cap))
+        return lo, hi
+
+    def _sample_proactive_cooldown() -> int:
+        lo, hi = _profile_bounds(
+            getattr(persona, "silence_delay_profile", {}),
+            fallback=(60, 110),
+            lo_scale=0.25,
+            hi_scale=0.45,
+            lo_cap=180,
+            hi_cap=420,
+        )
+        return random.randint(lo, hi)
+
+    def _sample_initial_proactive_delay() -> int:
+        lo, hi = _profile_bounds(
+            getattr(persona, "response_delay_profile", {}),
+            fallback=(20, 45),
+            lo_scale=0.08,
+            hi_scale=0.15,
+            lo_cap=45,
+            hi_cap=90,
+        )
+        return random.randint(lo, hi)
+
     def _show_messages(msgs: list[str]):
         """逐条展示消息（带延迟）。支持 [sticker:path] 格式。"""
         msgs = [m for m in msgs if m and m.strip()]
@@ -189,7 +232,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             else:
                 console.print(f"[bold cyan]{name}[/]: {msg}", highlight=False)
             if i < len(msgs) - 1:
-                _time.sleep(0.4 + random.random() * 0.8)
+                _time.sleep(engine.sample_inter_message_delay(True) * engine.reply_delay_factor)
         console.print()
 
     # ── 用户输入线程 ──
@@ -206,8 +249,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     input_thread.start()
 
     # ── 后台主动消息线程 ──
-    proactive_cooldown = 60  # 发完一条后至少等 60 秒
-    next_proactive_at = _time.time() + random.randint(20, 45)
+    next_proactive_at = _time.time() + _sample_initial_proactive_delay()
 
     def proactive_worker():
         nonlocal next_proactive_at
@@ -234,7 +276,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                             msgs = topic_starter.generate(recent_context=ctx)
                     if msgs:
                         msg_queue.put(("proactive", msgs))
-                        next_proactive_at = now + proactive_cooldown + random.randint(0, 30)
+                        next_proactive_at = now + _sample_proactive_cooldown()
                 except Exception as e:
                     logger.debug("主动消息生成失败: %s", e)
                 if not topic_starter._last_proactive:
@@ -261,7 +303,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             _show_messages(greet_msgs)
             engine.inject_proactive_message(greet_msgs)
             _update_activity()
-            next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
+            next_proactive_at = _time.time() + _sample_proactive_cooldown()
             # 后台预缓存下一条
             threading.Thread(target=topic_starter.prefetch, daemon=True).start()
 
@@ -269,7 +311,7 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     _update_activity()
     # 仅在未被开场消息设置过时初始化 cooldown
     if next_proactive_at <= _time.time():
-        next_proactive_at = _time.time() + proactive_cooldown + random.randint(0, 30)
+        next_proactive_at = _time.time() + _sample_proactive_cooldown()
     proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
     proactive_thread.start()
 

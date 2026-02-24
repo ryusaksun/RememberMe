@@ -125,6 +125,7 @@ def _build_system_prompt(persona: Persona) -> str:
         "- 不要比示例更礼貌、更正式、更啰嗦",
         "- 不要每条都加 emoji、哈哈或口头禅，跟示例频率一致",
         "- 心情再差也要把话说完，冷淡体现在语气上，不是不说话",
+        "- 偶尔可以出现轻微口误并马上自我修正，但频率要很低，不能影响理解",
         "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，用来理解你们的关系和共同记忆",
     ])
 
@@ -191,6 +192,20 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     return result
 
 
+def _introduce_minor_typo(text: str) -> str:
+    """制造一个轻微错字：重复一个字，模拟手滑。"""
+    if len(text) < 6:
+        return text
+    candidates = [
+        i for i, ch in enumerate(text)
+        if ("\u4e00" <= ch <= "\u9fff" or ch.isalpha()) and 1 <= i < len(text) - 1
+    ]
+    if not candidates:
+        return text
+    idx = random.choice(candidates)
+    return text[:idx] + text[idx] + text[idx:]
+
+
 class ChatEngine:
     def __init__(self, persona: Persona, memory: MemoryStore | None = None,
                  api_key: str | None = None, sticker_lib=None,
@@ -207,6 +222,10 @@ class ChatEngine:
         self._history: list[types.Content] = []
         self._sticker_lib = sticker_lib
         self._sticker_probability = 0.14  # 约 14% 概率发表情包（基于真人数据）
+        self._human_noise_probability = max(
+            0.01,
+            min(0.06, 0.02 + getattr(persona, "short_msg_ratio", 0.0) * 0.03),
+        )
         self._scratchpad = Scratchpad()
         self._scratchpad_updating = False
         self._emotion_state = EmotionState()
@@ -225,6 +244,48 @@ class ChatEngine:
     def proactive_cooldown_factor(self) -> float:
         """情绪驱动的主动消息冷却系数。"""
         return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
+
+    @staticmethod
+    def _sample_delay_from_profile(
+        profile: dict,
+        fallback: tuple[float, float],
+        lo_scale: float,
+        hi_scale: float,
+        lo_cap: float,
+        hi_cap: float,
+    ) -> float:
+        if not isinstance(profile, dict) or not profile:
+            return random.uniform(*fallback)
+        try:
+            p25 = float(profile.get("p25", 0))
+            p75 = float(profile.get("p75", 0))
+        except (TypeError, ValueError):
+            return random.uniform(*fallback)
+        if p25 <= 0 or p75 <= 0:
+            return random.uniform(*fallback)
+        lo = max(fallback[0], min(p25 * lo_scale, lo_cap))
+        hi = max(lo + 0.05, min(p75 * hi_scale, hi_cap))
+        return random.uniform(lo, hi)
+
+    def sample_inter_message_delay(self, burst_continuation: bool) -> float:
+        """采样展示延迟（用于 GUI/CLI 打字节奏），单位秒。"""
+        if burst_continuation:
+            return self._sample_delay_from_profile(
+                getattr(self._persona, "burst_delay_profile", {}),
+                fallback=(0.40, 1.20),
+                lo_scale=1 / 8.0,
+                hi_scale=1 / 5.0,
+                lo_cap=2.0,
+                hi_cap=4.0,
+            )
+        return self._sample_delay_from_profile(
+            getattr(self._persona, "response_delay_profile", {}),
+            fallback=(0.55, 1.45),
+            lo_scale=1 / 14.0,
+            hi_scale=1 / 8.0,
+            lo_cap=2.5,
+            hi_cap=5.0,
+        )
 
     def inject_proactive_message(self, messages: list[str]):
         """将主动消息注入对话历史（作为 model 的发言）。"""
@@ -307,10 +368,21 @@ class ChatEngine:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
             burst_hint = self._emotion_state.burst_hint(self._persona)
+            open_threads = list(self._scratchpad.open_threads[:3])
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
             system = system + "\n\n" + emotion_block
+        if open_threads:
+            lines = [
+                "## 回复优先级",
+                "- 如果对方这条消息和未完话题相关，优先把未完的话题聊完。",
+                "- 只有在对方明显切换到新话题时，才放下未完话题。",
+                "未完话题：",
+            ]
+            for thread in open_threads:
+                lines.append(f"- {thread}")
+            system = system + "\n\n" + "\n".join(lines)
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
@@ -529,9 +601,34 @@ class ChatEngine:
         messages = _split_reply(raw_reply, truncated=truncated)
         result = messages if messages else [raw_reply]
 
+        # 低频人类噪声：偶尔打错字并自我修正，避免回复过于“工整”
+        result = self._apply_human_noise(result)
+
         # 按概率附加表情包
         result = self._maybe_attach_sticker(result)
         return result
+
+    def _apply_human_noise(self, replies: list[str]) -> list[str]:
+        if not replies or random.random() > self._human_noise_probability:
+            return replies
+
+        candidates = [
+            (i, m) for i, m in enumerate(replies)
+            if 6 <= len(m) <= 40 and not m.startswith("[sticker:")
+        ]
+        if not candidates:
+            return replies
+
+        idx, msg = random.choice(candidates)
+        typo = _introduce_minor_typo(msg)
+        if typo == msg:
+            return replies
+
+        out = list(replies)
+        out[idx] = typo
+        if random.random() < 0.6 and len(out) < _MAX_BURST:
+            out.insert(idx + 1, f"打错字了，{msg}")
+        return out[:_MAX_BURST]
 
     def _maybe_attach_sticker(self, replies: list[str]) -> list[str]:
         """按概率在回复后附加一张表情包。"""

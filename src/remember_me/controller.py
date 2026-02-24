@@ -33,6 +33,7 @@ class ChatController:
         self._name = persona_name
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self._engine = None
+        self._persona = None
         self._topic_starter = None
         self._memory = None
         self._event_tracker = None
@@ -47,6 +48,7 @@ class ChatController:
         self._session_loaded = False
         self._has_topics = False
         self._proactive_cooldown = 60
+        self._reply_checkin_wait = 300
         self._next_proactive_at = 0.0
         self._consecutive_proactive = 0  # 连续主动消息计数（用户回复后归零）
         self._last_interaction_type: str = "none"  # "reply" | "proactive" | "none"
@@ -55,6 +57,82 @@ class ChatController:
     @property
     def persona_name(self) -> str:
         return self._name
+
+    @staticmethod
+    def _profile_bounds(
+        profile: dict,
+        fallback: tuple[int, int],
+        lo_scale: float,
+        hi_scale: float,
+        lo_cap: int,
+        hi_cap: int,
+    ) -> tuple[int, int]:
+        if not isinstance(profile, dict) or not profile:
+            return fallback
+        try:
+            p25 = float(profile.get("p25", 0))
+            p75 = float(profile.get("p75", 0))
+        except (TypeError, ValueError):
+            return fallback
+        if p25 <= 0 or p75 <= 0:
+            return fallback
+        lo = max(fallback[0], min(int(p25 * lo_scale), lo_cap))
+        hi = max(lo + 5, min(int(p75 * hi_scale), hi_cap))
+        return lo, hi
+
+    def _sample_initial_proactive_delay(self) -> int:
+        profile = getattr(self._persona, "response_delay_profile", {}) if self._persona else {}
+        lo, hi = self._profile_bounds(
+            profile,
+            fallback=(20, 45),
+            lo_scale=0.08,
+            hi_scale=0.15,
+            lo_cap=45,
+            hi_cap=90,
+        )
+        return random.randint(lo, hi)
+
+    def _sample_reply_checkin_wait(self) -> int:
+        profile = getattr(self._persona, "silence_delay_profile", {}) if self._persona else {}
+        lo, hi = self._profile_bounds(
+            profile,
+            fallback=(300, 420),
+            lo_scale=0.7,
+            hi_scale=1.25,
+            lo_cap=600,
+            hi_cap=1200,
+        )
+        chase_ratio = float(getattr(self._persona, "chase_ratio", 0.0) or 0.0) if self._persona else 0.0
+        if chase_ratio < 0.05:
+            lo = int(lo * 1.15)
+            hi = int(hi * 1.25)
+        elif chase_ratio > 0.2:
+            lo = int(lo * 0.8)
+            hi = int(hi * 0.9)
+        lo = max(120, lo)
+        hi = max(lo + 10, min(1500, hi))
+        return random.randint(lo, hi)
+
+    def _sample_proactive_cooldown(self) -> int:
+        profile = getattr(self._persona, "silence_delay_profile", {}) if self._persona else {}
+        lo, hi = self._profile_bounds(
+            profile,
+            fallback=(60, 110),
+            lo_scale=0.25,
+            hi_scale=0.45,
+            lo_cap=180,
+            hi_cap=420,
+        )
+        chase_ratio = float(getattr(self._persona, "chase_ratio", 0.0) or 0.0) if self._persona else 0.0
+        if chase_ratio < 0.05:
+            lo = int(lo * 1.25)
+            hi = int(hi * 1.35)
+        elif chase_ratio > 0.2:
+            lo = int(lo * 0.85)
+            hi = int(hi * 0.9)
+        lo = max(40, lo)
+        hi = max(lo + 10, min(600, hi))
+        return random.randint(lo, hi)
 
     def _load_notes(self) -> list[str]:
         """加载手动备注。"""
@@ -117,6 +195,7 @@ class ChatController:
             raise ValueError("GEMINI_API_KEY 未设置")
 
         persona = Persona.load(profile_path)
+        self._persona = persona
 
         # 加载记忆
         chroma_path = CHROMA_DIR / self._name
@@ -170,7 +249,8 @@ class ChatController:
         self._event_extract_index = len(self._engine._history)
 
         self._update_activity()
-        self._next_proactive_at = time.time() + random.randint(20, 45)
+        self._reply_checkin_wait = self._sample_reply_checkin_wait()
+        self._next_proactive_at = time.time() + self._sample_initial_proactive_delay()
 
         # 主动开场
         if not no_greet and self._has_topics:
@@ -195,7 +275,7 @@ class ChatController:
                 self._update_activity()
                 self._last_interaction_type = "proactive"
                 self._consecutive_proactive = 1
-                self._next_proactive_at = time.time() + self._proactive_cooldown + random.randint(0, 30)
+                self._next_proactive_at = time.time() + self._sample_proactive_cooldown()
                 if self._on_message:
                     self._on_message(greet_msgs, "greet")
                 # 后台预缓存
@@ -237,8 +317,9 @@ class ChatController:
                 None, lambda: self._engine.send_multi(text, image=image)
             )
             self._update_activity()
-            # 回复后长冷却（5-6 分钟），不在对话中途插入新话题
-            self._next_proactive_at = time.time() + 300 + random.randint(0, 60)
+            # 回复后按人格节奏等待一段时间，再考虑接话
+            self._reply_checkin_wait = self._sample_reply_checkin_wait()
+            self._next_proactive_at = time.time() + self._reply_checkin_wait
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
@@ -320,7 +401,7 @@ class ChatController:
                 if not msgs:
                     if self._last_interaction_type == "reply":
                         # 回复后沉默 → 接话/关心，不引新话题
-                        if idle < 300 or self._consecutive_proactive >= 1:
+                        if idle < self._reply_checkin_wait or self._consecutive_proactive >= 1:
                             continue
                         ctx = self._engine.get_recent_context()
                         msgs = await loop.run_in_executor(
@@ -349,10 +430,10 @@ class ChatController:
                     self._consecutive_proactive += 1
                     self._last_interaction_type = "proactive"
                     self._fresh_session = False
-                    cooldown = self._proactive_cooldown
+                    cooldown = self._sample_proactive_cooldown()
                     if self._engine:
                         cooldown *= self._engine.proactive_cooldown_factor
-                    self._next_proactive_at = now + cooldown + random.randint(0, 30)
+                    self._next_proactive_at = now + cooldown
                     if self._on_message:
                         self._on_message(msgs, "proactive")
             except Exception as e:

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class PendingEventTracker:
         self._path = data_dir / "pending_events" / f"{persona_name}.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._events: list[PendingEvent] = self._load()
+        self._embedding_fn = None
 
     def _load(self) -> list[PendingEvent]:
         if not self._path.exists():
@@ -148,14 +150,17 @@ class PendingEventTracker:
             followup_at = now + timedelta(minutes=max(minutes, 10))
 
             # 去重：如果已有类似事件（关键词重叠），跳过
-            event_text = item.get("event", "")
-            if self._is_duplicate(event_text):
+            event_text = str(item.get("event", "") or "").strip()
+            context_text = str(item.get("context", "") or "")
+            if not event_text:
+                continue
+            if self._is_duplicate(event_text, context_text):
                 continue
 
             ev = PendingEvent(
                 id=uuid.uuid4().hex[:8],
                 event=event_text,
-                context=item.get("context", ""),
+                context=context_text,
                 followup_hint=item.get("followup_hint", ""),
                 followup_after=followup_at.isoformat(),
                 extracted_at=now.isoformat(),
@@ -174,15 +179,61 @@ class PendingEventTracker:
 
         return new_events
 
-    def _is_duplicate(self, event_text: str) -> bool:
-        """简单去重：检查现有 pending 事件是否有类似描述。"""
+    @staticmethod
+    def _char_overlap_ratio(a: str, b: str) -> float:
+        a_set = set(a)
+        b_set = set(b)
+        if not a_set or not b_set:
+            return 0.0
+        return len(a_set & b_set) / max(len(a_set), len(b_set))
+
+    @staticmethod
+    def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
+        dot = sum(x * y for x, y in zip(v1, v2))
+        n1 = math.sqrt(sum(x * x for x in v1))
+        n2 = math.sqrt(sum(y * y for y in v2))
+        if n1 == 0 or n2 == 0:
+            return 0.0
+        return dot / (n1 * n2)
+
+    def _semantic_similarity(self, a: str, b: str) -> float:
+        try:
+            if self._embedding_fn is None:
+                from remember_me.memory.store import _get_embedding_function
+                self._embedding_fn = _get_embedding_function()
+            emb = self._embedding_fn([a, b])
+            if not emb or len(emb) != 2:
+                return 0.0
+            return self._cosine_similarity(emb[0], emb[1])
+        except Exception:
+            return 0.0
+
+    def _is_duplicate(self, event_text: str, context: str | None = "") -> bool:
+        """语义去重：文本重叠 + 向量相似度双重判定。"""
+        event_text = str(event_text or "").strip()
+        context = str(context or "")
+        candidate = f"{event_text} {context[:80]}".strip()
+        if len(candidate) < 2:
+            return True
+
         for e in self._events:
             if e.status != "pending":
                 continue
-            # 简单的关键词重叠检测
-            existing_chars = set(e.event)
-            new_chars = set(event_text)
-            if len(existing_chars & new_chars) > len(new_chars) * 0.6:
+
+            existing_event = str(e.event or "").strip()
+            existing_ctx = str(e.context or "")
+            existing = f"{existing_event} {existing_ctx[:80]}".strip()
+            if not existing:
+                continue
+
+            if event_text and existing_event and (event_text in existing_event or existing_event in event_text):
+                return True
+
+            if self._char_overlap_ratio(candidate, existing) >= 0.75:
+                return True
+
+            sim = self._semantic_similarity(candidate, existing)
+            if sim >= 0.84:
                 return True
         return False
 

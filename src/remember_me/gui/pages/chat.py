@@ -152,7 +152,11 @@ def create_chat_page(persona_name: str):
                 delay_factor = controller._engine.reply_delay_factor
 
             for i, msg in enumerate(replies):
-                await asyncio.sleep((0.4 + random.random() * 0.8) * delay_factor)
+                if controller._engine:
+                    base_delay = controller._engine.sample_inter_message_delay(i > 0)
+                else:
+                    base_delay = (0.4 + random.random() * 0.8) if i > 0 else (0.55 + random.random() * 0.9)
+                await asyncio.sleep(base_delay * delay_factor)
                 with messages_container:
                     render_message(
                         msg, persona_name, is_target=True,
@@ -210,7 +214,11 @@ def create_chat_page(persona_name: str):
 
                 for i, msg in enumerate(msgs_clean):
                     if i > 0:
-                        await asyncio.sleep((0.4 + random.random() * 0.8) * delay_factor)
+                        if controller._engine:
+                            base_delay = controller._engine.sample_inter_message_delay(True)
+                        else:
+                            base_delay = 0.4 + random.random() * 0.8
+                        await asyncio.sleep(base_delay * delay_factor)
                     with messages_container:
                         render_message(
                             msg, persona_name, is_target=True,

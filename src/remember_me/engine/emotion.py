@@ -105,10 +105,11 @@ class EmotionState:
 
     def quick_adjust(self, user_input: str, model_reply: str, persona=None):
         """基于关键词的即时情绪微调。"""
-        combined = user_input + " " + model_reply
+        # 只以用户输入为主，避免模型自己的措辞反向放大情绪漂移。
+        user_text = user_input or ""
 
         # 正向情绪
-        if _POSITIVE_RE.search(combined):
+        if _POSITIVE_RE.search(user_text):
             self.valence = _clamp(self.valence + 0.1, -1, 1)
             self.arousal = _clamp(self.arousal + 0.08, -1, 1)
 
@@ -123,7 +124,7 @@ class EmotionState:
             self.arousal = _clamp(self.arousal - 0.1, -1, 1)
 
         # 惊叹（高激动但方向不定）
-        if _EXCITED_RE.search(combined):
+        if _EXCITED_RE.search(user_text):
             self.arousal = _clamp(self.arousal + 0.12, -1, 1)
 
         # 话题情绪（如果 persona 有 topic_valence）
@@ -131,7 +132,7 @@ class EmotionState:
             ep = getattr(persona, "emotion_profile", None) or {}
             topic_valence = ep.get("topic_valence", {})
             for topic, v_shift in topic_valence.items():
-                if topic in combined:
+                if topic in user_text:
                     self.valence = _clamp(self.valence + v_shift * 0.1, -1, 1)
                     break
 

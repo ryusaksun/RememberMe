@@ -65,6 +65,9 @@ class Persona:
     farewell_patterns: list[str] = field(default_factory=list)
     self_references: list[str] = field(default_factory=list)     # 自称方式
     chase_ratio: float = 0.0                                      # 用户沉默后追发的概率
+    response_delay_profile: dict = field(default_factory=dict)    # 对方发言后你的响应时延（秒）
+    burst_delay_profile: dict = field(default_factory=dict)       # 你连发内部时延（秒）
+    silence_delay_profile: dict = field(default_factory=dict)     # 长沉默（>5分钟）后的时延（秒）
 
     # 话题偏好
     topic_keywords: list[str] = field(default_factory=list)
@@ -192,6 +195,33 @@ def _analyze_burst_pattern(history) -> tuple[float, list[float]]:
             dist.append(round(sum(1 for b in bursts if b >= 5) / total, 3))
 
     return avg, dist
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    """线性插值分位数。sorted_values 必须已升序。"""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    idx = (len(sorted_values) - 1) * p
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = idx - lo
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+
+
+def _build_delay_profile(values: list[float]) -> dict:
+    """将秒级样本压缩为分位统计，便于运行时采样。"""
+    filtered = sorted(v for v in values if 0 < v <= 12 * 3600)
+    if not filtered:
+        return {}
+    return {
+        "count": len(filtered),
+        "p25": round(_percentile(filtered, 0.25), 1),
+        "p50": round(_percentile(filtered, 0.50), 1),
+        "p75": round(_percentile(filtered, 0.75), 1),
+        "mean": round(sum(filtered) / len(filtered), 1),
+    }
 
 
 def _analyze_greetings_farewells(contents: list[str]):
@@ -368,48 +398,41 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
     burst_ratio = _analyze_burst_ratio(history)
     avg_burst_length, burst_distribution = _analyze_burst_pattern(history)
 
-    # ── 用户沉默后追发概率 ──
-    # 定义：target 发完一段消息后，用户超过5分钟没回复，
-    # 如果 target 又主动发了新消息（中间没有用户消息），算"追发"。
-    chase_count = 0
-    no_chase_count = 0
+    # ── 节奏统计（用于运行时采样）+ 用户沉默后追发概率 ──
+    response_gaps: list[float] = []        # 用户发言 -> 目标回复
+    burst_gaps: list[float] = []           # 目标连续发言的内部间隔（<=5分钟）
+    silence_gaps: list[float] = []         # 目标发言后出现长沉默（>5分钟）
+    chase_count = 0                        # 长沉默后，目标继续主动发言
+    no_chase_count = 0                     # 长沉默后，用户先回复
+
     msgs = history.messages
-    idx = 0
-    while idx < len(msgs):
-        if not msgs[idx].is_target:
-            idx += 1
+    for i in range(1, len(msgs)):
+        prev = msgs[i - 1]
+        curr = msgs[i]
+        if not prev.timestamp or not curr.timestamp:
             continue
-        # 找到 target 连发的结束位置
-        burst_end = idx
-        while burst_end < len(msgs) and msgs[burst_end].is_target:
-            burst_end += 1
-        last_target_ts = msgs[burst_end - 1].timestamp
-        # burst_end 现在指向第一条非 target 消息（或末尾）
-        if burst_end < len(msgs) and last_target_ts:
-            next_msg = msgs[burst_end]
-            if next_msg.timestamp:
-                gap = (next_msg.timestamp - last_target_ts).total_seconds()
-                if gap > 300:
-                    # 超过5分钟后，是用户回复还是 target 又追发？
-                    # 但 burst_end 处必然是用户消息，需要看得更远：
-                    # 往后找下一条 target 消息，看它和 burst_end-1 的间隔
-                    no_chase_count += 1  # 默认算用户回复了
-        # 检查：是否存在"target连发 → 长间隔 → target再发"（中间无用户消息）
-        # 即 burst_end == len(msgs)（对话结束）或者连续两段 target 之间有长间隔
-        # 实际上需要检查同一段连发内部是否有长间隔
-        if burst_end - idx >= 2 and last_target_ts:
-            for k in range(idx + 1, burst_end):
-                prev_ts = msgs[k - 1].timestamp
-                curr_ts = msgs[k].timestamp
-                if prev_ts and curr_ts:
-                    internal_gap = (curr_ts - prev_ts).total_seconds()
-                    if internal_gap > 300:
-                        # 同一段 target 连发中出现 >5分钟间隔 = 追发行为
-                        chase_count += 1
-                        break
-        idx = burst_end
+        gap = (curr.timestamp - prev.timestamp).total_seconds()
+        if gap <= 0 or gap > 12 * 3600:
+            continue
+
+        if not prev.is_target and curr.is_target:
+            response_gaps.append(gap)
+
+        if prev.is_target and curr.is_target and gap <= 300:
+            burst_gaps.append(gap)
+
+        if prev.is_target and gap > 300:
+            silence_gaps.append(gap)
+            if curr.is_target:
+                chase_count += 1
+            else:
+                no_chase_count += 1
+
     chase_total = chase_count + no_chase_count
-    chase_ratio = round(chase_count / max(chase_total, 1), 3)
+    chase_ratio = round(chase_count / chase_total, 3) if chase_total else 0.0
+    response_delay_profile = _build_delay_profile(response_gaps)
+    burst_delay_profile = _build_delay_profile(burst_gaps)
+    silence_delay_profile = _build_delay_profile(silence_gaps)
 
     # ── 打招呼 & 告别 ──
     greeting_patterns, farewell_patterns = _analyze_greetings_farewells(contents)
@@ -587,6 +610,9 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         avg_burst_length=avg_burst_length,
         burst_distribution=burst_distribution,
         chase_ratio=chase_ratio,
+        response_delay_profile=response_delay_profile,
+        burst_delay_profile=burst_delay_profile,
+        silence_delay_profile=silence_delay_profile,
         greeting_patterns=greeting_patterns,
         farewell_patterns=farewell_patterns,
         self_references=self_references,

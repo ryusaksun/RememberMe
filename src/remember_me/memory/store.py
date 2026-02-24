@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 import warnings
 from pathlib import Path
 
@@ -46,6 +47,17 @@ from remember_me.importers.base import ChatHistory
 _BGE_MODEL = "BAAI/bge-small-zh-v1.5"
 
 
+def _recency_bonus(indexed_at: float, now_ts: float | None = None) -> float:
+    """根据索引时间给距离一个轻量奖励，近期记忆优先。"""
+    if indexed_at <= 0:
+        return 0.0
+    if now_ts is None:
+        now_ts = time.time()
+    age_hours = max(0.0, (now_ts - indexed_at) / 3600.0)
+    # 0h 时约 0.18，24h 时约 0.09，越旧越接近 0
+    return min(0.18, 0.18 / (1.0 + age_hours / 24.0))
+
+
 class MemoryStore:
     def __init__(self, persist_dir: str | Path, persona_name: str):
         self._persist_dir = Path(persist_dir)
@@ -69,33 +81,134 @@ class MemoryStore:
                 embedding_function=self._ef,
             )
 
-    def index_history(self, history: ChatHistory):
-        """将聊天记录索引到向量数据库。按对话窗口分组存储。"""
-        if not history.messages:
-            return
+    @staticmethod
+    def _build_history_turns(history: ChatHistory) -> list[dict]:
+        """按 turn 边界切分历史：说话人切换或同人间隔超过 5 分钟都算新 turn。"""
+        turns: list[dict] = []
+        current: dict | None = None
 
-        # 先准备数据，再清空+写入（减少 delete 和 insert 之间的窗口）
-        window_size = 5
-        step = 3  # window_size - overlap(2)
+        for idx, m in enumerate(history.messages):
+            text = m.content.strip()
+            if not text:
+                continue
+            ts = m.timestamp
+            role = m.sender
+
+            start_new = False
+            if current is None:
+                start_new = True
+            else:
+                gap = None
+                if current["last_ts"] and ts:
+                    gap = (ts - current["last_ts"]).total_seconds()
+                if role != current["role"] or (gap is not None and gap > 300):
+                    start_new = True
+
+            if start_new:
+                if current:
+                    turns.append(current)
+                current = {
+                    "role": role,
+                    "texts": [text],
+                    "start_idx": idx,
+                    "end_idx": idx + 1,
+                    "last_ts": ts,
+                }
+                continue
+
+            current["texts"].append(text)
+            current["end_idx"] = idx + 1
+            if ts:
+                current["last_ts"] = ts
+
+        if current:
+            turns.append(current)
+        return turns
+
+    @staticmethod
+    def _build_runtime_turns(messages: list[dict]) -> list[dict]:
+        """按角色切分运行时 turn。"""
+        role_map = {"user": "对方", "model": "你"}
+        turns: list[dict] = []
+        current: dict | None = None
+
+        for idx, m in enumerate(messages):
+            text = str(m.get("text", "")).strip()
+            if not text:
+                continue
+            role = role_map.get(m.get("role"), str(m.get("role", "未知")))
+            if current is None or role != current["role"]:
+                if current:
+                    turns.append(current)
+                current = {
+                    "role": role,
+                    "texts": [text],
+                    "start_idx": idx,
+                    "end_idx": idx + 1,
+                }
+            else:
+                current["texts"].append(text)
+                current["end_idx"] = idx + 1
+
+        if current:
+            turns.append(current)
+        return turns
+
+    @staticmethod
+    def _build_turn_windows(
+        turns: list[dict],
+        id_prefix: str,
+        window_turns: int = 4,
+        step_turns: int = 2,
+    ) -> tuple[list[str], list[str], list[dict]]:
+        """将 turn 序列打成可检索窗口，并写入时间元数据。"""
         documents: list[str] = []
         ids: list[str] = []
         metadatas: list[dict] = []
+        if not turns:
+            return documents, ids, metadatas
 
-        for i in range(0, len(history.messages), step):
-            window = history.messages[i : i + window_size]
+        now_ts = time.time()
+        total_turns = len(turns)
+        for i in range(0, total_turns, step_turns):
+            window = turns[i : i + window_turns]
             if not window:
                 break
-            text = "\n".join(f"{m.sender}: {m.content}" for m in window)
-            doc_id = f"window_{i}"
+            lines = []
+            for turn in window:
+                lines.extend(f"{turn['role']}: {txt}" for txt in turn["texts"])
+            text = "\n".join(lines).strip()
+            if not text:
+                continue
+
+            last_ts = window[-1].get("last_ts")
+            if last_ts is not None:
+                indexed_at = last_ts.timestamp()
+            else:
+                # 没有原始时间戳时按顺序构造相对时间，保证“越近越优先”
+                indexed_at = now_ts - max(0, (total_turns - (i + len(window))) * 90)
+
+            doc_id = f"{id_prefix}_{i}"
             documents.append(text)
             ids.append(doc_id)
-            metadatas.append({"start_idx": i, "end_idx": i + len(window)})
+            metadatas.append({
+                "start_idx": window[0]["start_idx"],
+                "end_idx": window[-1]["end_idx"],
+                "turn_start": i,
+                "turn_end": i + len(window),
+                "indexed_at": round(indexed_at, 3),
+            })
 
+        return documents, ids, metadatas
+
+    def index_history(self, history: ChatHistory):
+        """将聊天记录索引到向量数据库，按 turn 边界切片。"""
+        turns = self._build_history_turns(history)
+        documents, ids, metadatas = self._build_turn_windows(turns, id_prefix="turn")
         if not documents:
             return
 
         # 数据已在内存中准备好，删除旧 collection 后立即写入
-        # 若 upsert 失败，下次 import-chat 会重建
         self._client.delete_collection(name=self._safe_name)
         self._collection = self._client.get_or_create_collection(
             name=self._safe_name,
@@ -105,43 +218,49 @@ class MemoryStore:
         self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
 
     def add_messages(self, messages: list[dict]):
-        """将新对话消息追加到向量库（运行时产生的对话）。"""
+        """将运行时新消息按 turn 追加到向量库。"""
         if not messages:
             return
 
         import uuid
-        window_size = 5
-        step = 3  # window_size - overlap(2)
 
-        documents: list[str] = []
-        ids: list[str] = []
-        metadatas: list[dict] = []
-
+        turns = self._build_runtime_turns(messages)
         uid = uuid.uuid4().hex[:12]
-        for i in range(0, len(messages), step):
-            window = messages[i : i + window_size]
-            if not window:
-                break
-            role_map = {"user": "对方", "model": "你"}
-            text = "\n".join(f"{role_map.get(m['role'], m['role'])}: {m['text']}" for m in window)
-            doc_id = f"session_{uid}_{i}"
-            documents.append(text)
-            ids.append(doc_id)
-            metadatas.append({"start_idx": i, "end_idx": i + len(window)})
-
+        documents, ids, metadatas = self._build_turn_windows(turns, id_prefix=f"session_{uid}")
         if documents:
             self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
 
     def search(self, query: str, top_k: int = 8) -> list[tuple[str, float]]:
-        """检索与查询最相关的历史对话片段。返回 [(文档, cosine距离)]，距离越小越相似。"""
-        if self._collection.count() == 0:
+        """检索相关片段并按“语义距离 + 时间权重”重排。"""
+        count = self._collection.count()
+        if count == 0:
             return []
 
+        candidate_k = min(max(top_k * 2, top_k), count)
         results = self._collection.query(
             query_texts=[query],
-            n_results=min(top_k, self._collection.count()),
-            include=["documents", "distances"],
+            n_results=candidate_k,
+            include=["documents", "distances", "metadatas"],
         )
-        if not results["documents"] or not results["documents"][0]:
+        docs = (results.get("documents") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0]
+        metas = (results.get("metadatas") or [[]])[0]
+        if not docs:
             return []
-        return list(zip(results["documents"][0], results["distances"][0]))
+
+        now_ts = time.time()
+        reranked: list[tuple[str, float, float]] = []
+        for doc, dist, meta in zip(docs, dists, metas):
+            indexed_at = 0.0
+            if isinstance(meta, dict):
+                try:
+                    indexed_at = float(meta.get("indexed_at", 0.0))
+                except (TypeError, ValueError):
+                    indexed_at = 0.0
+            adjusted = max(0.0, dist - _recency_bonus(indexed_at, now_ts))
+            # 保持返回值中的距离语义仍为原始 cosine distance，
+            # 仅用 adjusted 参与排序，避免上层阈值逻辑被破坏。
+            reranked.append((doc, dist, adjusted))
+
+        reranked.sort(key=lambda x: x[2])
+        return [(doc, dist) for doc, dist, _ in reranked[:top_k]]
