@@ -153,13 +153,19 @@ def create_import_page():
                     _log_msg(f"[FAIL] {e}", "error")
                 import_btn.enable()
             finally:
-                # 清理上传的临时文件
+                # 清理上传的临时文件并重置路径
+                nonlocal uploaded_path
                 if uploaded_path:
                     import os
                     try:
                         os.unlink(uploaded_path)
                     except OSError:
                         pass
+                    uploaded_path = None
+                    upload_label.content = (
+                        f'<span style="color: {TEXT_DIM}; font-size: 12px;">'
+                        f'尚未选择文件（请重新上传）</span>'
+                    )
 
 
 def _log_msg(text: str, level: str = "info"):

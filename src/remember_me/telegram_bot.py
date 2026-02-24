@@ -285,8 +285,7 @@ class TelegramBot:
         if self._controller and self._chat_id != chat_id:
             return False
 
-        self._chat_id = chat_id
-        self._controller = ChatController(PERSONA_NAME)
+        controller = ChatController(PERSONA_NAME)
         bot = self._app.bot
 
         def on_message(msgs: list[str], msg_type: str):
@@ -298,9 +297,17 @@ class TelegramBot:
                     bot.send_chat_action(chat_id, ChatAction.TYPING)
                 )
 
-        await self._controller.start(
-            on_message=on_message, on_typing=on_typing, no_greet=no_greet,
-        )
+        try:
+            await controller.start(
+                on_message=on_message, on_typing=on_typing, no_greet=no_greet,
+            )
+        except Exception:
+            # start() 失败时不写入状态，下次调用会重新初始化
+            logger.exception("session 初始化失败")
+            return False
+
+        self._chat_id = chat_id
+        self._controller = controller
         return True
 
     # ── 命令处理 ──

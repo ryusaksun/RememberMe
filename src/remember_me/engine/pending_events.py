@@ -139,7 +139,10 @@ class PendingEventTracker:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            minutes = item.get("followup_after_minutes", 60)
+            try:
+                minutes = int(item.get("followup_after_minutes", 60))
+            except (TypeError, ValueError):
+                minutes = 60
             followup_at = now + timedelta(minutes=max(minutes, 10))
 
             # 去重：如果已有类似事件（关键词重叠），跳过
@@ -182,18 +185,31 @@ class PendingEventTracker:
         return False
 
     def get_due_events(self) -> list[PendingEvent]:
-        """获取已到追问时间的 pending 事件。"""
+        """获取已到追问时间的 pending 事件（同时淘汰过期事件）。"""
         now = datetime.now()
+        cutoff = now - timedelta(hours=_MAX_EVENT_AGE_HOURS)
         due = []
+        evicted = False
         for e in self._events:
             if e.status != "pending":
                 continue
+            # 淘汰过期事件
+            try:
+                extracted = datetime.fromisoformat(e.extracted_at)
+                if extracted < cutoff:
+                    e.status = "expired"
+                    evicted = True
+                    continue
+            except ValueError:
+                pass
             try:
                 followup_at = datetime.fromisoformat(e.followup_after)
                 if followup_at <= now:
                     due.append(e)
             except ValueError:
                 continue
+        if evicted:
+            self._save()
         return due
 
     def mark_done(self, event_id: str):

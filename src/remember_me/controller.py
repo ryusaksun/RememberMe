@@ -247,11 +247,11 @@ class ChatController:
         if not self._event_tracker or not self._engine:
             return
         try:
+            snapshot_index = len(self._engine._history)
             messages = []
-            for h in self._engine._history[self._event_extract_index:]:
+            for h in self._engine._history[self._event_extract_index:snapshot_index]:
                 if h.parts and h.parts[0].text:
                     messages.append({"role": h.role, "text": h.parts[0].text})
-            self._event_extract_index = len(self._engine._history)
 
             if not messages:
                 return
@@ -262,6 +262,8 @@ class ChatController:
                     self._engine.client, messages
                 )
             )
+            # 只在提取成功后才前移索引
+            self._event_extract_index = snapshot_index
         except Exception as e:
             logger.debug("事件提取失败: %s", e)
 
