@@ -19,6 +19,7 @@ from remember_me.analyzer.persona import Persona
 from remember_me.engine.emotion import EmotionState
 from remember_me.memory.scratchpad import Scratchpad, update_scratchpad
 from remember_me.memory.store import MemoryStore
+from remember_me.models import MODEL_MAIN
 
 _MSG_SEPARATOR = "|||"
 
@@ -145,6 +146,7 @@ class ChatEngine:
         self._scratchpad = Scratchpad()
         self._scratchpad_updating = False
         self._emotion_state = EmotionState()
+        self._state_lock = threading.Lock()  # 保护 scratchpad/emotion 的跨线程访问
 
     @property
     def client(self) -> genai.Client:
@@ -176,7 +178,7 @@ class ChatEngine:
         if len(recent_model) < 2:
             return False
         lengths = [len(h.parts[0].text) for h in recent_model if h.parts]
-        return sum(lengths) / len(lengths) < 5
+        return sum(lengths) / len(lengths) < 10
 
     def get_recent_context(self) -> str:
         """获取最近几轮对话的文本，供外部判断当前话题。"""
@@ -236,16 +238,15 @@ class ChatEngine:
                 lines.append(f"- {note}")
             system = system + "\n\n" + "\n".join(lines)
 
-        # 中期记忆（scratchpad）
-        scratchpad_block = self._scratchpad.to_prompt_block()
+        # 中期记忆（scratchpad）+ 情绪引导（锁保护，防止后台线程写入时读到不一致状态）
+        with self._state_lock:
+            scratchpad_block = self._scratchpad.to_prompt_block()
+            emotion_block = self._emotion_state.to_prompt_block(self._persona)
+            burst_hint = self._emotion_state.burst_hint() if emotion_block else ""
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
-
-        # 情绪引导
-        emotion_block = self._emotion_state.to_prompt_block(self._persona)
         if emotion_block:
             system = system + "\n\n" + emotion_block
-            burst_hint = self._emotion_state.burst_hint()
             if burst_hint:
                 system = system + "\n" + burst_hint
 
@@ -260,7 +261,7 @@ class ChatEngine:
                         kb_lines.append(f"- {item.summary}")
                     system = system + "\n\n" + "\n".join(kb_lines)
             except Exception as e:
-                logger.debug("知识库检索失败: %s", e)
+                logger.warning("知识库检索失败: %s", e)
 
         # 长期记忆（RAG）
         if self._memory:
@@ -276,8 +277,10 @@ class ChatEngine:
             for doc, dist in raw_results:
                 if dist > max_dist:
                     continue
-                lines = set(doc.strip().split("\n"))
-                overlap = len(lines & seen_lines) / len(lines) if lines else 1.0
+                lines = set(doc.strip().split("\n")) - {""}
+                if not lines:
+                    continue
+                overlap = len(lines & seen_lines) / len(lines)
                 if overlap < 0.5:
                     filtered.append(doc)
                     seen_lines.update(lines)
@@ -294,7 +297,10 @@ class ChatEngine:
     def _trim_history(self):
         max_turns = 40
         if len(self._history) > max_turns:
+            trimmed = len(self._history) - max_turns
             self._history = self._history[-max_turns:]
+            # 同步 scratchpad 索引，防止越界
+            self._scratchpad.last_update_turn = max(0, self._scratchpad.last_update_turn - trimmed)
 
     def save_session(self, path: str | Path):
         """将对话历史保存到文件。"""
@@ -326,6 +332,10 @@ class ChatEngine:
             self._trim_history()
             if data.get("scratchpad"):
                 self._scratchpad = Scratchpad.from_dict(data["scratchpad"])
+            # 确保索引不超过实际历史长度
+            self._scratchpad.last_update_turn = min(
+                self._scratchpad.last_update_turn, len(self._history)
+            )
             if data.get("emotion_state"):
                 self._emotion_state = EmotionState.from_dict(data["emotion_state"])
             return bool(self._history)
@@ -374,12 +384,13 @@ class ChatEngine:
                     persona_name=self._persona.name,
                 )
                 new_pad.last_update_turn = current_turn
-                self._scratchpad = new_pad
-                # 从 Scratchpad LLM 输出同步情绪（覆盖规则引擎微调）
-                if new_pad.emotion_raw:
-                    self._emotion_state.sync_from_scratchpad(new_pad.emotion_raw)
+                with self._state_lock:
+                    self._scratchpad = new_pad
+                    # 从 Scratchpad LLM 输出同步情绪（覆盖规则引擎微调）
+                    if new_pad.emotion_raw:
+                        self._emotion_state.sync_from_scratchpad(new_pad.emotion_raw)
             except Exception as e:
-                logger.debug("Scratchpad 更新失败: %s", e)
+                logger.warning("Scratchpad 更新失败: %s", e)
             finally:
                 self._scratchpad_updating = False
 
@@ -392,8 +403,9 @@ class ChatEngine:
         image: 可选 (bytes, mime_type) 图片数据，与文本一起发送给 LLM。
         """
         # 情绪衰减（距上次更新到现在的时间回归）
-        self._emotion_state.decay(self._persona)
-        mods = self._emotion_state.get_modifiers(self._persona)
+        with self._state_lock:
+            self._emotion_state.decay(self._persona)
+            mods = self._emotion_state.get_modifiers(self._persona)
 
         system = self._build_system(user_input)
 
@@ -408,7 +420,7 @@ class ChatEngine:
 
         try:
             response = self._client.models.generate_content(
-                model="gemini-3.1-pro-preview",
+                model=MODEL_MAIN,
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
@@ -417,8 +429,9 @@ class ChatEngine:
                 ),
             )
         except Exception:
-            # API 失败时回滚用户消息，避免污染历史
-            self._history.pop()
+            # API 失败时安全回滚用户消息
+            if self._history and self._history[-1] is user_msg:
+                self._history.pop()
             raise
 
         raw_reply = response.text or ""
@@ -432,7 +445,8 @@ class ChatEngine:
         self._trim_history()
 
         # 即时情绪微调（关键词规则）
-        self._emotion_state.quick_adjust(user_input, raw_reply, self._persona)
+        with self._state_lock:
+            self._emotion_state.quick_adjust(user_input, raw_reply, self._persona)
         # 动态更新表情包概率
         self._sticker_probability = mods.sticker_probability
 
@@ -492,7 +506,7 @@ class ChatEngine:
         full_reply = []
         try:
             for chunk in self._client.models.generate_content_stream(
-                model="gemini-3.1-pro-preview",
+                model=MODEL_MAIN,
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
@@ -504,8 +518,8 @@ class ChatEngine:
                 full_reply.append(text)
                 yield text
         except Exception:
-            # API 失败时回滚用户消息，避免污染历史
-            self._history.pop()
+            if self._history and self._history[-1] is user_msg:
+                self._history.pop()
             raise
 
         self._history.append(

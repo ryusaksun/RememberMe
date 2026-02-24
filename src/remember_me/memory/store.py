@@ -91,7 +91,11 @@ class MemoryStore:
             ids.append(doc_id)
             metadatas.append({"start_idx": i, "end_idx": i + len(window)})
 
-        # 删除并重建 collection（比逐条删除快得多），紧接着写入新数据
+        if not documents:
+            return
+
+        # 数据已在内存中准备好，删除旧 collection 后立即写入
+        # 若 upsert 失败，下次 import-chat 会重建
         self._client.delete_collection(name=self._safe_name)
         self._collection = self._client.get_or_create_collection(
             name=self._safe_name,

@@ -20,7 +20,9 @@ from remember_me.engine.brave import brave_image_search, brave_search
 from remember_me.engine.topic_starter import _TOPIC_SEARCH_HINTS
 from remember_me.knowledge.store import KnowledgeItem
 
-_SUMMARY_MODEL = "gemini-3-flash-preview"
+from remember_me.models import MODEL_LIGHT
+
+_SUMMARY_MODEL = MODEL_LIGHT
 
 
 def _extract_article(url: str) -> str | None:

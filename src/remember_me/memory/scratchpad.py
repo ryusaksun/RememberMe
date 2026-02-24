@@ -10,7 +10,9 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
-_SCRATCHPAD_MODEL = "gemini-3-flash-preview"
+from remember_me.models import MODEL_LIGHT
+
+_SCRATCHPAD_MODEL = MODEL_LIGHT
 
 _UPDATE_PROMPT = """\
 你是一个对话记录员。分析下面的对话片段，更新对话笔记。
@@ -113,7 +115,7 @@ def _parse_json(raw: str) -> dict | None:
         raw = raw.rsplit("```", 1)[0]
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except Exception:
         return None
 
 

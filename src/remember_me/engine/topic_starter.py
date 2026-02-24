@@ -71,7 +71,9 @@ _TOPIC_SEARCH_HINTS: dict[str, list[str]] = {
     ],
 }
 
-_MODEL = "gemini-3.1-pro-preview"
+from remember_me.models import MODEL_MAIN
+
+_MODEL = MODEL_MAIN
 
 
 class TopicStarter:

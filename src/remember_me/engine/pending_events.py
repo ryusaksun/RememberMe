@@ -14,7 +14,9 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini-3-flash-preview"
+from remember_me.models import MODEL_LIGHT
+
+_MODEL = MODEL_LIGHT
 
 _EXTRACT_PROMPT = """\
 你是一个对话分析器。分析下面的对话片段，提取值得过一段时间后主动追问的事件。

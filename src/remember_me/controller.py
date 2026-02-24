@@ -265,7 +265,7 @@ class ChatController:
             # 只在提取成功后才前移索引
             self._event_extract_index = snapshot_index
         except Exception as e:
-            logger.debug("事件提取失败: %s", e)
+            logger.warning("事件提取失败: %s", e)
 
     async def _proactive_loop(self):
         """后台主动消息循环（替代 cli.py 中的 proactive_worker 线程）。"""

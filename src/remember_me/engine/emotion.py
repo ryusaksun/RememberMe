@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -143,15 +144,24 @@ class EmotionState:
         """从 Scratchpad LLM 输出同步情绪状态（覆盖规则引擎的微调）。"""
         if not emotion_raw:
             return
-        v = emotion_raw.get("valence")
-        a = emotion_raw.get("arousal")
-        if v is not None:
-            self.valence = _clamp(float(v), -1, 1)
-        if a is not None:
-            self.arousal = _clamp(float(a), -1, 1)
+        try:
+            v = emotion_raw.get("valence")
+            a = emotion_raw.get("arousal")
+            if v is not None:
+                v_f = float(v)
+                if not math.isfinite(v_f):
+                    return
+                self.valence = _clamp(v_f, -1, 1)
+            if a is not None:
+                a_f = float(a)
+                if not math.isfinite(a_f):
+                    return
+                self.arousal = _clamp(a_f, -1, 1)
+        except (ValueError, TypeError):
+            return  # LLM 输出异常值，跳过本次同步
         trigger = emotion_raw.get("trigger", "")
         if trigger:
-            self.trigger = trigger
+            self.trigger = str(trigger)
         self.updated_at = datetime.now().isoformat()
         self._update_derived()
 
@@ -184,11 +194,11 @@ class EmotionState:
         else:
             mods.reply_delay_factor = 1.0 - a * 0.5  # 低沉时更慢 [1.0, 1.5]
 
-        # 主动消息冷却
+        # 主动消息冷却（限制范围 0.6-1.5，避免低落时完全沉默）
         if v > 0.3 and a > 0.3:
             mods.proactive_cooldown_factor = 0.6
         elif v < -0.3:
-            mods.proactive_cooldown_factor = 2.0
+            mods.proactive_cooldown_factor = 1.5
         else:
             mods.proactive_cooldown_factor = 1.0
 
