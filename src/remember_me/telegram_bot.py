@@ -386,7 +386,11 @@ class TelegramBot:
 
         for i, msg in enumerate(msgs):
             if msg.startswith("[sticker:"):
-                await bot.send_message(chat_id, "[表情包]")
+                sticker_path = Path(msg[9:].rstrip("]"))
+                if sticker_path.exists():
+                    await bot.send_photo(chat_id, photo=sticker_path.open("rb"))
+                else:
+                    logger.warning("表情包文件不存在: %s", sticker_path)
             else:
                 await bot.send_message(chat_id, msg)
 
