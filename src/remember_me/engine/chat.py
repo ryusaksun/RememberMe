@@ -333,7 +333,7 @@ class ChatEngine:
 
         try:
             response = self._client.models.generate_content(
-                model="gemini-3.1-pro-preview",
+                model="gemini-3-flash-preview",
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
@@ -412,7 +412,7 @@ class ChatEngine:
         full_reply = []
         try:
             for chunk in self._client.models.generate_content_stream(
-                model="gemini-3.1-pro-preview",
+                model="gemini-3-flash-preview",
                 contents=self._history,
                 config=types.GenerateContentConfig(
                     system_instruction=system,

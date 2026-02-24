@@ -72,7 +72,7 @@ _TOPIC_SEARCH_HINTS: dict[str, list[str]] = {
     ],
 }
 
-_MODEL = "gemini-3.1-pro-preview"
+_MODEL = "gemini-3-flash-preview"
 
 
 def _brave_search(query: str, count: int = 5) -> list[dict]:
