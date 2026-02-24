@@ -515,7 +515,7 @@ class ChatEngine:
         return user_input
 
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（core > relationship > RAG > session > conflict > scratchpad/emotion）。"""
+        """构建 system prompt（core > relationship > boundary > RAG > session > conflict > scratchpad/emotion）。"""
         # 注入当前时间（使用用户时区，非服务器时区）
         now = datetime.now(_TIMEZONE)
         time_block = (
@@ -532,6 +532,7 @@ class ChatEngine:
         burst_hint = ""
         gov_core_block = ""
         gov_relationship_block = ""
+        gov_boundary_block = ""
         gov_session_block = ""
         gov_conflict_block = ""
         governance = getattr(self, "_memory_governance", None)
@@ -544,12 +545,16 @@ class ChatEngine:
                 )
                 if hasattr(governance, "build_relationship_block"):
                     gov_relationship_block = governance.build_relationship_block(limit=10)
+                if hasattr(governance, "build_active_boundary_block"):
+                    gov_boundary_block = governance.build_active_boundary_block(limit=5)
             except Exception as e:
                 logger.warning("核心记忆块构建失败: %s", e)
         if gov_core_block:
             system = system + "\n\n" + gov_core_block
         if gov_relationship_block:
             system = system + "\n\n" + gov_relationship_block
+        if gov_boundary_block:
+            system = system + "\n\n" + gov_boundary_block
 
         # 2) 导入历史检索（只依赖 import 建立的向量库，不写入运行时消息）
         if self._memory:

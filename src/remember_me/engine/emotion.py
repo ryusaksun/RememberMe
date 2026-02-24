@@ -159,12 +159,18 @@ class EmotionState:
         for fact in list(facts or [])[:12]:
             fact_type = str(getattr(fact, "type", "") or "")
             content = str(getattr(fact, "content", "") or "").lower()
+            meta = getattr(fact, "meta", None)
+            if not isinstance(meta, dict):
+                meta = {}
             if not content:
                 continue
 
             hit = False
             if fact_type == "shared_event":
+                event = str(meta.get("event", "") or "").strip().lower()
                 if any(k in text for k in ("上次", "那次", "还记得", "之前", "那天")):
+                    hit = True
+                elif event and event in text:
                     hit = True
                 elif any(seg and len(seg) >= 2 and seg in text for seg in re.split(r"[，。！？、\s]+", content)):
                     hit = True
@@ -173,14 +179,20 @@ class EmotionState:
                     delta_a += 0.04
                     triggers.append("共同经历被提及")
             elif fact_type == "addressing":
-                if any(seg and len(seg) >= 2 and seg in text for seg in re.split(r"[：，。！？、\s]+", content)):
+                term = str(meta.get("term", "") or "").strip().lower()
+                if term and term in text:
+                    hit = True
+                elif any(seg and len(seg) >= 2 and seg in text for seg in re.split(r"[：，。！？、\s]+", content)):
                     hit = True
                 if hit:
                     delta_v += 0.04
                     delta_a += 0.02
                     triggers.append("称呼习惯命中")
             elif fact_type == "boundary":
+                topic = str(meta.get("topic", "") or "").strip().lower()
                 if any(k in text for k in ("别提", "不聊", "别问", "不要再问", "不想聊")):
+                    hit = True
+                elif topic and topic in text:
                     hit = True
                 if hit:
                     delta_v -= 0.02

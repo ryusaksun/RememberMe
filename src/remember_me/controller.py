@@ -487,6 +487,10 @@ class ChatController:
                 has_image=bool(image),
                 input_len=len(text or ""),
             )
+            if self._relationship_store:
+                await loop.run_in_executor(
+                    None, lambda: self._relationship_store.mark_boundary_hit(text)
+                )
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
@@ -626,6 +630,7 @@ class ChatController:
                             None, lambda: self._topic_starter.generate_relationship_followup(
                                 fact_type=fact.type,
                                 fact_content=fact.content,
+                                fact_meta=fact.meta,
                                 recent_context=ctx,
                             ),
                         )

@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 def _now_iso() -> str:
@@ -59,11 +59,14 @@ class RelationshipFact:
     status: str = "candidate"
     conflict_with_core: bool = False
     conflict_reason: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "RelationshipFact":
         valid = {f.name for f in cls.__dataclass_fields__.values()}
         payload = {k: v for k, v in data.items() if k in valid}
+        if not isinstance(payload.get("meta"), dict):
+            payload["meta"] = {}
         return cls(**payload)
 
 
@@ -130,6 +133,64 @@ class RelationshipMemoryStore:
                 break
         return merged
 
+    @staticmethod
+    def _normalize_meta(meta: object) -> dict[str, Any]:
+        if not isinstance(meta, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for raw_key, raw_val in meta.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            if isinstance(raw_val, (str, int, float, bool)) or raw_val is None:
+                out[key] = raw_val
+                continue
+            if isinstance(raw_val, list):
+                cleaned: list[Any] = []
+                for item in raw_val:
+                    if not isinstance(item, (str, int, float, bool)):
+                        continue
+                    if item in cleaned:
+                        continue
+                    cleaned.append(item)
+                    if len(cleaned) >= 8:
+                        break
+                out[key] = cleaned
+                continue
+            if isinstance(raw_val, dict):
+                nested: dict[str, Any] = {}
+                for nested_key, nested_val in raw_val.items():
+                    nk = str(nested_key or "").strip()
+                    if not nk:
+                        continue
+                    if isinstance(nested_val, (str, int, float, bool)) or nested_val is None:
+                        nested[nk] = nested_val
+                out[key] = nested
+        return out
+
+    @staticmethod
+    def _merge_meta(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base or {})
+        for key, val in (incoming or {}).items():
+            cur = merged.get(key)
+            if isinstance(cur, dict) and isinstance(val, dict):
+                child = dict(cur)
+                child.update(val)
+                merged[key] = child
+                continue
+            if isinstance(cur, list) and isinstance(val, list):
+                combined = list(cur)
+                for item in val:
+                    if item in combined:
+                        continue
+                    combined.append(item)
+                    if len(combined) >= 8:
+                        break
+                merged[key] = combined
+                continue
+            merged[key] = val
+        return merged
+
     def upsert_facts(self, facts: list[RelationshipFact]) -> int:
         if not facts:
             return 0
@@ -152,6 +213,7 @@ class RelationshipMemoryStore:
             incoming.updated_at = now
             incoming.created_at = incoming.created_at or now
             incoming.evidence = self._merge_evidence([], incoming.evidence)
+            incoming.meta = self._normalize_meta(incoming.meta)
 
             key = self._fact_key(incoming.type, incoming.content)
             idx = by_key.get(key)
@@ -163,13 +225,23 @@ class RelationshipMemoryStore:
 
             current = self._facts[idx]
             merged_evidence = self._merge_evidence(current.evidence, incoming.evidence)
+            merged_meta = self._merge_meta(
+                self._normalize_meta(current.meta),
+                incoming.meta,
+            )
             better_status = _STATUS_RANK.get(incoming.status, 0) > _STATUS_RANK.get(current.status, 0)
             better_conf = incoming.confidence > current.confidence
 
-            if better_status or better_conf or merged_evidence != current.evidence:
+            if (
+                better_status
+                or better_conf
+                or merged_evidence != current.evidence
+                or merged_meta != self._normalize_meta(current.meta)
+            ):
                 current.subject = incoming.subject or current.subject
                 current.evidence = merged_evidence
                 current.confidence = max(current.confidence, incoming.confidence)
+                current.meta = merged_meta
                 if better_status:
                     current.status = incoming.status
                 if incoming.conflict_with_core:
@@ -181,6 +253,107 @@ class RelationshipMemoryStore:
         if changed:
             self.save()
         return changed
+
+    def _find_best_boundary_fact(self, user_text: str) -> RelationshipFact | None:
+        message = _normalize_text(user_text)
+        if not message:
+            return None
+        best: tuple[int, RelationshipFact] | None = None
+        for fact in self._facts:
+            if fact.type != "boundary" or fact.status != "confirmed" or fact.conflict_with_core:
+                continue
+            meta = self._normalize_meta(fact.meta)
+            topic = str(meta.get("topic", "") or "").strip()
+            if not topic:
+                continue
+            norm_topic = _normalize_text(topic)
+            if len(norm_topic) < 2 or norm_topic not in message:
+                continue
+            score = len(norm_topic)
+            if best is None or score > best[0]:
+                best = (score, fact)
+        return best[1] if best else None
+
+    def mark_boundary_hit(self, user_text: str, hit_at: str | None = None) -> bool:
+        fact = self._find_best_boundary_fact(user_text)
+        if not fact:
+            return False
+        meta = self._normalize_meta(fact.meta)
+        stamp = str(hit_at or _now_iso())
+        if meta.get("last_hit_at") == stamp:
+            return True
+        meta["last_hit_at"] = stamp
+        fact.meta = meta
+        fact.updated_at = _now_iso()
+        self.save()
+        return True
+
+    @staticmethod
+    def _safe_int(value: object, default: int = 0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def list_active_boundaries(self, now_ts: datetime | None = None, limit: int = 10) -> list[RelationshipFact]:
+        now = now_ts or datetime.now()
+        rows: list[tuple[float, RelationshipFact]] = []
+        for fact in self._facts:
+            if fact.type != "boundary" or fact.status != "confirmed" or fact.conflict_with_core:
+                continue
+            meta = self._normalize_meta(fact.meta)
+            cooldown = self._safe_int(meta.get("cooldown_seconds"), default=0)
+            if cooldown <= 0:
+                continue
+            last_hit_raw = str(meta.get("last_hit_at", "") or "")
+            last_hit_dt = _parse_iso(last_hit_raw)
+            if not last_hit_dt:
+                continue
+            elapsed = (now - last_hit_dt).total_seconds()
+            remain = cooldown - elapsed
+            if remain <= 0:
+                continue
+            rows.append((remain, fact))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in rows[: max(0, limit)]]
+
+    @staticmethod
+    def _format_cooldown(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes = round(seconds / 60.0, 1)
+        if float(int(minutes)) == minutes:
+            return f"{int(minutes)}m"
+        return f"{minutes}m"
+
+    @staticmethod
+    def _format_preferred_contexts(meta: dict[str, Any]) -> str:
+        contexts = meta.get("preferred_contexts")
+        if not isinstance(contexts, list):
+            return ""
+        cleaned = [str(x).strip() for x in contexts if str(x).strip()]
+        if not cleaned:
+            return ""
+        return "、".join(cleaned[:3])
+
+    def build_active_boundary_block(self, limit: int = 5) -> str:
+        rows = self.list_active_boundaries(limit=limit)
+        if not rows:
+            return ""
+        lines = ["## 当前生效的边界冷却（优先遵守）"]
+        now = datetime.now()
+        for fact in rows:
+            meta = self._normalize_meta(fact.meta)
+            topic = str(meta.get("topic", "") or "").strip()
+            cooldown = self._safe_int(meta.get("cooldown_seconds"), default=0)
+            last_hit_dt = _parse_iso(str(meta.get("last_hit_at", "") or ""))
+            remain = cooldown
+            if last_hit_dt:
+                remain = max(1, int(cooldown - (now - last_hit_dt).total_seconds()))
+            level = str(meta.get("strength", "") or "").strip() or "normal"
+            label = f"{topic}（强度:{level}，剩余:{self._format_cooldown(remain)}）" if topic else fact.content
+            lines.append(f"- {label}")
+        return "\n".join(lines)
 
     def list_facts(
         self,
@@ -243,6 +416,38 @@ class RelationshipMemoryStore:
         for fact in rows:
             label = _TYPE_LABEL.get(fact.type, fact.type)
             line = f"- [{label}] {fact.content}"
+            meta = self._normalize_meta(fact.meta)
+            if fact.type == "boundary":
+                topic = str(meta.get("topic", "") or "").strip()
+                strength = str(meta.get("strength", "") or "").strip()
+                cooldown = self._safe_int(meta.get("cooldown_seconds"), default=0)
+                extra_parts: list[str] = []
+                if topic:
+                    extra_parts.append(f"话题:{topic}")
+                if strength:
+                    extra_parts.append(f"强度:{strength}")
+                if cooldown > 0:
+                    extra_parts.append(f"冷却:{self._format_cooldown(cooldown)}")
+                if extra_parts:
+                    line += f"（{'，'.join(extra_parts)}）"
+            elif fact.type == "shared_event":
+                event = str(meta.get("event", "") or "").strip()
+                time_hint = str(meta.get("time_hint", "") or "").strip()
+                place_hint = str(meta.get("place_hint", "") or "").strip()
+                emotion_hint = str(meta.get("emotion_hint", "") or "").strip()
+                event_parts = [x for x in [event, time_hint, place_hint, emotion_hint] if x]
+                if event_parts:
+                    line += f"（{' / '.join(event_parts[:3])}）"
+            elif fact.type == "addressing":
+                term = str(meta.get("term", "") or "").strip()
+                contexts = self._format_preferred_contexts(meta)
+                if term or contexts:
+                    seg = []
+                    if term:
+                        seg.append(f"称呼:{term}")
+                    if contexts:
+                        seg.append(f"常见场景:{contexts}")
+                    line += f"（{'，'.join(seg)}）"
             if fact.evidence:
                 line += f"（证据：{fact.evidence[0][:30]}）"
             lines.append(line)

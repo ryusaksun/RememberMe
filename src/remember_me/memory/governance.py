@@ -274,6 +274,9 @@ class MemoryGovernance:
         text = str(getattr(fact, "content", "") or "").strip()
         if not text:
             return ConflictResult(False, "")
+        meta = getattr(fact, "meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
 
         # 先复用通用冲突规则（身份/语气改写等）
         base = self.validate_against_imported_history(text, persona=persona)
@@ -281,12 +284,18 @@ class MemoryGovernance:
             return base
 
         fact_type = str(getattr(fact, "type", "") or "").strip()
-        if fact_type == "addressing" and _ADDRESSING_INVALID_RE.search(text):
-            return ConflictResult(True, "关系称呼与导入人格不一致")
+        if fact_type == "addressing":
+            term = str(meta.get("term", "") or "").strip()
+            target = f"{text} {term}".strip()
+            if _ADDRESSING_INVALID_RE.search(target):
+                return ConflictResult(True, "关系称呼与导入人格不一致")
         if fact_type == "relation_stage" and _RELATION_OVERRIDE_RE.search(text):
             return ConflictResult(True, "关系阶段被指令式改写")
-        if fact_type == "boundary" and _BOUNDARY_OVERRIDE_RE.search(text):
-            return ConflictResult(True, "互动边界被永久性重写")
+        if fact_type == "boundary":
+            topic = str(meta.get("topic", "") or "").strip()
+            boundary_text = f"{text} {topic}".strip()
+            if _BOUNDARY_OVERRIDE_RE.search(boundary_text):
+                return ConflictResult(True, "互动边界被永久性重写")
         return ConflictResult(False, "")
 
     def list_core_records(self) -> list[MemoryRecord]:
@@ -469,4 +478,13 @@ class MemoryGovernance:
             return self._relationship_store.build_prompt_block(limit=limit)
         except Exception as e:
             logger.warning("关系记忆块构建失败: %s", e)
+            return ""
+
+    def build_active_boundary_block(self, limit: int = 5) -> str:
+        if not self._relationship_store:
+            return ""
+        try:
+            return self._relationship_store.build_active_boundary_block(limit=limit)
+        except Exception as e:
+            logger.warning("边界冷却块构建失败: %s", e)
             return ""

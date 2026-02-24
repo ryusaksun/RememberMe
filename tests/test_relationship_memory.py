@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from remember_me.analyzer.relationship_extractor import RelationshipExtractor
@@ -57,6 +57,63 @@ def test_relationship_store_build_prompt_block(tmp_path) -> None:
     block = store.build_prompt_block(limit=5)
     assert "你们关系记忆" in block
     assert "[互动边界]" in block
+
+
+def test_relationship_store_upsert_merges_meta_and_boundary_cooldown(tmp_path) -> None:
+    store = RelationshipMemoryStore("小明", data_dir=tmp_path)
+    store.upsert_facts([
+        RelationshipFact(
+            id="rel_meta_1",
+            type="addressing",
+            subject="persona",
+            content="常用称呼偏好：宝宝",
+            evidence=["宝宝早", "宝宝晚安"],
+            confidence=0.72,
+            status="candidate",
+            meta={"term": "宝宝"},
+        )
+    ])
+    changed = store.upsert_facts([
+        RelationshipFact(
+            id="rel_meta_2",
+            type="addressing",
+            subject="persona",
+            content="常用称呼偏好：宝宝",
+            evidence=["宝宝早点睡"],
+            confidence=0.88,
+            status="confirmed",
+            meta={"preferred_contexts": ["daily_care"]},
+        )
+    ])
+    assert changed == 1
+    confirmed = store.list_confirmed(limit=5)
+    assert confirmed and confirmed[0].meta.get("term") == "宝宝"
+    assert confirmed[0].meta.get("preferred_contexts") == ["daily_care"]
+
+    now = datetime.now()
+    store.upsert_facts([
+        RelationshipFact(
+            id="rel_bound_cool",
+            type="boundary",
+            subject="user",
+            content="边界话题：前任",
+            evidence=["别提前任", "不要问前任"],
+            confidence=0.9,
+            status="confirmed",
+            meta={
+                "topic": "前任",
+                "strength": "strict",
+                "cooldown_seconds": 3600,
+                "last_hit_at": (now - timedelta(minutes=10)).isoformat(),
+            },
+        )
+    ])
+    active = store.list_active_boundaries(now_ts=now)
+    assert len(active) == 1
+    assert store.mark_boundary_hit("你别提前任了", hit_at=now.isoformat())
+    block = store.build_active_boundary_block(limit=3)
+    assert "边界冷却" in block
+    assert "前任" in block
 
 
 def test_relationship_store_manual_confirm_and_reject(tmp_path) -> None:
@@ -117,6 +174,37 @@ def test_relationship_extractor_rules_and_conflict_filter() -> None:
     boundary = next(f for f in facts if f.type == "boundary")
     assert boundary.conflict_with_core
     assert boundary.status == "rejected"
+
+
+def test_relationship_extractor_structured_meta() -> None:
+    history = ChatHistory(
+        target_name="小明",
+        user_name="我",
+        messages=[
+            ChatMessage(sender="我", content="别再提前任了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="好", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="我", content="不要再问前任了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="上次我们在南京看演唱会还记得吗", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="那次我们在地铁站迷路，真的尴尬", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="宝宝早安", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="宝宝早点睡", timestamp=_ts(), is_target=True),
+        ],
+    )
+    extractor = RelationshipExtractor()
+    facts = extractor.extract_from_history(history)
+
+    boundary = next(f for f in facts if f.type == "boundary")
+    assert boundary.meta.get("topic") == "前任"
+    assert boundary.meta.get("cooldown_seconds", 0) > 0
+    assert boundary.meta.get("strength") in {"strict", "normal", "soft"}
+
+    shared = next(f for f in facts if f.type == "shared_event")
+    assert "event" in shared.meta
+    assert shared.meta.get("time_hint") in {"上次", "那次"}
+
+    addressing = next(f for f in facts if f.type == "addressing" and "宝宝" in f.content)
+    assert addressing.meta.get("term") == "宝宝"
+    assert addressing.meta.get("preferred_contexts")
 
 
 def test_relationship_extractor_history_windowed_dedup() -> None:
@@ -191,9 +279,22 @@ def test_governance_validate_relationship_fact(tmp_path) -> None:
         content="常用称呼偏好：机器人",
         evidence=["你是机器人"],
         confidence=0.9,
+        meta={"term": "AI客服"},
     )
     verdict = governance.validate_relationship_fact(bad, persona=persona)
     assert verdict.conflict
+
+    bad_boundary = RelationshipFact(
+        id="rel_bad_boundary",
+        type="boundary",
+        subject="user",
+        content="边界话题：前任",
+        evidence=["以后都不许聊前任"],
+        confidence=0.9,
+        meta={"topic": "以后都不许聊前任"},
+    )
+    verdict_bad_boundary = governance.validate_relationship_fact(bad_boundary, persona=persona)
+    assert verdict_bad_boundary.conflict
 
     good = RelationshipFact(
         id="rel_ok",
@@ -294,3 +395,31 @@ def test_chat_engine_prompt_order_puts_knowledge_after_conflict() -> None:
     assert text.index("## 你们过去聊到类似话题时的真实对话") < text.index("## SESSION")
     assert text.index("## SESSION") < text.index("## CONFLICT")
     assert text.index("## CONFLICT") < text.index("## 你最近关注的新闻和动态")
+
+
+def test_chat_engine_prompt_includes_active_boundary_block_after_relationship() -> None:
+    class _Gov:
+        def build_prompt_blocks(self, **kwargs):
+            return ("## CORE\n- imported", "## SESSION\n- runtime", "## CONFLICT\n- x")
+
+        def build_relationship_block(self, limit: int = 10):
+            return "## REL\n- relation"
+
+        def build_active_boundary_block(self, limit: int = 5):
+            return "## BOUNDARY\n- 前任冷却中"
+
+    e = ChatEngine.__new__(ChatEngine)
+    e._persona = type("P", (), {"name": "x"})()
+    e._system_prompt = "base"
+    e._knowledge_store = None
+    e._memory = None
+    e._history = []
+    e._state_lock = threading.Lock()
+    e._scratchpad = Scratchpad()
+    e._emotion_state = EmotionState()
+    e._memory_governance = _Gov()
+
+    text = e._build_system("最近怎么样")
+    assert text.index("## CORE") < text.index("## REL")
+    assert text.index("## REL") < text.index("## BOUNDARY")
+    assert text.index("## BOUNDARY") < text.index("## SESSION")

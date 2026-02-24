@@ -303,10 +303,12 @@ class TopicStarter:
         self,
         fact_type: str,
         fact_content: str,
+        fact_meta: dict | None = None,
         recent_context: str = "",
     ) -> list[str]:
         """基于已确认关系记忆生成主动接话（shared_event 优先）。"""
         name = self._persona.name
+        meta = fact_meta if isinstance(fact_meta, dict) else {}
         context = ""
         if recent_context:
             context = (
@@ -314,18 +316,42 @@ class TopicStarter:
                 "如果最近话题还没结束，优先顺着最近话题自然过渡。\n\n"
             )
 
+        memory_line = fact_content
         if fact_type == "shared_event":
+            event = str(meta.get("event", "") or "").strip()
+            time_hint = str(meta.get("time_hint", "") or "").strip()
+            place_hint = str(meta.get("place_hint", "") or "").strip()
+            emotion_hint = str(meta.get("emotion_hint", "") or "").strip()
+            event_parts = [x for x in [event, time_hint, place_hint, emotion_hint] if x]
+            if event_parts:
+                memory_line = f"{fact_content}（{', '.join(event_parts[:3])}）"
             intent = "从共同经历里挑一个自然提起并轻轻追问，不要像背档案。"
         elif fact_type == "addressing":
+            term = str(meta.get("term", "") or "").strip()
+            contexts = meta.get("preferred_contexts")
+            if isinstance(contexts, list):
+                ctx_text = "、".join(str(x).strip() for x in contexts if str(x).strip())
+            else:
+                ctx_text = ""
+            if term and ctx_text:
+                memory_line = f"{fact_content}（称呼:{term}，常见场景:{ctx_text}）"
+            elif term:
+                memory_line = f"{fact_content}（称呼:{term}）"
             intent = "按你平时的称呼风格自然开口，不要生硬强调关系设定。"
         elif fact_type == "boundary":
+            topic = str(meta.get("topic", "") or "").strip()
+            strength = str(meta.get("strength", "") or "").strip()
+            if topic and strength:
+                memory_line = f"{fact_content}（话题:{topic}，强度:{strength}）"
+            elif topic:
+                memory_line = f"{fact_content}（话题:{topic}）"
             intent = "语气克制，避免踩边界，用轻松方式换个角度接话。"
         else:
             intent = "按既有关系记忆自然接一句，不要显得刻意。"
 
         prompt = (
             f"{context}"
-            f"你们关系记忆里有一条：{fact_content}\n"
+            f"你们关系记忆里有一条：{memory_line}\n"
             f"{intent}\n"
             f"用{name}的语气发 1 条短消息，必要时最多 2 条。\n"
             f"要求：\n"

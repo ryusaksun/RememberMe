@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Callable
 
 from google import genai
@@ -22,6 +22,12 @@ _REPAIR_RE = re.compile(r"对不起|抱歉|不好意思|我错了|算我错|别�
 _PREFERENCE_RE = re.compile(r"你喜欢|你不喜欢|你讨厌|我喜欢|我讨厌|你爱吃|你最爱")
 _AFFECTION_RE = re.compile(r"爱你|想你|抱抱|亲亲|宝贝|宝宝|乖|老婆|老公")
 _TENSION_RE = re.compile(r"滚|烦死|别烦|不想理|拉黑|绝交|懒得理")
+_BOUNDARY_TOPIC_RE = re.compile(
+    r"(?:别再?|不要|不许|少)(?:再)?(?:提|说|问|聊|叫|发)(?:我|这个|这件事|这事|一下|了)?(?P<topic>[^，。！？\n]{1,12})"
+)
+_EVENT_SLOT_RE = re.compile(
+    r"(?:上次|那次|之前|那天)(?:我们)?(?P<event>[^，。！？\n]{2,18})"
+)
 
 _ADDRESS_TERMS = [
     "宝宝", "宝贝", "宝", "亲爱的", "哥们", "兄弟", "老师", "姐姐", "弟弟", "老婆", "老公",
@@ -52,13 +58,15 @@ _VERIFY_PROMPT = """\
   "subject": "user|persona|both",
   "content": "一句话关系事实",
   "confidence": 0.0,
-  "evidence": ["证据句1", "证据句2"]
+  "evidence": ["证据句1", "证据句2"],
+  "meta": {}
 }}
 
 规则：
 - 宁缺毋滥，模糊内容不要输出
 - content 不超过 28 字
 - confidence 取值 0~1
+- meta 仅保留有证据的结构化字段，不确定就留空对象
 - 最多输出 8 条
 """
 
@@ -134,6 +142,164 @@ class RelationshipExtractor:
         return max(0.0, min(0.95, confidence))
 
     @staticmethod
+    def _clean_boundary_topic(topic: str) -> str:
+        cleaned = re.sub(r"[，。！？!?\s]+", "", str(topic or "")).strip()
+        cleaned = re.sub(r"(这个|这件事|这事|的话题|一下|了)$", "", cleaned)
+        if cleaned in {"这个", "这事", "话题", "事情"}:
+            return ""
+        if len(cleaned) < 2:
+            return ""
+        return cleaned[:10]
+
+    @staticmethod
+    def _boundary_meta(text: str) -> dict:
+        raw = str(text or "")
+        topic = ""
+        match = _BOUNDARY_TOPIC_RE.search(raw)
+        if match:
+            topic = RelationshipExtractor._clean_boundary_topic(match.group("topic") or "")
+
+        strict = bool(re.search(r"(不许|必须|别再|不要再|永远不要)", raw))
+        soft = bool(re.search(r"(先不聊|改天再聊|回头再说)", raw))
+        strength = "strict" if strict else "soft" if soft else "normal"
+        cooldown = 6 * 3600 if strict else 90 * 60 if soft else 3 * 3600
+        meta: dict = {"strength": strength, "cooldown_seconds": cooldown}
+        if topic:
+            meta["topic"] = topic
+        return meta
+
+    @staticmethod
+    def _guess_addressing_context(text: str) -> str:
+        raw = str(text or "")
+        if re.search(r"(早安|晚安|睡|起床|吃饭|到家|下班)", raw):
+            return "daily_care"
+        if re.search(r"(别生气|对不起|抱歉|和好|吵架)", raw):
+            return "repair"
+        if re.search(r"(爱你|想你|抱抱|亲亲)", raw):
+            return "affection"
+        if re.search(r"(考试|面试|工作|加班|开会)", raw):
+            return "support"
+        return "general"
+
+    @staticmethod
+    def _event_meta(text: str) -> dict:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+
+        event = ""
+        event_match = _EVENT_SLOT_RE.search(raw)
+        if event_match:
+            event = re.sub(r"[，。！？!?\s]+", " ", event_match.group("event") or "").strip()
+        if not event:
+            event = raw
+        event = event[:22]
+
+        time_hint = ""
+        for token in ("上次", "那次", "那天", "之前", "昨天", "去年", "刚刚"):
+            if token in raw:
+                time_hint = token
+                break
+
+        place_hint = ""
+        place_match = re.search(r"(在|去|到)([^，。！？\s]{1,8})", raw)
+        if place_match:
+            place_hint = f"{place_match.group(1)}{place_match.group(2)}"
+
+        emotion_hint = ""
+        for token in ("开心", "难过", "尴尬", "生气", "紧张", "激动"):
+            if token in raw:
+                emotion_hint = token
+                break
+
+        meta = {"event": event}
+        if time_hint:
+            meta["time_hint"] = time_hint
+        if place_hint:
+            meta["place_hint"] = place_hint
+        if emotion_hint:
+            meta["emotion_hint"] = emotion_hint
+        return meta
+
+    @staticmethod
+    def _merge_meta(base: dict | None, incoming: dict | None) -> dict:
+        out = dict(base or {})
+        for key, val in (incoming or {}).items():
+            if isinstance(out.get(key), dict) and isinstance(val, dict):
+                child = dict(out[key])
+                child.update(val)
+                out[key] = child
+                continue
+            if isinstance(out.get(key), list) and isinstance(val, list):
+                cur = list(out[key])
+                for item in val:
+                    if item in cur:
+                        continue
+                    cur.append(item)
+                    if len(cur) >= 8:
+                        break
+                out[key] = cur
+                continue
+            out[key] = val
+        return out
+
+    @staticmethod
+    def _sanitize_meta(fact_type: str, raw_meta: object) -> dict:
+        if not isinstance(raw_meta, dict):
+            return {}
+
+        if fact_type == "boundary":
+            out = {}
+            topic = str(raw_meta.get("topic", "") or "").strip()
+            if topic:
+                out["topic"] = topic[:10]
+            strength = str(raw_meta.get("strength", "") or "").strip().lower()
+            if strength in {"strict", "normal", "soft"}:
+                out["strength"] = strength
+            try:
+                cooldown = int(float(raw_meta.get("cooldown_seconds", 0) or 0))
+            except (TypeError, ValueError):
+                cooldown = 0
+            if cooldown > 0:
+                out["cooldown_seconds"] = min(cooldown, 24 * 3600)
+            return out
+
+        if fact_type == "shared_event":
+            out = {}
+            for key in ("event", "time_hint", "place_hint", "emotion_hint"):
+                val = str(raw_meta.get(key, "") or "").strip()
+                if val:
+                    out[key] = val[:24]
+            return out
+
+        if fact_type == "addressing":
+            out = {}
+            term = str(raw_meta.get("term", "") or "").strip()
+            if term:
+                out["term"] = term[:8]
+            contexts = raw_meta.get("preferred_contexts")
+            if isinstance(contexts, list):
+                cleaned = [str(x).strip() for x in contexts if str(x).strip()]
+                if cleaned:
+                    out["preferred_contexts"] = cleaned[:4]
+            context_counts = raw_meta.get("context_counts")
+            if isinstance(context_counts, dict):
+                mapped = {}
+                for key, val in context_counts.items():
+                    k = str(key or "").strip()
+                    if not k:
+                        continue
+                    try:
+                        mapped[k] = int(val)
+                    except (TypeError, ValueError):
+                        continue
+                if mapped:
+                    out["context_counts"] = mapped
+            return out
+
+        return {}
+
+    @staticmethod
     def _to_role_texts_from_history(history: ChatHistory) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
         for m in history.messages:
@@ -190,7 +356,13 @@ class RelationshipExtractor:
 
         candidate_map: dict[str, RelationshipFact] = {}
 
-        def add(fact_type: str, subject: str, content: str, evidence_text: str):
+        def add(
+            fact_type: str,
+            subject: str,
+            content: str,
+            evidence_text: str,
+            meta: dict | None = None,
+        ):
             key = self._normalize_key(fact_type, content)
             fact = candidate_map.get(key)
             if fact is None:
@@ -203,11 +375,14 @@ class RelationshipExtractor:
                     source=source,
                     status="candidate",
                     evidence=[],
+                    meta={},
                 )
                 candidate_map[key] = fact
             snippet = self._compact(evidence_text)
             if snippet and snippet not in fact.evidence and len(fact.evidence) < 3:
                 fact.evidence.append(snippet)
+            if meta:
+                fact.meta = self._merge_meta(fact.meta, self._sanitize_meta(fact_type, meta))
 
         # 规则 1: 关系阶段线索（亲近/摩擦）
         affection_hits = [text for _role, text in rows if _AFFECTION_RE.search(text)]
@@ -221,26 +396,52 @@ class RelationshipExtractor:
 
         # 规则 2: 称呼习惯（persona 对 user 的称呼）
         addressing_counter: Counter[str] = Counter()
+        addressing_context_counter: dict[str, Counter[str]] = defaultdict(Counter)
         for role, text in rows:
             if role != "persona":
                 continue
             lowered = text.lower()
+            ctx = self._guess_addressing_context(text)
             for term in _ADDRESS_TERMS:
                 if term in lowered:
                     addressing_counter[term] += 1
+                    addressing_context_counter[term][ctx] += 1
         for term, cnt in addressing_counter.items():
             if cnt < 2:
                 continue
             ev = [text for role, text in rows if role == "persona" and term in text.lower()][:3]
+            context_counts = dict(addressing_context_counter.get(term, Counter()))
+            preferred_contexts = [
+                key for key, _val in addressing_context_counter.get(term, Counter()).most_common(3)
+            ]
             for item in ev:
-                add("addressing", "persona", f"常用称呼偏好：{term}", item)
+                add(
+                    "addressing",
+                    "persona",
+                    f"常用称呼偏好：{term}",
+                    item,
+                    meta={
+                        "term": term,
+                        "context_counts": context_counts,
+                        "preferred_contexts": preferred_contexts,
+                    },
+                )
 
         # 规则 3: 边界/共同经历/承诺/修复/偏好
         for role, text in rows:
             if _BOUNDARY_RE.search(text):
-                add("boundary", role, "存在明确的交流边界（别提/别问/不聊）", text)
+                boundary_meta = self._boundary_meta(text)
+                topic = str(boundary_meta.get("topic", "") or "").strip()
+                content = f"边界话题：{topic}" if topic else "存在明确的交流边界（别提/别问/不聊）"
+                add("boundary", role, content, text, meta=boundary_meta)
             if _SHARED_EVENT_RE.search(text):
-                add("shared_event", "both", "经常引用共同经历（上次/那次/还记得）", text)
+                add(
+                    "shared_event",
+                    "both",
+                    "经常引用共同经历（上次/那次/还记得）",
+                    text,
+                    meta=self._event_meta(text),
+                )
             if _COMMITMENT_RE.search(text):
                 add("commitment", role, "存在未来约定与承诺表达（明天/回头/下次）", text)
             if _REPAIR_RE.search(text):
@@ -277,6 +478,7 @@ class RelationshipExtractor:
                 "content": c.content,
                 "confidence": c.confidence,
                 "evidence": c.evidence,
+                "meta": c.meta,
             }
             for c in candidates
         ], ensure_ascii=False, indent=2)
@@ -314,6 +516,7 @@ class RelationshipExtractor:
                 for e in (item.get("evidence") or [])
                 if str(e).strip()
             ][:3]
+            meta = self._sanitize_meta(fact_type, item.get("meta"))
             output.append(RelationshipFact(
                 id=f"rel_{uuid.uuid4().hex[:10]}",
                 type=fact_type,
@@ -323,6 +526,7 @@ class RelationshipExtractor:
                 confidence=confidence,
                 source=source,
                 status="candidate",
+                meta=meta,
             ))
         return output
 
@@ -346,6 +550,7 @@ class RelationshipExtractor:
             for ev in fact.evidence:
                 if ev not in existing.evidence and len(existing.evidence) < 3:
                     existing.evidence.append(ev)
+            existing.meta = self._merge_meta(existing.meta, fact.meta)
 
         return list(merged.values())
 
@@ -431,6 +636,7 @@ class RelationshipExtractor:
                 for ev in fact.evidence:
                     if ev not in existing.evidence and len(existing.evidence) < 3:
                         existing.evidence.append(ev)
+                existing.meta = self._merge_meta(existing.meta, fact.meta)
                 if fact.conflict_with_core:
                     existing.conflict_with_core = True
                     existing.status = "rejected"
