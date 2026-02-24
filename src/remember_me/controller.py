@@ -48,6 +48,8 @@ class ChatController:
         self._has_topics = False
         self._proactive_cooldown = 60
         self._next_proactive_at = 0.0
+        self._consecutive_proactive = 0  # 连续主动消息计数（用户回复后归零）
+        self._max_consecutive_proactive = 1  # 最多连续发 1 条主动消息
         self._fresh_session = True  # 新开 GUI 页面，跳过 is_conversation_ended 检查
 
     @property
@@ -221,6 +223,7 @@ class ChatController:
 
         self._topic_starter.on_user_replied()
         self._update_activity()
+        self._consecutive_proactive = 0  # 用户回复了，重置连续主动消息计数
         self._fresh_session = False
 
         if self._on_typing:
@@ -231,6 +234,8 @@ class ChatController:
                 None, lambda: self._engine.send_multi(text, image=image)
             )
             self._update_activity()
+            # 回复后重置主动消息冷却，防止回复刚发完就触发主动话题
+            self._next_proactive_at = time.time() + self._proactive_cooldown + random.randint(0, 30)
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
@@ -276,6 +281,9 @@ class ChatController:
             now = time.time()
             idle = self._get_idle_seconds()
             if idle <= 15 or now <= self._next_proactive_at:
+                continue
+            # 连续主动消息上限：用户不回复就不再骚扰
+            if self._consecutive_proactive >= self._max_consecutive_proactive:
                 continue
             # 新 GUI 会话跳过"对话已结束"检查（用户主动打开页面说明想聊）
             if not self._fresh_session and self._engine.is_conversation_ended():
@@ -324,6 +332,7 @@ class ChatController:
                         continue
                     self._engine.inject_proactive_message(msgs)
                     self._update_activity()
+                    self._consecutive_proactive += 1
                     self._fresh_session = False  # 第一条主动消息发出后恢复正常检查
                     cooldown = self._proactive_cooldown
                     if self._engine:
