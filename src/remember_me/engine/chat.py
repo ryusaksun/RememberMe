@@ -120,10 +120,29 @@ def _build_system_prompt(persona: Persona) -> str:
 _MAX_BURST = 8  # 单次回复最大消息条数安全上限（正常由 burst_range 引导）
 
 
+# 检测 LLM 推理泄漏：中文内容后跟随英文句子（如 `"). Let's ask about...`）
+_REASONING_LEAK_RE = re.compile(
+    r'["\')}\]]+\s*\.?\s*[A-Z][a-zA-Z\s,\'"\-]{8,}$'
+)
+
+
+def _clean_reasoning_leak(msg: str) -> str:
+    """剥离 LLM 偶尔泄漏的英文推理/元注释。"""
+    m = _REASONING_LEAK_RE.search(msg)
+    if m:
+        cleaned = msg[:m.start()].strip()
+        if cleaned:
+            return cleaned
+    return msg
+
+
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
     """将 ||| 分隔的回复拆成多条消息。自动检测并丢弃截断的末尾消息。"""
     parts = text.split(_MSG_SEPARATOR)
     result = [p.strip() for p in parts if p.strip()]
+    # 清理 LLM 推理泄漏
+    result = [_clean_reasoning_leak(m) for m in result]
+    result = [m for m in result if m]
     if len(result) > 1:
         # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
         avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
