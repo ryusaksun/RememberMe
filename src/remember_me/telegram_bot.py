@@ -206,7 +206,7 @@ class TelegramBot:
             logger.exception("知识库更新失败: %s", e)
 
     async def _try_send_daily_message(self):
-        """尝试发送每日主动消息。"""
+        """尝试发送每日主动消息。优先发送待跟进事件的追问。"""
         # 没有目标 chat_id（用户从未和 bot 交互过）
         if not self._chat_id and not self._allowed_users:
             logger.info("每日消息跳过：无目标 chat_id")
@@ -229,17 +229,35 @@ class TelegramBot:
             if not ok:
                 return
 
-            # 用 TopicStarter 生成消息
             controller = self._controller
             if not controller._engine or not controller._topic_starter:
                 return
 
             loop = asyncio.get_event_loop()
-            ctx = controller._engine.get_recent_context() if controller._engine else ""
-            msgs = await loop.run_in_executor(
-                None, lambda: controller._topic_starter.generate(recent_context=ctx)
-            )
-            msgs = [m for m in msgs if m and m.strip()]
+            msgs = None
+
+            # 优先级 1：检查待跟进事件
+            if controller._event_tracker:
+                due_events = controller._event_tracker.get_due_events()
+                if due_events:
+                    event = due_events[0]
+                    logger.info("每日消息触发事件追问: %s", event.event)
+                    msgs = await loop.run_in_executor(
+                        None, lambda: controller._topic_starter.generate_event_followup(
+                            event.event, event.context, event.followup_hint
+                        )
+                    )
+                    if msgs:
+                        controller._event_tracker.mark_done(event.id)
+
+            # 优先级 2：常规新话题
+            if not msgs:
+                ctx = controller._engine.get_recent_context() if controller._engine else ""
+                msgs = await loop.run_in_executor(
+                    None, lambda: controller._topic_starter.generate(recent_context=ctx)
+                )
+
+            msgs = [m for m in (msgs or []) if m and m.strip()]
             if not msgs:
                 logger.info("每日消息生成为空")
                 return

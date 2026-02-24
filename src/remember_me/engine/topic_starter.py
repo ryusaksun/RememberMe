@@ -250,6 +250,29 @@ class TopicStarter:
             self._proactive_count += 1
         return msgs
 
+    def generate_event_followup(self, event_desc: str, event_context: str,
+                                followup_hint: str) -> list[str]:
+        """为待跟进事件生成追问消息。"""
+        name = self._persona.name
+
+        prompt = (
+            f"之前对方跟你说过：「{event_context}」\n"
+            f"（事件：{event_desc}）\n\n"
+            f"现在过了一段时间了，你想关心一下对方。追问方向：{followup_hint}\n\n"
+            f"用{name}的语气，自然地问一句。要求：\n"
+            f"- 像是突然想起来随口一问，不要太正式\n"
+            f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果需要）\n"
+            f"- 1-2 条短消息就够了\n"
+            f"- 不要重复对方原话，用自己的方式表达关心\n"
+        )
+
+        msgs = self._generate_with_context(prompt)
+        if msgs:
+            self._last_proactive = msgs
+            self._followup_count = 0
+            self._proactive_count += 1
+        return msgs
+
     def on_user_replied(self):
         self._followup_count = 0
         self._last_proactive = []

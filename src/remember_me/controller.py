@@ -35,6 +35,7 @@ class ChatController:
         self._engine = None
         self._topic_starter = None
         self._memory = None
+        self._event_tracker = None
         self._on_message: Callable[[list[str], str], None] | None = None  # (msgs, msg_type)
         self._on_typing: Callable[[bool], None] | None = None
         self._running = False
@@ -42,6 +43,7 @@ class ChatController:
         self._proactive_task: asyncio.Task | None = None
         self._last_activity = 0.0
         self._history_start_index = 0
+        self._event_extract_index = 0  # 上次事件提取时的历史位置
         self._session_loaded = False
         self._has_topics = False
         self._proactive_cooldown = 60
@@ -160,6 +162,11 @@ class ChatController:
         self._topic_starter = TopicStarter(persona=persona, client=self._engine.client)
         self._has_topics = bool(getattr(persona, "topic_interests", None))
 
+        # 待跟进事件追踪器
+        from remember_me.engine.pending_events import PendingEventTracker
+        self._event_tracker = PendingEventTracker(persona_name=self._name, data_dir=DATA_DIR)
+        self._event_extract_index = len(self._engine._history)
+
         self._update_activity()
         self._next_proactive_at = time.time() + random.randint(20, 45)
 
@@ -224,22 +231,49 @@ class ChatController:
                 None, lambda: self._engine.send_multi(text, image=image)
             )
             self._update_activity()
+
+            # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
+            history_len = len(self._engine._history)
+            if history_len - self._event_extract_index >= 6:
+                asyncio.create_task(self._extract_pending_events())
+
             return replies
         finally:
             if self._on_typing:
                 self._on_typing(False)
 
+    async def _extract_pending_events(self):
+        """异步从近期对话中提取待跟进事件。"""
+        if not self._event_tracker or not self._engine:
+            return
+        try:
+            messages = []
+            for h in self._engine._history[self._event_extract_index:]:
+                if h.parts and h.parts[0].text:
+                    messages.append({"role": h.role, "text": h.parts[0].text})
+            self._event_extract_index = len(self._engine._history)
+
+            if not messages:
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: self._event_tracker.extract_events(
+                    self._engine.client, messages
+                )
+            )
+        except Exception as e:
+            logger.debug("事件提取失败: %s", e)
+
     async def _proactive_loop(self):
         """后台主动消息循环（替代 cli.py 中的 proactive_worker 线程）。"""
         while self._running:
             await asyncio.sleep(2)
-            if not self._has_topics or not self._running:
+            if not self._running:
                 continue
             now = time.time()
             idle = self._get_idle_seconds()
             if idle <= 15 or now <= self._next_proactive_at:
-                continue
-            if not self._topic_starter.should_send_proactive():
                 continue
             # 新 GUI 会话跳过"对话已结束"检查（用户主动打开页面说明想聊）
             if not self._fresh_session and self._engine.is_conversation_ended():
@@ -250,17 +284,35 @@ class ChatController:
                     self._on_typing(True)
 
                 loop = asyncio.get_event_loop()
-                ctx = self._engine.get_recent_context()
-                if self._topic_starter._last_proactive:
-                    msgs = await loop.run_in_executor(
-                        None, lambda: self._topic_starter.generate_followup(recent_context=ctx)
-                    )
-                else:
-                    msgs = self._topic_starter.pop_cached()
-                    if not msgs:
+                msgs = None
+
+                # 优先级 1：检查待跟进事件
+                if self._event_tracker:
+                    due_events = self._event_tracker.get_due_events()
+                    if due_events:
+                        event = due_events[0]
+                        logger.info("触发事件追问: %s", event.event)
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate(recent_context=ctx)
+                            None, lambda: self._topic_starter.generate_event_followup(
+                                event.event, event.context, event.followup_hint
+                            )
                         )
+                        if msgs:
+                            self._event_tracker.mark_done(event.id)
+
+                # 优先级 2：常规主动话题
+                if not msgs and self._has_topics and self._topic_starter.should_send_proactive():
+                    ctx = self._engine.get_recent_context()
+                    if self._topic_starter._last_proactive:
+                        msgs = await loop.run_in_executor(
+                            None, lambda: self._topic_starter.generate_followup(recent_context=ctx)
+                        )
+                    else:
+                        msgs = self._topic_starter.pop_cached()
+                        if not msgs:
+                            msgs = await loop.run_in_executor(
+                                None, lambda: self._topic_starter.generate(recent_context=ctx)
+                            )
 
                 if msgs:
                     # 再次检查：发送期间用户可能回复了
@@ -275,7 +327,7 @@ class ChatController:
                     if self._on_message:
                         self._on_message(msgs, "proactive")
 
-                if not self._topic_starter._last_proactive:
+                if self._has_topics and not self._topic_starter._last_proactive:
                     try:
                         await loop.run_in_executor(None, self._topic_starter.prefetch)
                     except Exception:
@@ -309,6 +361,17 @@ class ChatController:
             new_msgs = self._engine.get_new_messages(self._history_start_index)
             if new_msgs and self._memory:
                 self._memory.add_messages(new_msgs)
+            # 会话结束时提取待跟进事件（确保不遗漏）
+            if self._event_tracker:
+                remaining = []
+                for h in self._engine._history[self._event_extract_index:]:
+                    if h.parts and h.parts[0].text:
+                        remaining.append({"role": h.role, "text": h.parts[0].text})
+                if remaining:
+                    try:
+                        self._event_tracker.extract_events(self._engine.client, remaining)
+                    except Exception as e:
+                        logger.debug("会话结束事件提取失败: %s", e)
         except Exception as e:
             logger.warning("保存会话失败: %s", e)
 
