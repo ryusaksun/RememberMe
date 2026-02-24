@@ -7,6 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 
 def _now_iso() -> str:
@@ -27,9 +28,9 @@ def _normalize_text(text: str) -> str:
 
 
 _STATUS_RANK = {
-    "rejected": 0,
     "candidate": 1,
     "confirmed": 2,
+    "rejected": 3,
 }
 
 _TYPE_LABEL = {
@@ -41,6 +42,7 @@ _TYPE_LABEL = {
     "repair_pattern": "冲突修复",
     "preference": "偏好线索",
 }
+RELATION_TYPES = tuple(_TYPE_LABEL.keys())
 
 
 @dataclass
@@ -104,6 +106,15 @@ class RelationshipMemoryStore:
     @staticmethod
     def _fact_key(fact_type: str, content: str) -> str:
         return f"{fact_type}:{_normalize_text(content)}"
+
+    @staticmethod
+    def _sort_rows(rows: Iterable[RelationshipFact]) -> list[RelationshipFact]:
+        sorted_rows = list(rows)
+        sorted_rows.sort(
+            key=lambda x: (x.confidence, _parse_iso(x.updated_at)),
+            reverse=True,
+        )
+        return sorted_rows
 
     @staticmethod
     def _merge_evidence(old: list[str], new: list[str], limit: int = 3) -> list[str]:
@@ -171,27 +182,39 @@ class RelationshipMemoryStore:
             self.save()
         return changed
 
-    def list_confirmed(self, limit: int = 20) -> list[RelationshipFact]:
+    def list_facts(
+        self,
+        *,
+        fact_type: str | None = None,
+        statuses: set[str] | None = None,
+        include_conflict: bool = True,
+        limit: int = 20,
+    ) -> list[RelationshipFact]:
+        wanted_statuses = statuses or {"candidate", "confirmed", "rejected"}
         rows = [
             f for f in self._facts
-            if f.status == "confirmed" and not f.conflict_with_core
+            if f.status in wanted_statuses and (not fact_type or f.type == fact_type)
         ]
-        rows.sort(
-            key=lambda x: (x.confidence, _parse_iso(x.updated_at)),
-            reverse=True,
+        if not include_conflict:
+            rows = [f for f in rows if not f.conflict_with_core]
+        return self._sort_rows(rows)[: max(0, limit)]
+
+    def list_confirmed(self, limit: int = 20) -> list[RelationshipFact]:
+        return self.list_facts(
+            statuses={"confirmed"}, include_conflict=False, limit=limit,
         )
-        return rows[: max(0, limit)]
 
     def list_candidates(self, limit: int = 20) -> list[RelationshipFact]:
-        rows = [
-            f for f in self._facts
-            if f.status == "candidate" and not f.conflict_with_core
-        ]
-        rows.sort(
-            key=lambda x: (x.confidence, _parse_iso(x.updated_at)),
-            reverse=True,
+        return self.list_facts(
+            statuses={"candidate"}, include_conflict=False, limit=limit,
         )
-        return rows[: max(0, limit)]
+
+    def list_rejected(self, limit: int = 20) -> list[RelationshipFact]:
+        return self.list_facts(
+            statuses={"rejected"},
+            include_conflict=True,
+            limit=limit,
+        )
 
     def promote_candidates(self, min_confidence: float = 0.78, min_evidence: int = 2) -> int:
         changed = 0
@@ -224,3 +247,44 @@ class RelationshipMemoryStore:
                 line += f"（证据：{fact.evidence[0][:30]}）"
             lines.append(line)
         return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_ref(ref: str | int, rows: list[RelationshipFact]) -> RelationshipFact | None:
+        if isinstance(ref, int):
+            idx = ref - 1
+            if 0 <= idx < len(rows):
+                return rows[idx]
+            return None
+        target = str(ref or "").strip()
+        if not target:
+            return None
+        for fact in rows:
+            if fact.id == target:
+                return fact
+        return None
+
+    def confirm_fact(self, ref: str | int) -> bool:
+        rows = self.list_facts(limit=500)
+        target = self._resolve_ref(ref, rows)
+        if not target:
+            return False
+        if target.conflict_with_core:
+            return False
+        if target.status == "confirmed":
+            return True
+        target.status = "confirmed"
+        target.updated_at = _now_iso()
+        self.save()
+        return True
+
+    def reject_fact(self, ref: str | int, reason: str = "manual_reject") -> bool:
+        rows = self.list_facts(limit=500)
+        target = self._resolve_ref(ref, rows)
+        if not target:
+            return False
+        target.status = "rejected"
+        if reason:
+            target.conflict_reason = str(reason)
+        target.updated_at = _now_iso()
+        self.save()
+        return True

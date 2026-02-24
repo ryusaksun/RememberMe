@@ -94,14 +94,24 @@ class RelationshipExtractor:
 
     @staticmethod
     def _resolve_conflict(
-        validator: Callable[[str], object] | None,
-        text: str,
+        validator: Callable[[object], object] | None,
+        fact: RelationshipFact,
     ) -> tuple[bool, str]:
         if not validator:
             return False, ""
-        try:
-            verdict = validator(text)
-        except Exception:
+
+        verdict = None
+        called = False
+        for payload in (fact, fact.content):
+            try:
+                verdict = validator(payload)
+                called = True
+                break
+            except TypeError:
+                continue
+            except Exception:
+                continue
+        if not called:
             return False, ""
 
         if isinstance(verdict, tuple):
@@ -144,6 +154,35 @@ class RelationshipExtractor:
             mapped = "persona" if role == "model" else "user"
             rows.append((mapped, text))
         return rows
+
+    @staticmethod
+    def _iter_windows(
+        rows: list[tuple[str, str]],
+        *,
+        window_size: int,
+        stride: int,
+    ):
+        if not rows:
+            return
+        if window_size <= 0:
+            window_size = len(rows)
+        if stride <= 0:
+            stride = window_size
+
+        n = len(rows)
+        if n <= window_size:
+            yield rows
+            return
+
+        start = 0
+        while start < n:
+            end = min(n, start + window_size)
+            window = rows[start:end]
+            if len(window) >= 8:
+                yield window
+            if end >= n:
+                break
+            start += stride
 
     def _extract_rule_candidates(self, rows: list[tuple[str, str]], source: str) -> list[RelationshipFact]:
         if not rows:
@@ -243,7 +282,7 @@ class RelationshipExtractor:
         ], ensure_ascii=False, indent=2)
         messages_text = "\n".join(
             f"{'对方' if role == 'user' else '你'}: {text}"
-            for role, text in rows[-28:]
+            for role, text in rows[-60:]
         )
         prompt = _VERIFY_PROMPT.format(candidates=cand_json, messages=messages_text)
 
@@ -310,48 +349,91 @@ class RelationshipExtractor:
 
         return list(merged.values())
 
+    def _extract_from_rows(
+        self,
+        rows: list[tuple[str, str]],
+        *,
+        source: str,
+        client: genai.Client | None = None,
+        conflict_validator: Callable[[object], object] | None = None,
+    ) -> list[RelationshipFact]:
+        if not rows:
+            return []
+
+        rule_facts = self._extract_rule_candidates(rows, source=source)
+        llm_facts = self._verify_with_llm(client, rows, rule_facts, source=source) if client else []
+        facts = self._merge_rule_and_llm(rule_facts, llm_facts)
+
+        for fact in facts:
+            conflict, reason = self._resolve_conflict(conflict_validator, fact)
+            fact.conflict_with_core = conflict
+            fact.conflict_reason = reason
+            if conflict:
+                fact.status = "rejected"
+        return facts
+
     def extract_from_messages(
         self,
         messages: list[dict],
         *,
         client: genai.Client | None = None,
         source: str = "runtime_session",
-        conflict_validator: Callable[[str], object] | None = None,
+        conflict_validator: Callable[[object], object] | None = None,
     ) -> list[RelationshipFact]:
         rows = self._to_role_texts_from_messages(messages)
-        if not rows:
-            return []
-        rule_facts = self._extract_rule_candidates(rows, source=source)
-        llm_facts = self._verify_with_llm(client, rows, rule_facts, source=source) if client else []
-        facts = self._merge_rule_and_llm(rule_facts, llm_facts)
-
-        for fact in facts:
-            conflict, reason = self._resolve_conflict(conflict_validator, fact.content)
-            fact.conflict_with_core = conflict
-            fact.conflict_reason = reason
-            if conflict:
-                fact.status = "rejected"
-        return facts
+        return self._extract_from_rows(
+            rows, source=source, client=client, conflict_validator=conflict_validator,
+        )
 
     def extract_from_history(
         self,
         history: ChatHistory,
         *,
         client: genai.Client | None = None,
-        conflict_validator: Callable[[str], object] | None = None,
+        conflict_validator: Callable[[object], object] | None = None,
+    ) -> list[RelationshipFact]:
+        rows = self._to_role_texts_from_history(history)
+        return self._extract_from_rows(
+            rows,
+            source="imported_history",
+            client=client,
+            conflict_validator=conflict_validator,
+        )
+
+    def extract_from_history_in_windows(
+        self,
+        history: ChatHistory,
+        *,
+        client: genai.Client | None = None,
+        conflict_validator: Callable[[object], object] | None = None,
+        window_size: int = 120,
+        stride: int = 80,
     ) -> list[RelationshipFact]:
         rows = self._to_role_texts_from_history(history)
         if not rows:
             return []
 
-        rule_facts = self._extract_rule_candidates(rows, source="imported_history")
-        llm_facts = self._verify_with_llm(client, rows, rule_facts, source="imported_history") if client else []
-        facts = self._merge_rule_and_llm(rule_facts, llm_facts)
+        merged: dict[str, RelationshipFact] = {}
+        for window_rows in self._iter_windows(rows, window_size=window_size, stride=stride):
+            facts = self._extract_from_rows(
+                window_rows,
+                source="imported_history",
+                client=client,
+                conflict_validator=conflict_validator,
+            )
+            for fact in facts:
+                key = self._normalize_key(fact.type, fact.content)
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = fact
+                    continue
+                existing.confidence = max(existing.confidence, fact.confidence)
+                for ev in fact.evidence:
+                    if ev not in existing.evidence and len(existing.evidence) < 3:
+                        existing.evidence.append(ev)
+                if fact.conflict_with_core:
+                    existing.conflict_with_core = True
+                    existing.status = "rejected"
+                    existing.conflict_reason = fact.conflict_reason or existing.conflict_reason
 
-        for fact in facts:
-            conflict, reason = self._resolve_conflict(conflict_validator, fact.content)
-            fact.conflict_with_core = conflict
-            fact.conflict_reason = reason
-            if conflict:
-                fact.status = "rejected"
-        return facts
+        return list(merged.values())

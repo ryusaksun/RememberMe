@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 from remember_me.controller import ChatController
+from remember_me.memory.relationship import RELATION_TYPES, RelationshipMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,15 @@ TIMEZONE = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
 DATA_DIR = Path("data")
 PROFILES_DIR = DATA_DIR / "profiles"
 _SENTENCE_END_RE = re.compile(r"[。！？!?~…]$")
+_REL_TYPE_LABEL = {
+    "relation_stage": "关系阶段",
+    "addressing": "称呼习惯",
+    "boundary": "互动边界",
+    "shared_event": "共同经历",
+    "commitment": "承诺与跟进",
+    "repair_pattern": "冲突修复",
+    "preference": "偏好线索",
+}
 
 
 class TelegramBot:
@@ -405,23 +415,155 @@ class TelegramBot:
         if self._controller and self._controller._memory_governance and self._controller._persona:
             self._controller._memory_governance.replace_manual_notes(notes, persona=self._controller._persona)
 
+    def _get_relationship_store(self) -> RelationshipMemoryStore:
+        if self._controller and self._controller._relationship_store:
+            return self._controller._relationship_store
+        return RelationshipMemoryStore(PERSONA_NAME, data_dir=DATA_DIR)
+
+    @staticmethod
+    def _format_relationship_item(idx: int, fact) -> str:
+        status_label = {
+            "confirmed": "已确认",
+            "candidate": "待确认",
+            "rejected": "已拒绝",
+        }.get(getattr(fact, "status", "candidate"), "未知")
+        fact_type = str(getattr(fact, "type", "") or "")
+        type_label = _REL_TYPE_LABEL.get(fact_type, fact_type)
+        content = str(getattr(fact, "content", "") or "").strip()
+        conf = float(getattr(fact, "confidence", 0.0) or 0.0)
+        evidence = list(getattr(fact, "evidence", []) or [])
+        suffix = f"（置信 {conf:.2f}）"
+        if evidence:
+            suffix += f" 证据:{evidence[0][:20]}"
+        return f"{idx}. [{status_label}][{type_label}] {content} {suffix}"
+
+    async def _cmd_note_rel(self, update: Update, raw: str, parts: list[str]):
+        if len(parts) < 3:
+            await update.message.reply_text(
+                "用法：\n"
+                "/note rel list [type|all|rejected]\n"
+                "/note rel confirm <序号>\n"
+                "/note rel reject <序号> [原因]\n\n"
+                f"type 可选：{', '.join(RELATION_TYPES)}"
+            )
+            return
+
+        store = self._get_relationship_store()
+        subcmd = parts[2].lower()
+
+        if subcmd == "list":
+            fact_type = None
+            statuses = {"candidate", "confirmed"}
+            include_conflict = False
+            if len(parts) >= 4:
+                arg = parts[3].strip().lower()
+                if arg == "all":
+                    statuses = {"candidate", "confirmed", "rejected"}
+                    include_conflict = True
+                elif arg == "rejected":
+                    statuses = {"rejected"}
+                    include_conflict = True
+                else:
+                    fact_type = arg
+                    if fact_type not in RELATION_TYPES:
+                        await update.message.reply_text(
+                            f"type 无效，可选：{', '.join(RELATION_TYPES)}"
+                        )
+                        return
+            rows = store.list_facts(
+                fact_type=fact_type,
+                statuses=statuses,
+                include_conflict=include_conflict,
+                limit=50,
+            )
+            if not rows:
+                await update.message.reply_text("暂无关系记忆记录。")
+                return
+            lines = [self._format_relationship_item(i + 1, fact) for i, fact in enumerate(rows)]
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        if subcmd == "confirm":
+            if len(parts) < 4:
+                await update.message.reply_text("用法：/note rel confirm <序号>")
+                return
+            try:
+                idx = int(parts[3])
+            except ValueError:
+                await update.message.reply_text("序号必须是数字。")
+                return
+            rows = store.list_facts(
+                statuses={"candidate", "confirmed"},
+                include_conflict=True,
+                limit=200,
+            )
+            if idx < 1 or idx > len(rows):
+                await update.message.reply_text(f"序号超出范围（1-{len(rows)}）。")
+                return
+            fact = rows[idx - 1]
+            ok = store.confirm_fact(fact.id)
+            if not ok:
+                await update.message.reply_text("该记录无法确认（可能与核心人格冲突）。")
+                return
+            await update.message.reply_text(f"已确认：{fact.content}")
+            return
+
+        if subcmd == "reject":
+            if len(parts) < 4:
+                await update.message.reply_text("用法：/note rel reject <序号> [原因]")
+                return
+            try:
+                idx = int(parts[3])
+            except ValueError:
+                await update.message.reply_text("序号必须是数字。")
+                return
+            rows = store.list_facts(
+                statuses={"candidate", "confirmed"},
+                include_conflict=True,
+                limit=200,
+            )
+            if idx < 1 or idx > len(rows):
+                await update.message.reply_text(f"序号超出范围（1-{len(rows)}）。")
+                return
+            reason = ""
+            if len(parts) >= 5:
+                reason = raw.split(None, 4)[4].strip()
+            if not reason:
+                reason = "manual_reject"
+            fact = rows[idx - 1]
+            store.reject_fact(fact.id, reason=f"manual:{reason}")
+            await update.message.reply_text(f"已拒绝：{fact.content}")
+            return
+
+        await update.message.reply_text(
+            "未知子命令。用法：/note rel list|confirm|reject"
+        )
+
     async def _cmd_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
             return
 
-        args = update.message.text.split(maxsplit=2)  # /note [subcmd] [content]
-        if len(args) < 2:
+        raw = (update.message.text or "").strip()
+        parts = raw.split()
+        if len(parts) < 2:
             await update.message.reply_text(
                 "用法：\n"
                 "/note add <内容> — 添加备注\n"
                 "/note list — 查看所有备注\n"
-                "/note del <序号> — 删除备注\n\n"
+                "/note del <序号> — 删除备注\n"
+                "/note rel list [type|all|rejected] — 查看关系记忆\n"
+                "/note rel confirm <序号> — 确认关系记忆\n"
+                "/note rel reject <序号> [原因] — 拒绝关系记忆\n\n"
                 "备注是短期上下文，不会覆盖导入聊天记录的人设核心。\n"
                 "修改即时生效，无需重启对话。"
             )
             return
 
-        subcmd = args[1].lower()
+        subcmd = parts[1].lower()
+        if subcmd == "rel":
+            await self._cmd_note_rel(update, raw, parts)
+            return
+
         notes = ChatController.load_notes(PERSONA_NAME)
 
         if subcmd == "list":
@@ -432,21 +574,24 @@ class TelegramBot:
                 await update.message.reply_text("\n".join(lines))
 
         elif subcmd == "add":
-            if len(args) < 3 or not args[2].strip():
+            if len(parts) < 3:
                 await update.message.reply_text("用法：/note add <内容>")
                 return
-            content = args[2].strip()
+            content = raw.split(None, 2)[2].strip()
+            if not content:
+                await update.message.reply_text("用法：/note add <内容>")
+                return
             notes.append(content)
             ChatController.save_notes(PERSONA_NAME, notes)
             self._sync_notes_to_engine(notes)
             await update.message.reply_text(f"已添加第 {len(notes)} 条备注：{content}")
 
         elif subcmd == "del":
-            if len(args) < 3:
+            if len(parts) < 3:
                 await update.message.reply_text("用法：/note del <序号>")
                 return
             try:
-                idx = int(args[2]) - 1
+                idx = int(parts[2]) - 1
             except ValueError:
                 await update.message.reply_text("序号必须是数字。")
                 return

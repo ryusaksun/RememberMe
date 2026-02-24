@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from datetime import datetime
+from types import SimpleNamespace
 
 from remember_me.analyzer.relationship_extractor import RelationshipExtractor
 from remember_me.engine.chat import ChatEngine
@@ -57,6 +59,37 @@ def test_relationship_store_build_prompt_block(tmp_path) -> None:
     assert "[互动边界]" in block
 
 
+def test_relationship_store_manual_confirm_and_reject(tmp_path) -> None:
+    store = RelationshipMemoryStore("小明", data_dir=tmp_path)
+    store.upsert_facts([
+        RelationshipFact(
+            id="rel_a",
+            type="shared_event",
+            subject="both",
+            content="经常引用共同经历（上次/那次/还记得）",
+            evidence=["上次我们看电影", "那次我们淋雨"],
+            confidence=0.75,
+            status="candidate",
+        ),
+        RelationshipFact(
+            id="rel_b",
+            type="addressing",
+            subject="persona",
+            content="常用称呼偏好：宝宝",
+            evidence=["宝宝早", "宝宝晚安"],
+            confidence=0.84,
+            status="confirmed",
+        ),
+    ])
+    assert store.confirm_fact("rel_a")
+    confirmed = [x.id for x in store.list_confirmed(limit=10)]
+    assert "rel_a" in confirmed and "rel_b" in confirmed
+
+    assert store.reject_fact("rel_b", reason="manual:not fit")
+    rejected = [x.id for x in store.list_rejected(limit=10)]
+    assert "rel_b" in rejected
+
+
 def test_relationship_extractor_rules_and_conflict_filter() -> None:
     history = ChatHistory(
         target_name="小明",
@@ -86,6 +119,36 @@ def test_relationship_extractor_rules_and_conflict_filter() -> None:
     assert boundary.status == "rejected"
 
 
+def test_relationship_extractor_history_windowed_dedup() -> None:
+    history = ChatHistory(
+        target_name="小明",
+        user_name="我",
+        messages=[
+            ChatMessage(sender="我", content="别再提这个了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="好", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="我", content="不要再问这个了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="收到", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="上次我们看电影还记得吗", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="那次我们淋雨你还记得", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="我", content="别再提这个了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="行", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="我", content="不要再问这个了", timestamp=_ts(), is_target=False),
+            ChatMessage(sender="小明", content="好好", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="宝宝你到家了吗", timestamp=_ts(), is_target=True),
+            ChatMessage(sender="小明", content="宝宝早点休息", timestamp=_ts(), is_target=True),
+        ],
+    )
+    extractor = RelationshipExtractor()
+    facts = extractor.extract_from_history_in_windows(
+        history,
+        window_size=8,
+        stride=4,
+    )
+    boundary = [f for f in facts if f.type == "boundary"]
+    assert len(boundary) == 1
+    assert any(f.type == "shared_event" for f in facts)
+
+
 def test_governance_build_relationship_block(tmp_path) -> None:
     governance = MemoryGovernance("小明", data_dir=tmp_path)
     store = RelationshipMemoryStore("小明", data_dir=tmp_path)
@@ -105,6 +168,72 @@ def test_governance_build_relationship_block(tmp_path) -> None:
     block = governance.build_relationship_block(limit=5)
     assert "你们关系记忆" in block
     assert "共同经历" in block
+
+
+def test_governance_validate_relationship_fact(tmp_path) -> None:
+    governance = MemoryGovernance("小明", data_dir=tmp_path)
+    persona = type("P", (), {
+        "name": "小明",
+        "style_summary": "自然口语",
+        "catchphrases": ["笑死"],
+        "tone_markers": ["啊"],
+        "self_references": ["我"],
+        "topic_interests": {"游戏": 3},
+        "swear_ratio": 0.0,
+        "avg_length": 12.0,
+    })()
+    governance.bootstrap_core_from_persona(persona, force=True)
+
+    bad = RelationshipFact(
+        id="rel_bad",
+        type="addressing",
+        subject="persona",
+        content="常用称呼偏好：机器人",
+        evidence=["你是机器人"],
+        confidence=0.9,
+    )
+    verdict = governance.validate_relationship_fact(bad, persona=persona)
+    assert verdict.conflict
+
+    good = RelationshipFact(
+        id="rel_ok",
+        type="shared_event",
+        subject="both",
+        content="经常引用共同经历（上次/那次/还记得）",
+        evidence=["上次我们一起看电影", "那次我们淋雨"],
+        confidence=0.88,
+    )
+    verdict_ok = governance.validate_relationship_fact(good, persona=persona)
+    assert not verdict_ok.conflict
+
+
+def test_emotion_relationship_trigger_medium_weight() -> None:
+    state = EmotionState()
+    facts = [
+        RelationshipFact(
+            id="rel_evt",
+            type="shared_event",
+            subject="both",
+            content="经常引用共同经历（上次/那次/还记得）",
+            status="confirmed",
+        ),
+    ]
+    state.apply_relationship_trigger(facts, "上次我们看的电影你还记得吗")
+    assert state.valence > 0.0
+    assert state.arousal > 0.0
+
+    state2 = EmotionState(valence=0.2, arousal=0.2)
+    boundary = [
+        RelationshipFact(
+            id="rel_bound",
+            type="boundary",
+            subject="user",
+            content="存在明确的交流边界（别提/别问/不聊）",
+            status="confirmed",
+        )
+    ]
+    state2.apply_relationship_trigger(boundary, "这个不聊了，别问了")
+    assert state2.arousal < 0.2
 
 
 def test_chat_engine_prompt_orders_core_relation_session() -> None:
@@ -129,3 +258,39 @@ def test_chat_engine_prompt_orders_core_relation_session() -> None:
     text = e._build_system("最近怎么样")
     assert text.index("## CORE") < text.index("## REL")
     assert text.index("## REL") < text.index("## SESSION")
+
+
+def test_chat_engine_prompt_order_puts_knowledge_after_conflict() -> None:
+    class _Gov:
+        def build_prompt_blocks(self, **kwargs):
+            return ("## CORE\n- imported", "## SESSION\n- runtime", "## CONFLICT\n- x")
+
+        def build_relationship_block(self, limit: int = 10):
+            return "## REL\n- relation"
+
+    class _Memory:
+        def search(self, query: str, top_k: int):
+            return [("user: 上次我们一起看电影", 0.2)]
+
+    class _KB:
+        def search(self, query: str, top_k: int):
+            return [SimpleNamespace(summary="今天有个新热点")]
+
+    e = ChatEngine.__new__(ChatEngine)
+    e._persona = type("P", (), {"name": "x"})()
+    e._system_prompt = "base"
+    e._knowledge_store = _KB()
+    e._memory = _Memory()
+    e._memory_cache = OrderedDict()
+    e._history = []
+    e._state_lock = threading.Lock()
+    e._scratchpad = Scratchpad()
+    e._emotion_state = EmotionState()
+    e._memory_governance = _Gov()
+
+    text = e._build_system("最近怎么样")
+    assert text.index("## CORE") < text.index("## REL")
+    assert text.index("## REL") < text.index("## 你们过去聊到类似话题时的真实对话")
+    assert text.index("## 你们过去聊到类似话题时的真实对话") < text.index("## SESSION")
+    assert text.index("## SESSION") < text.index("## CONFLICT")
+    assert text.index("## CONFLICT") < text.index("## 你最近关注的新闻和动态")

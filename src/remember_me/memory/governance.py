@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from remember_me.analyzer.persona import Persona
-from remember_me.memory.relationship import RelationshipMemoryStore
+from remember_me.memory.relationship import RelationshipFact, RelationshipMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,9 @@ _TRIVIAL_SESSION_RE = re.compile(
 _AI_IDENTITY_RE = re.compile(r"(你是ai|你是人工智能|你是机器人|你只是程序|你不是真人)")
 _OVERRIDE_CUE_RE = re.compile(r"(以后|从现在开始|别再|不要再|改成|改为|你其实|你不是|你应该)")
 _NO_SWEAR_RE = re.compile(r"(别骂人|不要骂人|不许骂人|别说脏话|不要说脏话)")
+_RELATION_OVERRIDE_RE = re.compile(r"(从现在起|以后我们|关系.*改成|你其实只把我当)")
+_BOUNDARY_OVERRIDE_RE = re.compile(r"(永远|以后都|必须|不许).{0,8}(提|问|聊|叫|联系)")
+_ADDRESSING_INVALID_RE = re.compile(r"(客服|机器人|ai|人工智能)", re.I)
 
 
 def _now_iso() -> str:
@@ -260,6 +263,30 @@ class MemoryGovernance:
             if any(tok and tok in msg for tok in tokens):
                 return ConflictResult(True, "试图覆盖导入历史的核心表达")
 
+        return ConflictResult(False, "")
+
+    def validate_relationship_fact(
+        self,
+        fact: RelationshipFact,
+        persona: Persona | None = None,
+    ) -> ConflictResult:
+        """关系记忆专用冲突检查：导入人格核心不可被关系层覆盖。"""
+        text = str(getattr(fact, "content", "") or "").strip()
+        if not text:
+            return ConflictResult(False, "")
+
+        # 先复用通用冲突规则（身份/语气改写等）
+        base = self.validate_against_imported_history(text, persona=persona)
+        if base.conflict:
+            return base
+
+        fact_type = str(getattr(fact, "type", "") or "").strip()
+        if fact_type == "addressing" and _ADDRESSING_INVALID_RE.search(text):
+            return ConflictResult(True, "关系称呼与导入人格不一致")
+        if fact_type == "relation_stage" and _RELATION_OVERRIDE_RE.search(text):
+            return ConflictResult(True, "关系阶段被指令式改写")
+        if fact_type == "boundary" and _BOUNDARY_OVERRIDE_RE.search(text):
+            return ConflictResult(True, "互动边界被永久性重写")
         return ConflictResult(False, "")
 
     def list_core_records(self) -> list[MemoryRecord]:

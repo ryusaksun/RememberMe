@@ -63,6 +63,8 @@ class ChatController:
         self._event_extract_task: asyncio.Task | None = None
         self._relationship_extract_index = 0
         self._relationship_extract_task: asyncio.Task | None = None
+        self._last_relationship_followup_at = 0.0
+        self._last_relationship_fact_id = ""
         self._session_loaded = False
         self._has_topics = False
         self._proactive_cooldown = 60
@@ -230,6 +232,40 @@ class ChatController:
         except Exception as e:
             logger.warning("加载备注失败: %s", e)
             return []
+
+    def _relationship_validator(self, payload: object):
+        if not self._memory_governance:
+            return False, ""
+        if hasattr(payload, "type") and hasattr(payload, "content"):
+            return self._memory_governance.validate_relationship_fact(
+                payload, persona=self._persona,
+            )
+        return self._memory_governance.validate_against_imported_history(
+            str(payload), persona=self._persona,
+        )
+
+    def _pick_shared_event_fact(self):
+        if not self._relationship_store:
+            return None
+        try:
+            rows = self._relationship_store.list_facts(
+                fact_type="shared_event",
+                statuses={"confirmed"},
+                include_conflict=False,
+                limit=6,
+            )
+        except Exception:
+            return None
+        if not rows:
+            return None
+        now = time.time()
+        for fact in rows:
+            if fact.id != self._last_relationship_fact_id:
+                return fact
+        # 全是同一条时，至少间隔 2 小时再复用
+        if now - self._last_relationship_followup_at >= 7200:
+            return rows[0]
+        return None
 
     @staticmethod
     def save_notes(persona_name: str, notes: list[str]):
@@ -514,20 +550,13 @@ class ChatController:
 
             loop = asyncio.get_event_loop()
 
-            def _validator(text: str):
-                if not self._memory_governance:
-                    return False, ""
-                return self._memory_governance.validate_against_imported_history(
-                    text, persona=self._persona,
-                )
-
             facts = await loop.run_in_executor(
                 None,
                 lambda: self._relationship_extractor.extract_from_messages(
                     messages,
                     client=self._engine.client,
                     source="runtime_session",
-                    conflict_validator=_validator,
+                    conflict_validator=self._relationship_validator,
                 ),
             )
             if not facts:
@@ -571,6 +600,7 @@ class ChatController:
 
                 loop = asyncio.get_event_loop()
                 msgs = None
+                relation_fact_id = ""
 
                 # 优先级 1：待跟进事件（上下文相关，始终可触发）
                 if self._event_tracker and idle > 60:
@@ -586,7 +616,21 @@ class ChatController:
                         if msgs:
                             self._event_tracker.mark_done(event.id)
 
-                # 优先级 2：根据上次交互类型决定
+                # 优先级 2：关系记忆追问（shared_event 优先）
+                if not msgs and idle > 90 and (now - self._last_relationship_followup_at) >= 1800:
+                    fact = self._pick_shared_event_fact()
+                    if fact:
+                        ctx = self._engine.get_recent_context()
+                        relation_fact_id = fact.id
+                        msgs = await loop.run_in_executor(
+                            None, lambda: self._topic_starter.generate_relationship_followup(
+                                fact_type=fact.type,
+                                fact_content=fact.content,
+                                recent_context=ctx,
+                            ),
+                        )
+
+                # 优先级 3：根据上次交互类型决定
                 if not msgs:
                     if self._last_interaction_type == "reply":
                         # 回复后沉默 → 接话/关心，不引新话题
@@ -620,6 +664,9 @@ class ChatController:
                     self._consecutive_proactive += 1
                     self._last_interaction_type = "proactive"
                     self._fresh_session = False
+                    if relation_fact_id:
+                        self._last_relationship_fact_id = relation_fact_id
+                        self._last_relationship_followup_at = now
                     cooldown = self._sample_proactive_cooldown()
                     if self._engine:
                         cooldown *= self._engine.proactive_cooldown_factor
@@ -685,18 +732,11 @@ class ChatController:
                     if h.parts and h.parts[0].text:
                         rel_msgs.append({"role": h.role, "text": h.parts[0].text})
                 if rel_msgs:
-                    def _validator(text: str):
-                        if not self._memory_governance:
-                            return False, ""
-                        return self._memory_governance.validate_against_imported_history(
-                            text, persona=self._persona,
-                        )
-
                     facts = self._relationship_extractor.extract_from_messages(
                         rel_msgs,
                         client=self._engine.client,
                         source="runtime_session",
-                        conflict_validator=_validator,
+                        conflict_validator=self._relationship_validator,
                     )
                     if facts:
                         self._relationship_store.upsert_facts(facts)
@@ -808,13 +848,20 @@ class ChatController:
         rel_store = RelationshipMemoryStore(target_name, data_dir=DATA_DIR)
         rel_extractor = RelationshipExtractor()
 
-        def _validator(text: str):
-            return governance.validate_against_imported_history(text, persona=persona)
+        def _validator(payload: object):
+            if hasattr(payload, "type") and hasattr(payload, "content"):
+                return governance.validate_relationship_fact(payload, persona=persona)
+            return governance.validate_against_imported_history(
+                str(payload), persona=persona,
+            )
 
         rel_facts = await loop.run_in_executor(
             None,
-            lambda: rel_extractor.extract_from_history(
-                history, conflict_validator=_validator,
+            lambda: rel_extractor.extract_from_history_in_windows(
+                history,
+                conflict_validator=_validator,
+                window_size=120,
+                stride=80,
             ),
         )
         if rel_facts:

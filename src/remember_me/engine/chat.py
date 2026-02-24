@@ -515,7 +515,7 @@ class ChatEngine:
         return user_input
 
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（核心事实 > 关系记忆 > 导入检索 > 会话上下文）。"""
+        """构建 system prompt（core > relationship > RAG > session > conflict > scratchpad/emotion）。"""
         # 注入当前时间（使用用户时区，非服务器时区）
         now = datetime.now(_TIMEZONE)
         time_block = (
@@ -551,18 +551,6 @@ class ChatEngine:
         if gov_relationship_block:
             system = system + "\n\n" + gov_relationship_block
 
-        # 每日知识库（persona 最近关注的动态）
-        if self._knowledge_store:
-            try:
-                kb_items = self._knowledge_store.search(expanded_query, top_k=3)
-                if kb_items:
-                    kb_lines = ["## 你最近关注的新闻和动态（自然地提到，不要像背课文）"]
-                    for item in kb_items:
-                        kb_lines.append(f"- {item.summary}")
-                    system = system + "\n\n" + "\n".join(kb_lines)
-            except Exception as e:
-                logger.warning("知识库检索失败: %s", e)
-
         # 2) 导入历史检索（只依赖 import 建立的向量库，不写入运行时消息）
         if self._memory:
             raw_results = self._search_memory_cached(expanded_query, top_k=5)
@@ -597,6 +585,18 @@ class ChatEngine:
         if gov_conflict_block:
             system = system + "\n\n" + gov_conflict_block
 
+        # 每日知识库（作为补充，不高于核心/关系/RAG/会话）
+        if self._knowledge_store:
+            try:
+                kb_items = self._knowledge_store.search(expanded_query, top_k=3)
+                if kb_items:
+                    kb_lines = ["## 你最近关注的新闻和动态（自然地提到，不要像背课文）"]
+                    for item in kb_items:
+                        kb_lines.append(f"- {item.summary}")
+                    system = system + "\n\n" + "\n".join(kb_lines)
+            except Exception as e:
+                logger.warning("知识库检索失败: %s", e)
+
         # 中期记忆（scratchpad）+ 情绪引导（锁保护，防止后台线程写入时读到不一致状态）
         with self._state_lock:
             scratchpad_block = self._scratchpad.to_prompt_block()
@@ -627,6 +627,22 @@ class ChatEngine:
             system = system + f"\n\n⚠️ {burst_hint}用 ||| 分隔多条消息。记住：反应词之后必须跟实际回应。"
 
         return system
+
+    def _apply_relationship_emotion_trigger(self, user_input: str):
+        governance = getattr(self, "_memory_governance", None)
+        if not governance:
+            return
+        store = getattr(governance, "_relationship_store", None)
+        if not store:
+            return
+        try:
+            facts = store.list_confirmed(limit=12)
+        except Exception as e:
+            logger.debug("读取关系记忆失败，跳过情绪触发: %s", e)
+            return
+        if not facts:
+            return
+        self._emotion_state.apply_relationship_trigger(facts, user_input)
 
     def _trim_history(self):
         max_turns = 40
@@ -792,6 +808,7 @@ class ChatEngine:
         # 即时情绪微调（关键词规则）
         with self._state_lock:
             self._emotion_state.quick_adjust(user_input, raw_reply, self._persona)
+            self._apply_relationship_emotion_trigger(user_input)
         # 动态更新表情包概率
         self._sticker_probability = mods.sticker_probability
 

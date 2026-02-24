@@ -133,3 +133,78 @@ def test_handle_photo_when_controller_dropped_replies_session_ended() -> None:
     asyncio.run(bot._handle_photo(update, context))
     assert message.replies
     assert "当前会话已结束" in message.replies[-1]
+
+
+def test_note_rel_list_confirm_reject_flow() -> None:
+    class _Fact:
+        def __init__(self, fid: str, status: str, content: str, fact_type: str = "shared_event"):
+            self.id = fid
+            self.status = status
+            self.content = content
+            self.type = fact_type
+            self.confidence = 0.86
+            self.evidence = ["上次我们一起看电影"]
+
+    class _Store:
+        def __init__(self):
+            self.rows = [
+                _Fact("rel_1", "candidate", "经常引用共同经历（上次/那次/还记得）"),
+                _Fact("rel_2", "confirmed", "常用称呼偏好：宝宝", fact_type="addressing"),
+            ]
+            self.confirmed: list[str] = []
+            self.rejected: list[tuple[str, str]] = []
+
+        def list_facts(self, **kwargs):
+            statuses = kwargs.get("statuses")
+            if statuses:
+                return [x for x in self.rows if x.status in statuses]
+            return list(self.rows)
+
+        def confirm_fact(self, ref):
+            self.confirmed.append(str(ref))
+            return True
+
+        def reject_fact(self, ref, reason: str = "manual_reject"):
+            self.rejected.append((str(ref), reason))
+            return True
+
+    class _Msg:
+        def __init__(self, text: str):
+            self.text = text
+            self.replies: list[str] = []
+
+        async def reply_text(self, text: str):
+            self.replies.append(text)
+
+    store = _Store()
+    bot = TelegramBot("token")
+    bot._get_relationship_store = lambda: store  # type: ignore[assignment]
+
+    async def _run():
+        msg_list = _Msg("/note rel list")
+        upd_list = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_list,
+        )
+        await bot._cmd_note(upd_list, SimpleNamespace())
+        assert msg_list.replies and "共同经历" in msg_list.replies[-1]
+
+        msg_confirm = _Msg("/note rel confirm 1")
+        upd_confirm = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_confirm,
+        )
+        await bot._cmd_note(upd_confirm, SimpleNamespace())
+        assert store.confirmed == ["rel_1"]
+        assert "已确认" in msg_confirm.replies[-1]
+
+        msg_reject = _Msg("/note rel reject 2 不符合当前关系")
+        upd_reject = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_reject,
+        )
+        await bot._cmd_note(upd_reject, SimpleNamespace())
+        assert store.rejected == [("rel_2", "manual:不符合当前关系")]
+        assert "已拒绝" in msg_reject.replies[-1]
+
+    asyncio.run(_run())

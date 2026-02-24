@@ -299,6 +299,48 @@ class TopicStarter:
             self._proactive_count += 1
         return msgs
 
+    def generate_relationship_followup(
+        self,
+        fact_type: str,
+        fact_content: str,
+        recent_context: str = "",
+    ) -> list[str]:
+        """基于已确认关系记忆生成主动接话（shared_event 优先）。"""
+        name = self._persona.name
+        context = ""
+        if recent_context:
+            context = (
+                f"你们最近在聊：\n{recent_context}\n\n"
+                "如果最近话题还没结束，优先顺着最近话题自然过渡。\n\n"
+            )
+
+        if fact_type == "shared_event":
+            intent = "从共同经历里挑一个自然提起并轻轻追问，不要像背档案。"
+        elif fact_type == "addressing":
+            intent = "按你平时的称呼风格自然开口，不要生硬强调关系设定。"
+        elif fact_type == "boundary":
+            intent = "语气克制，避免踩边界，用轻松方式换个角度接话。"
+        else:
+            intent = "按既有关系记忆自然接一句，不要显得刻意。"
+
+        prompt = (
+            f"{context}"
+            f"你们关系记忆里有一条：{fact_content}\n"
+            f"{intent}\n"
+            f"用{name}的语气发 1 条短消息，必要时最多 2 条。\n"
+            f"要求：\n"
+            f"- 像平时聊天，不要解释“我记得你”\n"
+            f"- 用 {_MSG_SEPARATOR} 分隔多条消息（如果有）\n"
+            f"- 不要太正式，不要写成长段\n"
+        )
+
+        msgs = self._generate_with_context(prompt)
+        if msgs:
+            self._last_proactive = msgs
+            self._followup_count = 0
+            self._proactive_count += 1
+        return msgs
+
     def on_user_replied(self):
         self._followup_count = 0
         self._last_proactive = []

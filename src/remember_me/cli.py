@@ -88,11 +88,15 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
     with console.status("  [dim]正在提取关系记忆...[/]"):
         rel_store = RelationshipMemoryStore(target, data_dir=DATA_DIR)
         rel_extractor = RelationshipExtractor()
-        rel_facts = rel_extractor.extract_from_history(
+        rel_facts = rel_extractor.extract_from_history_in_windows(
             history,
-            conflict_validator=lambda text: governance.validate_against_imported_history(
-                text, persona=persona,
+            conflict_validator=lambda payload: governance.validate_relationship_fact(
+                payload, persona=persona,
+            ) if hasattr(payload, "type") else governance.validate_against_imported_history(
+                str(payload), persona=persona,
             ),
+            window_size=120,
+            stride=80,
         )
         if rel_facts:
             rel_store.upsert_facts(rel_facts)
@@ -372,8 +376,10 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     new_msgs,
                     client=engine.client,
                     source="runtime_session",
-                    conflict_validator=lambda text: governance.validate_against_imported_history(
-                        text, persona=persona,
+                    conflict_validator=lambda payload: governance.validate_relationship_fact(
+                        payload, persona=persona,
+                    ) if hasattr(payload, "type") else governance.validate_against_imported_history(
+                        str(payload), persona=persona,
                     ),
                 )
                 if facts:

@@ -146,6 +146,60 @@ class EmotionState:
         self.updated_at = datetime.now().isoformat()
         self._update_derived()
 
+    def apply_relationship_trigger(self, facts, user_input: str):
+        """根据关系记忆做中等强度情绪微调，增强长期关系一致性。"""
+        text = (user_input or "").strip().lower()
+        if not text:
+            return
+
+        delta_v = 0.0
+        delta_a = 0.0
+        triggers: list[str] = []
+
+        for fact in list(facts or [])[:12]:
+            fact_type = str(getattr(fact, "type", "") or "")
+            content = str(getattr(fact, "content", "") or "").lower()
+            if not content:
+                continue
+
+            hit = False
+            if fact_type == "shared_event":
+                if any(k in text for k in ("上次", "那次", "还记得", "之前", "那天")):
+                    hit = True
+                elif any(seg and len(seg) >= 2 and seg in text for seg in re.split(r"[，。！？、\s]+", content)):
+                    hit = True
+                if hit:
+                    delta_v += 0.06
+                    delta_a += 0.04
+                    triggers.append("共同经历被提及")
+            elif fact_type == "addressing":
+                if any(seg and len(seg) >= 2 and seg in text for seg in re.split(r"[：，。！？、\s]+", content)):
+                    hit = True
+                if hit:
+                    delta_v += 0.04
+                    delta_a += 0.02
+                    triggers.append("称呼习惯命中")
+            elif fact_type == "boundary":
+                if any(k in text for k in ("别提", "不聊", "别问", "不要再问", "不想聊")):
+                    hit = True
+                if hit:
+                    delta_v -= 0.02
+                    delta_a -= 0.03
+                    triggers.append("边界线索命中")
+
+        if delta_v == 0.0 and delta_a == 0.0:
+            return
+
+        # 中等权重：限制总偏移幅度，避免压过既有情绪机制
+        delta_v = _clamp(delta_v, -0.10, 0.10)
+        delta_a = _clamp(delta_a, -0.08, 0.08)
+        self.valence = _clamp(self.valence + delta_v, -1, 1)
+        self.arousal = _clamp(self.arousal + delta_a, -1, 1)
+        self.updated_at = datetime.now().isoformat()
+        if triggers:
+            self.trigger = triggers[0]
+        self._update_derived()
+
     # ── Scratchpad 更新同步 ──
 
     def sync_from_scratchpad(self, emotion_raw: dict):
