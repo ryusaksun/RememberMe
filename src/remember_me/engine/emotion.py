@@ -249,7 +249,7 @@ class EmotionState:
         emotion_factor = 1.0 + bias * 0.25  # 0.5 ~ 1.5
 
         center = base * emotion_factor
-        low = max(1, round(center * 0.7))
+        low = max(2 if base >= 1.5 else 1, round(center * 0.7))
         high = max(low, min(8, round(center * 1.3)))
 
         return (low, high)

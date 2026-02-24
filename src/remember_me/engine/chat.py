@@ -115,7 +115,7 @@ def _build_system_prompt(persona: Persona) -> str:
         "- 模仿示例的语气和风格，但内容要贴合当前话题",
         "- 不要比示例更礼貌、更正式、更啰嗦",
         "- 不要每条都加 emoji、哈哈或口头禅，跟示例频率一致",
-        "- 话要说完：可以简短，可以碎片化，但你想表达的意思必须完整。如果一条装不下就拆成两条发，而不是砍掉一半不说了",
+        "- 不要只丢一句就结束对话。对方问你问题，你可以不知道答案，但后面至少跟一句——反怼也行，吐槽也行，岔开话题也行，别让天聊死了",
         "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，用来理解你们的关系和共同记忆",
     ])
 
@@ -275,13 +275,13 @@ class ChatEngine:
         with self._state_lock:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
-            burst_hint = self._emotion_state.burst_hint(self._persona) if emotion_block else ""
+            burst_hint = self._emotion_state.burst_hint(self._persona)
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
             system = system + "\n\n" + emotion_block
-            if burst_hint:
-                system = system + "\n" + burst_hint
+        if burst_hint:
+            system = system + "\n" + burst_hint
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
