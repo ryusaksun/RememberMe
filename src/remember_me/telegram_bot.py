@@ -38,6 +38,9 @@ PROFILES_DIR = DATA_DIR / "profiles"
 class TelegramBot:
     """单 persona Telegram Bot，含每日主动消息调度。"""
 
+    # 消息聚合等待时间（秒）：收到消息后等待这么久，期间的新消息会合并处理
+    MSG_BATCH_DELAY = 1.5
+
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
         self._allowed_users = allowed_users
@@ -46,6 +49,10 @@ class TelegramBot:
         self._send_lock = asyncio.Lock()
         self._app: Application | None = None
         self._last_user_activity: float = 0.0  # 用户最后交互时间
+        # 消息聚合缓冲
+        self._msg_buffer: list[str] = []
+        self._msg_buffer_lock = asyncio.Lock()
+        self._batch_timer: asyncio.Task | None = None
         # 每日调度
         self._daily_times: list[datetime] = []
         self._daily_date: str = ""  # 当前计划对应的日期
@@ -386,16 +393,37 @@ class TelegramBot:
         if not text:
             return
 
+        # 消息聚合：将文本放入缓冲区，重置定时器
+        async with self._msg_buffer_lock:
+            self._msg_buffer.append(text)
+            # 取消上一个定时器（如果有）
+            if self._batch_timer and not self._batch_timer.done():
+                self._batch_timer.cancel()
+            # 启动新的定时器
+            self._batch_timer = asyncio.create_task(
+                self._flush_msg_buffer(chat_id)
+            )
+
+    async def _flush_msg_buffer(self, chat_id: int):
+        """等待聚合窗口结束后，将缓冲区内所有消息合并发送给 LLM。"""
+        await asyncio.sleep(self.MSG_BATCH_DELAY)
+
+        async with self._msg_buffer_lock:
+            if not self._msg_buffer:
+                return
+            merged = "\n".join(self._msg_buffer)
+            self._msg_buffer.clear()
+
         async with self._send_lock:
             bot = self._app.bot
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
             try:
-                replies = await self._controller.send_message(text)
+                replies = await self._controller.send_message(merged)
                 await self._deliver_messages(bot, chat_id, replies)
             except Exception as e:
                 logger.exception("发送消息失败")
-                await update.message.reply_text(f"出错了：{e}")
+                await bot.send_message(chat_id, f"出错了：{e}")
 
     async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
@@ -409,12 +437,22 @@ class TelegramBot:
             await update.message.reply_text("Bot 正在被其他用户使用。")
             return
 
+        # 图片消息到达时，先把缓冲区里的文字消息冲掉（合并到图片的 caption 里）
+        async with self._msg_buffer_lock:
+            if self._batch_timer and not self._batch_timer.done():
+                self._batch_timer.cancel()
+            buffered = list(self._msg_buffer)
+            self._msg_buffer.clear()
+
         # 下载最大分辨率的图片
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
 
         caption = (update.message.caption or "").strip() or "[图片]"
+        # 如果之前缓冲区有文字消息，合并到 caption 前面
+        if buffered:
+            caption = "\n".join(buffered) + "\n" + caption
 
         async with self._send_lock:
             bot = self._app.bot

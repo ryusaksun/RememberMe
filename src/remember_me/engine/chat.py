@@ -207,7 +207,15 @@ class ChatEngine:
 
     def _build_system(self, user_input: str) -> str:
         """构建 system prompt（基础 + 备注 + 中期记忆 + RAG 上下文）。"""
-        system = self._system_prompt
+        # 注入当前时间，让 persona 有时间感知
+        now = datetime.now()
+        time_block = (
+            f"\n\n## 当前时间\n"
+            f"现在是 {now.strftime('%Y年%m月%d日 %H:%M')}，"
+            f"{'凌晨' if now.hour < 6 else '早上' if now.hour < 9 else '上午' if now.hour < 12 else '中午' if now.hour < 13 else '下午' if now.hour < 18 else '晚上' if now.hour < 23 else '深夜'}。"
+            f"请根据当前时间自然地回复，不要在白天叫对方去睡觉，也不要在深夜像白天一样精力充沛。"
+        )
+        system = self._system_prompt + time_block
 
         # 手动备注（动态读取，修改后即时生效）
         if self._notes:
