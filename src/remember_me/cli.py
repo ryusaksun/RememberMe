@@ -21,6 +21,7 @@ from rich.text import Text
 from remember_me.analyzer.persona import Persona, analyze
 from remember_me.engine.chat import ChatEngine
 from remember_me.importers import json_parser, plain_text, wechat
+from remember_me.memory.governance import MemoryGovernance
 from remember_me.memory.store import MemoryStore
 
 console = Console()
@@ -77,6 +78,11 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
     console.print(f"  [green]✓[/] 人格分析完成")
     console.print(f"    说话风格: {persona.style_summary}")
 
+    # 重建核心记忆快照（导入历史是唯一真源）
+    governance = MemoryGovernance(target, data_dir=DATA_DIR)
+    governance.bootstrap_core_from_persona(persona, force=True)
+    console.print(f"  [green]✓[/] 核心记忆快照已更新")
+
     # 建立记忆索引
     with console.status("  [dim]正在建立记忆索引...[/]"):
         store = MemoryStore(CHROMA_DIR / target, persona_name=target)
@@ -123,12 +129,21 @@ def chat(name: str, api_key: str | None, no_greet: bool):
         except Exception as e:
             logger.debug("加载表情包库失败: %s", e)
 
-    engine = ChatEngine(persona=persona, memory=memory, api_key=api_key, sticker_lib=sticker_lib)
+    governance = MemoryGovernance(name, data_dir=DATA_DIR)
+    governance.ensure_core_from_persona(persona)
+
+    engine = ChatEngine(
+        persona=persona,
+        memory=memory,
+        api_key=api_key,
+        sticker_lib=sticker_lib,
+        memory_governance=governance,
+    )
 
     # 加载上次对话
     session_path = SESSIONS_DIR / f"{name}.json"
     session_loaded = engine.load_session(session_path)
-    history_start_index = len(engine._history)  # 记录起始位置，退出时只保存新消息
+    history_start_index = len(engine._history)
 
     # 加载历史消息数
     from remember_me.importers.base import ChatHistory
@@ -327,7 +342,11 @@ def chat(name: str, api_key: str | None, no_greet: bool):
             engine.save_session(session_path)
             new_msgs = engine.get_new_messages(history_start_index)
             if new_msgs and memory:
-                memory.add_messages(new_msgs)
+                to_add = governance.filter_messages_for_long_term(
+                    new_msgs, persona=persona,
+                )
+                if to_add:
+                    memory.add_messages(to_add)
         except Exception as e:
             logger.warning("保存会话失败: %s", e)
 
@@ -356,6 +375,13 @@ def chat(name: str, api_key: str | None, no_greet: bool):
                     console.print(f"\n  [dim]再见，{name} 会一直在这里等你。[/]\n")
                     break
                 topic_starter.on_user_replied()
+                governance.add_session_record(
+                    user_input,
+                    persona=persona,
+                    ttl_seconds=None,
+                    tags=["runtime", "user_turn"],
+                    confidence=0.45,
+                )
 
                 _update_activity()
                 try:

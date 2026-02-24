@@ -23,6 +23,7 @@ from google.genai import types
 
 from remember_me.analyzer.persona import Persona
 from remember_me.engine.emotion import EmotionState
+from remember_me.memory.governance import MemoryGovernance
 from remember_me.memory.scratchpad import Scratchpad, update_scratchpad
 from remember_me.memory.store import MemoryStore
 from remember_me.models import MODEL_LIGHT, MODEL_MAIN
@@ -245,7 +246,8 @@ class ChatEngine:
     def __init__(self, persona: Persona, memory: MemoryStore | None = None,
                  api_key: str | None = None, sticker_lib=None,
                  notes: list[str] | None = None,
-                 knowledge_store=None):
+                 knowledge_store=None,
+                 memory_governance: MemoryGovernance | None = None):
         if not api_key:
             raise ValueError("GEMINI_API_KEY 未提供，无法初始化对话引擎")
         self._persona = persona
@@ -258,6 +260,7 @@ class ChatEngine:
         self._sticker_lib = sticker_lib
         self._sticker_probability = 0.14  # 约 14% 概率发表情包（基于真人数据）
         self._session_phase = "warmup"
+        self._memory_governance = memory_governance
         self._human_noise_probability = max(
             0.01,
             min(0.06, 0.02 + getattr(persona, "short_msg_ratio", 0.0) * 0.03),
@@ -484,7 +487,7 @@ class ChatEngine:
         return user_input
 
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（基础 + 备注 + 中期记忆 + RAG 上下文）。"""
+        """构建 system prompt（导入核心事实 > 导入检索 > 会话短期上下文）。"""
         # 注入当前时间（使用用户时区，非服务器时区）
         now = datetime.now(_TIMEZONE)
         time_block = (
@@ -498,38 +501,22 @@ class ChatEngine:
         if phase_block:
             system = system + "\n\n" + phase_block
         expanded_query = self._expand_query(user_input)
+        burst_hint = ""
+        gov_core_block = ""
+        gov_session_block = ""
+        gov_conflict_block = ""
+        governance = getattr(self, "_memory_governance", None)
 
-        # 手动备注（动态读取，修改后即时生效）
-        if self._notes:
-            lines = ["## 你知道的关于对方和你们关系的事"]
-            for note in self._notes:
-                lines.append(f"- {note}")
-            system = system + "\n\n" + "\n".join(lines)
-
-        # 中期记忆（scratchpad）+ 情绪引导（锁保护，防止后台线程写入时读到不一致状态）
-        with self._state_lock:
-            scratchpad_block = self._scratchpad.to_prompt_block()
-            emotion_block = self._emotion_state.to_prompt_block(self._persona)
-            burst_hint = self._emotion_state.burst_hint(self._persona)
-            open_threads = self._rank_open_threads(
-                user_input, list(self._scratchpad.open_threads),
-            )
-        if scratchpad_block:
-            system = system + "\n\n" + scratchpad_block
-        if emotion_block:
-            system = system + "\n\n" + emotion_block
-        if open_threads:
-            lines = [
-                "## 回复优先级",
-                "- 如果对方这条消息和未完话题相关，优先把未完的话题聊完。",
-                "- 只有在对方明显切换到新话题时，才放下未完话题。",
-                f"- 当前最相关的未完话题：{open_threads[0]}",
-            ]
-            if len(open_threads) > 1:
-                lines.append("其他未完话题：")
-                for thread in open_threads[1:]:
-                    lines.append(f"- {thread}")
-            system = system + "\n\n" + "\n".join(lines)
+        # 1) 导入聊天记录核心事实（最高优先级，只读）
+        if governance:
+            try:
+                gov_core_block, gov_session_block, gov_conflict_block = governance.build_prompt_blocks(
+                    core_limit=6, session_limit=5, conflict_limit=2,
+                )
+            except Exception as e:
+                logger.warning("核心记忆块构建失败: %s", e)
+        if gov_core_block:
+            system = system + "\n\n" + gov_core_block
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
@@ -543,7 +530,7 @@ class ChatEngine:
             except Exception as e:
                 logger.warning("知识库检索失败: %s", e)
 
-        # 长期记忆（RAG）
+        # 2) 导入历史检索（只依赖 import 建立的向量库，不写入运行时消息）
         if self._memory:
             raw_results = self._search_memory_cached(expanded_query, top_k=5)
 
@@ -570,6 +557,37 @@ class ChatEngine:
                     context_parts.append(fragment)
                     context_parts.append("---")
                 system = system + "\n\n" + "\n".join(context_parts)
+
+        # 3) 会话短期上下文（可过期，且不得覆盖核心）
+        if gov_session_block:
+            system = system + "\n\n" + gov_session_block
+        if gov_conflict_block:
+            system = system + "\n\n" + gov_conflict_block
+
+        # 中期记忆（scratchpad）+ 情绪引导（锁保护，防止后台线程写入时读到不一致状态）
+        with self._state_lock:
+            scratchpad_block = self._scratchpad.to_prompt_block()
+            emotion_block = self._emotion_state.to_prompt_block(self._persona)
+            burst_hint = self._emotion_state.burst_hint(self._persona)
+            open_threads = self._rank_open_threads(
+                user_input, list(self._scratchpad.open_threads),
+            )
+        if scratchpad_block:
+            system = system + "\n\n" + scratchpad_block
+        if emotion_block:
+            system = system + "\n\n" + emotion_block
+        if open_threads:
+            lines = [
+                "## 回复优先级",
+                "- 如果对方这条消息和未完话题相关，优先把未完的话题聊完。",
+                "- 只有在对方明显切换到新话题时，才放下未完话题。",
+                f"- 当前最相关的未完话题：{open_threads[0]}",
+            ]
+            if len(open_threads) > 1:
+                lines.append("其他未完话题：")
+                for thread in open_threads[1:]:
+                    lines.append(f"- {thread}")
+            system = system + "\n\n" + "\n".join(lines)
 
         # burst_hint 放在最末尾，确保 LLM 注意力最高
         if burst_hint:

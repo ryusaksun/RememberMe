@@ -153,7 +153,7 @@ def create_chat_page(persona_name: str):
 
             for i, msg in enumerate(replies):
                 if controller._engine:
-                    base_delay = controller._engine.sample_inter_message_delay(i > 0)
+                    base_delay = controller._engine.sample_inter_message_delay("burst" if i > 0 else "first")
                 else:
                     base_delay = (0.4 + random.random() * 0.8) if i > 0 else (0.55 + random.random() * 0.9)
                 await asyncio.sleep(base_delay * delay_factor)
@@ -213,12 +213,12 @@ def create_chat_page(persona_name: str):
                     delay_factor = controller._engine.reply_delay_factor
 
                 for i, msg in enumerate(msgs_clean):
-                    if i > 0:
-                        if controller._engine:
-                            base_delay = controller._engine.sample_inter_message_delay(True)
-                        else:
-                            base_delay = 0.4 + random.random() * 0.8
-                        await asyncio.sleep(base_delay * delay_factor)
+                    if controller._engine:
+                        phase = "burst" if i > 0 else "followup"
+                        base_delay = controller._engine.sample_inter_message_delay(phase)
+                    else:
+                        base_delay = 0.4 + random.random() * 0.8 if i > 0 else 0.35 + random.random() * 0.5
+                    await asyncio.sleep(base_delay * delay_factor)
                     with messages_container:
                         render_message(
                             msg, persona_name, is_target=True,

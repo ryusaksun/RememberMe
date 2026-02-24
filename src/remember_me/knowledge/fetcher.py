@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import random
@@ -23,6 +24,7 @@ from remember_me.knowledge.store import KnowledgeItem
 from remember_me.models import MODEL_LIGHT
 
 _SUMMARY_MODEL = MODEL_LIGHT
+_TOPIC_CONCURRENCY = 3
 
 
 def _extract_article(url: str) -> str | None:
@@ -152,21 +154,38 @@ class KnowledgeFetcher:
             return []
 
         logger.info("知识库更新: 选中话题 %s", selected)
-
-        all_articles = []  # [{title, text, topic, url}]
-        all_items = []
-
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._fetch_daily_async(selected))
+        # fetch_daily 通常在后台线程执行（无运行中事件循环）；若在 loop 内调用则降级串行。
+        logger.warning("fetch_daily 在运行中的事件循环内被调用，降级为串行抓取")
+        all_items: list[KnowledgeItem] = []
         for topic in selected:
             try:
-                items = self._fetch_topic(topic, all_articles)
-                all_items.extend(items)
+                all_items.extend(self._fetch_topic(topic))
             except Exception as e:
                 logger.warning("话题 %s 抓取失败: %s", topic, e)
-            time.sleep(1)  # 请求间隔
-
         return all_items
 
-    def _fetch_topic(self, topic: str, all_articles: list[dict]) -> list[KnowledgeItem]:
+    async def _fetch_daily_async(self, topics: list[str]) -> list[KnowledgeItem]:
+        sem = asyncio.Semaphore(_TOPIC_CONCURRENCY)
+
+        async def _run_topic(topic: str):
+            async with sem:
+                return await asyncio.to_thread(self._fetch_topic, topic)
+
+        tasks = [_run_topic(topic) for topic in topics]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        all_items: list[KnowledgeItem] = []
+        for topic, result in zip(topics, results):
+            if isinstance(result, Exception):
+                logger.warning("话题 %s 抓取失败: %s", topic, result)
+                continue
+            all_items.extend(result)
+        return all_items
+
+    def _fetch_topic(self, topic: str) -> list[KnowledgeItem]:
         """抓取单个话题的文章和图片。"""
         hints = _TOPIC_SEARCH_HINTS.get(topic, [f"{topic} 最新"])
         search_hint = random.choice(hints)
@@ -174,6 +193,7 @@ class KnowledgeFetcher:
         # Web 搜索
         results = brave_search(search_hint, count=5)
         items = []
+        articles = []  # [{title, text, topic, url}]
         now = datetime.now().isoformat()
 
         # 提取 top-2 文章全文
@@ -194,7 +214,7 @@ class KnowledgeFetcher:
                 if not full_text:
                     continue
 
-            all_articles.append({
+            articles.append({
                 "title": r["title"],
                 "text": full_text,
                 "topic": topic,
@@ -203,13 +223,12 @@ class KnowledgeFetcher:
             extracted_count += 1
 
         # 批量摘要
-        if all_articles:
-            # 只摘要本轮新增的
-            start_idx = len(all_articles) - extracted_count
-            to_summarize = all_articles[start_idx:]
+        if articles and extracted_count > 0:
+            to_summarize = articles[:extracted_count]
             summaries = _summarize_articles(self._client, to_summarize, self._name)
 
-            for article, summary in zip(to_summarize, summaries):
+            for idx, article in enumerate(to_summarize):
+                summary = summaries[idx] if idx < len(summaries) else article["text"][:120]
                 items.append(KnowledgeItem(
                     topic=article["topic"],
                     title=article["title"],

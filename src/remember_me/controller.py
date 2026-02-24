@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
+from remember_me.memory.governance import MemoryGovernance
 
 load_dotenv()
 
@@ -23,7 +24,6 @@ PROFILES_DIR = DATA_DIR / "profiles"
 CHROMA_DIR = DATA_DIR / "chroma"
 HISTORY_DIR = DATA_DIR / "history"
 SESSIONS_DIR = DATA_DIR / "sessions"
-NOTES_DIR = DATA_DIR / "notes"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 
 _SESSION_PHASES = {"warmup", "normal", "deep_talk", "cooldown", "ending"}
@@ -46,6 +46,7 @@ class ChatController:
         self._persona = None
         self._topic_starter = None
         self._memory = None
+        self._memory_governance: MemoryGovernance | None = None
         self._event_tracker = None
         self._on_message: Callable[[list[str], str], None] | None = None  # (msgs, msg_type)
         self._on_typing: Callable[[bool], None] | None = None
@@ -216,31 +217,31 @@ class ChatController:
         return random.randint(lo, hi)
 
     def _load_notes(self) -> list[str]:
-        """加载手动备注。"""
-        notes_path = NOTES_DIR / f"{self._name}.json"
-        if not notes_path.exists():
-            return []
+        """兼容旧接口：加载手动备注（实际来自运行时短期记忆 manual 标签）。"""
         try:
-            return json.loads(notes_path.read_text(encoding="utf-8"))
+            store = MemoryGovernance(self._name, data_dir=DATA_DIR)
+            return [r.text for r in store.list_manual_notes()]
         except Exception as e:
             logger.warning("加载备注失败: %s", e)
             return []
 
     @staticmethod
     def save_notes(persona_name: str, notes: list[str]):
-        """保存手动备注。"""
-        NOTES_DIR.mkdir(parents=True, exist_ok=True)
-        notes_path = NOTES_DIR / f"{persona_name}.json"
-        notes_path.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+        """兼容旧接口：保存手动备注到运行时短期记忆（不影响导入核心人格）。"""
+        from remember_me.analyzer.persona import Persona
+
+        profile_path = PROFILES_DIR / f"{persona_name}.json"
+        persona = Persona.load(profile_path) if profile_path.exists() else Persona(name=persona_name)
+        store = MemoryGovernance(persona_name, data_dir=DATA_DIR)
+        store.ensure_core_from_persona(persona)
+        store.replace_manual_notes(notes, persona=persona)
 
     @staticmethod
     def load_notes(persona_name: str) -> list[str]:
-        """加载手动备注（静态方法，供外部调用）。"""
-        notes_path = NOTES_DIR / f"{persona_name}.json"
-        if not notes_path.exists():
-            return []
+        """兼容旧接口：读取运行时短期记忆 manual 标签。"""
         try:
-            return json.loads(notes_path.read_text(encoding="utf-8"))
+            store = MemoryGovernance(persona_name, data_dir=DATA_DIR)
+            return [r.text for r in store.list_manual_notes()]
         except Exception:
             return []
 
@@ -278,6 +279,10 @@ class ChatController:
         persona = Persona.load(profile_path)
         self._persona = persona
 
+        # 核心记忆治理：导入历史是唯一真源
+        self._memory_governance = MemoryGovernance(self._name, data_dir=DATA_DIR)
+        self._memory_governance.ensure_core_from_persona(persona)
+
         # 加载记忆
         chroma_path = CHROMA_DIR / self._name
         if chroma_path.exists():
@@ -292,9 +297,6 @@ class ChatController:
                 sticker_lib = StickerLibrary.load(sticker_path)
             except Exception as e:
                 logger.debug("加载表情包库失败: %s", e)
-
-        # 加载手动备注
-        notes = self._load_notes()
 
         # 加载知识库
         from remember_me.knowledge.store import KnowledgeStore
@@ -313,7 +315,8 @@ class ChatController:
         self._engine = ChatEngine(
             persona=persona, memory=self._memory,
             api_key=self._api_key, sticker_lib=sticker_lib,
-            notes=notes, knowledge_store=knowledge_store,
+            notes=[], knowledge_store=knowledge_store,
+            memory_governance=self._memory_governance,
         )
 
         # 加载上次对话
@@ -404,6 +407,14 @@ class ChatController:
         self._user_turn_count += 1
         next_phase = self._derive_phase_from_user_input(text, idle_before=idle_before)
         self._set_phase(next_phase, reason="user_input")
+        if self._memory_governance:
+            self._memory_governance.add_session_record(
+                text,
+                persona=self._persona,
+                ttl_seconds=None,
+                tags=["runtime", "user_turn"],
+                confidence=0.45,
+            )
         self._topic_starter.on_user_replied()
         self._update_activity()
         self._consecutive_proactive = 0
@@ -588,7 +599,13 @@ class ChatController:
             self._engine.save_session(session_path)
             new_msgs = self._engine.get_new_messages(self._history_start_index)
             if new_msgs and self._memory:
-                self._memory.add_messages(new_msgs)
+                to_add = new_msgs
+                if self._memory_governance:
+                    to_add = self._memory_governance.filter_messages_for_long_term(
+                        new_msgs, persona=self._persona,
+                    )
+                if to_add:
+                    self._memory.add_messages(to_add)
             # 会话结束时提取待跟进事件（确保不遗漏）
             if self._event_tracker:
                 remaining = []
@@ -680,6 +697,9 @@ class ChatController:
         persona = await loop.run_in_executor(None, lambda: analyze(history))
         profile_path = PROFILES_DIR / f"{target_name}.json"
         persona.save(profile_path)
+        # 导入完成后重建核心记忆快照（唯一真源）
+        governance = MemoryGovernance(target_name, data_dir=DATA_DIR)
+        await loop.run_in_executor(None, lambda: governance.bootstrap_core_from_persona(persona, force=True))
 
         if on_progress:
             on_progress(f"人格分析完成 — {persona.style_summary[:60]}")

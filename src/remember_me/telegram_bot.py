@@ -401,9 +401,9 @@ class TelegramBot:
         )
 
     def _sync_notes_to_engine(self, notes: list[str]):
-        """将备注同步到运行中的 ChatEngine（即时生效）。"""
-        if self._controller and self._controller._engine:
-            self._controller._engine._notes = notes
+        """将备注同步到运行中的记忆治理层（仅短期上下文，不覆盖导入核心）。"""
+        if self._controller and self._controller._memory_governance and self._controller._persona:
+            self._controller._memory_governance.replace_manual_notes(notes, persona=self._controller._persona)
 
     async def _cmd_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
@@ -416,7 +416,7 @@ class TelegramBot:
                 "/note add <内容> — 添加备注\n"
                 "/note list — 查看所有备注\n"
                 "/note del <序号> — 删除备注\n\n"
-                "备注会注入 system prompt，让 TA \"知道\"这些事。\n"
+                "备注是短期上下文，不会覆盖导入聊天记录的人设核心。\n"
                 "修改即时生效，无需重启对话。"
             )
             return
