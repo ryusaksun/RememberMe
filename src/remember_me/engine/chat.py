@@ -151,14 +151,26 @@ def _clean_reasoning_leak(msg: str) -> str:
     return msg
 
 
-def _is_pure_english(msg: str) -> bool:
-    """检测整条消息是否为纯英文（中文 persona 不应发纯英文，大概率是推理泄漏）。"""
+def _is_reasoning_leak_msg(msg: str) -> bool:
+    """检测整条消息是否为 LLM 推理泄漏（纯英文 / 中文推理片段）。"""
     stripped = msg.strip()
-    if len(stripped) < 10:
+    if len(stripped) < 5:
         return False
+    # 1) 纯英文消息（中文 persona 不应发纯英文）
     non_ascii = sum(1 for c in stripped if ord(c) > 127)
-    # 超过 10 字符且非 ASCII 不足 10% → 纯英文推理泄漏
-    return non_ascii / len(stripped) < 0.1
+    if len(stripped) > 10 and non_ascii / len(stripped) < 0.1:
+        return True
+    # 2) 中文推理片段：消息前 6 字符内出现孤立右括号（无匹配左括号）
+    #    如 "冬），直接改个字眼..." —— 这是 LLM 推理块被截断的尾部碎片
+    for i, ch in enumerate(stripped[:6]):
+        if ch in ')）':
+            if '(' not in stripped[:i] and '（' not in stripped[:i]:
+                return True
+            break
+    # 3) 以规划性语句结尾（"比如""例如" 不完整句，正在举例但没举完）
+    if re.search(r'(?:比如|例如)\s*$', stripped):
+        return True
+    return False
 
 
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
@@ -167,7 +179,7 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     result = [p.strip() for p in parts if p.strip()]
     # 清理 LLM 推理泄漏（末尾英文 + 整条纯英文）
     result = [_clean_reasoning_leak(m) for m in result]
-    result = [m for m in result if m and not _is_pure_english(m)]
+    result = [m for m in result if m and not _is_reasoning_leak_msg(m)]
     if len(result) > 1:
         # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
         avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
