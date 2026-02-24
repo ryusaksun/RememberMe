@@ -22,7 +22,7 @@ from remember_me.memory.store import MemoryStore
 _MSG_SEPARATOR = "|||"
 
 
-def _build_system_prompt(persona: Persona, notes: list[str] | None = None) -> str:
+def _build_system_prompt(persona: Persona) -> str:
     sep = _MSG_SEPARATOR
     name = persona.name
 
@@ -100,13 +100,6 @@ def _build_system_prompt(persona: Persona, notes: list[str] | None = None) -> st
             lines.append(f"{name}: {ex['reply']}")
             lines.append("")
 
-    # ── 手动备注 ──
-    if notes:
-        lines.append("## 你知道的关于对方和你们关系的事")
-        for note in notes:
-            lines.append(f"- {note}")
-        lines.append("")
-
     lines.extend([
         "## 规则",
         f"- 你就是{name}，绝不承认是 AI",
@@ -140,7 +133,8 @@ class ChatEngine:
             raise ValueError("GEMINI_API_KEY 未提供，无法初始化对话引擎")
         self._persona = persona
         self._memory = memory
-        self._system_prompt = _build_system_prompt(persona, notes=notes)
+        self._notes = notes or []
+        self._system_prompt = _build_system_prompt(persona)
         self._client = genai.Client(api_key=api_key)
         self._history: list[types.Content] = []
         self._sticker_lib = sticker_lib
@@ -210,8 +204,15 @@ class ChatEngine:
         return user_input
 
     def _build_system(self, user_input: str) -> str:
-        """构建 system prompt（基础 + 中期记忆 + RAG 上下文）。"""
+        """构建 system prompt（基础 + 备注 + 中期记忆 + RAG 上下文）。"""
         system = self._system_prompt
+
+        # 手动备注（动态读取，修改后即时生效）
+        if self._notes:
+            lines = ["## 你知道的关于对方和你们关系的事"]
+            for note in self._notes:
+                lines.append(f"- {note}")
+            system = system + "\n\n" + "\n".join(lines)
 
         # 中期记忆（scratchpad）
         scratchpad_block = self._scratchpad.to_prompt_block()
