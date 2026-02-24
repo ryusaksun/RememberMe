@@ -87,10 +87,14 @@ def _build_system_prompt(persona: Persona) -> str:
     burst_examples = getattr(persona, "burst_examples", [])
 
     if burst_ratio > 0.2:
-        lines.append("## 回复格式")
-        lines.append(f"你习惯连发消息，平均每次发 {avg_burst_length:.0f} 条左右。")
-        lines.append(f"多条消息用 {sep} 分隔。每条消息像发微信一样简短口语化，但意思要表达完整——宁可多发一条也不要话说一半。")
-        lines.append("具体发几条，看情况：对方就说了个嗯，你回 1 条就行；聊到感兴趣的话题可以多说几条。不管几条，你要说的话要说完，不要像被打断了一样突然结束。")
+        lines.append("## 回复格式（必须遵守）")
+        lines.append(f"你习惯连发消息，平均每次发 {avg_burst_length:.0f} 条左右。多条消息用 {sep} 分隔。")
+        lines.append("")
+        lines.append(f"关键：「笑死」「6」「牛逼」「哈哈哈」这类反应词不算完整回复。反应之后必须跟上你对话题的实际回应。")
+        lines.append(f"错误示例 → 笑死老子了")
+        lines.append(f"正确示例 → 笑死老子了{sep}南方要啥暖气啊你在做梦")
+        lines.append(f"错误示例 → 老子哪知道")
+        lines.append(f"正确示例 → 老子哪知道{sep}你自己不会搜啊")
         lines.append("")
 
     # ── 真实对话示例 ──
@@ -115,7 +119,7 @@ def _build_system_prompt(persona: Persona) -> str:
         "- 模仿示例的语气和风格，但内容要贴合当前话题",
         "- 不要比示例更礼貌、更正式、更啰嗦",
         "- 不要每条都加 emoji、哈哈或口头禅，跟示例频率一致",
-        "- 不管什么心情，都不要只丢一句就结束。对方跟你说话，后面至少跟一句——反怼、吐槽、岔开话题都行，别让天聊死了。心情不好就用冷淡的语气说完，而不是不说",
+        "- 心情再差也要把话说完，冷淡体现在语气上，不是不说话",
         "- 下面的「相关历史对话记忆」是你们过去真实聊过的内容，用来理解你们的关系和共同记忆",
     ])
 
@@ -280,8 +284,6 @@ class ChatEngine:
             system = system + "\n\n" + scratchpad_block
         if emotion_block:
             system = system + "\n\n" + emotion_block
-        if burst_hint:
-            system = system + "\n" + burst_hint
 
         # 每日知识库（persona 最近关注的动态）
         if self._knowledge_store:
@@ -324,6 +326,10 @@ class ChatEngine:
                     context_parts.append(fragment)
                     context_parts.append("---")
                 system = system + "\n\n" + "\n".join(context_parts)
+
+        # burst_hint 放在最末尾，确保 LLM 注意力最高
+        if burst_hint:
+            system = system + f"\n\n⚠️ {burst_hint}用 ||| 分隔多条消息。记住：反应词之后必须跟实际回应。"
 
         return system
 
