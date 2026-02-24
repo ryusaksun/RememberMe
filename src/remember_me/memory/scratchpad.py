@@ -10,7 +10,7 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
-_SCRATCHPAD_MODEL = "gemini-2.0-flash"
+_SCRATCHPAD_MODEL = "gemini-3-flash-preview"
 
 _UPDATE_PROMPT = """\
 你是一个对话记录员。分析下面的对话片段，更新对话笔记。
