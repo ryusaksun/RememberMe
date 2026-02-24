@@ -153,10 +153,22 @@ _SESSION_PHASE_GUIDE = {
 _REASONING_LEAK_RE = re.compile(
     r'[\s"\')}\]\.\-,;:。！？…—]+[A-Z][a-zA-Z\s,\'\"\-\*\(\)\.!?;:]{8,}$'
 )
+_MONOLOGUE_LEAK_RE = re.compile(
+    r"(?i)(internal\s+monologue|chain\s*of\s*thought|thought\s*process|"
+    r"reasoning(?:\s*trace|\s*process)?|/trial|trial\)\*\*|思考过程|推理过程|内心独白)"
+)
+_MESSAGE_LINE_RE = re.compile(r"(?is).*?message\s*\d+\s*[:：]\s*")
+_SAFE_REPLY_FALLBACK = "嗯，刚刚卡了一下，你继续说。"
 
 
 def _clean_reasoning_leak(msg: str) -> str:
     """剥离 LLM 偶尔泄漏的英文推理/元注释。"""
+    if _MONOLOGUE_LEAK_RE.search(msg):
+        # 尝试从 "Message 1:" 之后挽救正文，否则整条丢弃
+        candidate = _MESSAGE_LINE_RE.sub("", msg).strip(" \t\r\n*-`：:")
+        if candidate and not _MONOLOGUE_LEAK_RE.search(candidate):
+            return candidate
+        return ""
     m = _REASONING_LEAK_RE.search(msg)
     if m:
         cleaned = msg[:m.start()].strip()
@@ -170,6 +182,8 @@ def _is_reasoning_leak_msg(msg: str) -> bool:
     stripped = msg.strip()
     if len(stripped) < 5:
         return False
+    if _MONOLOGUE_LEAK_RE.search(stripped):
+        return True
     # 1) 纯英文消息（中文 persona 不应发纯英文，但短消息如 "OK" 不过滤）
     non_ascii = sum(1 for c in stripped if ord(c) > 127)
     if len(stripped) > 20 and non_ascii / len(stripped) < 0.1:
@@ -208,6 +222,17 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     if len(result) > _MAX_BURST:
         result = result[:_MAX_BURST]
     return result
+
+
+def _sanitize_reply_messages(raw_reply: str, truncated: bool = False) -> list[str]:
+    """对模型原始输出做安全清洗，确保不会把推理文本直接发给用户。"""
+    messages = _split_reply(raw_reply, truncated=truncated)
+    if messages:
+        return messages
+    cleaned = _clean_reasoning_leak(raw_reply).strip()
+    if cleaned and not _is_reasoning_leak_msg(cleaned):
+        return [cleaned]
+    return [_SAFE_REPLY_FALLBACK]
 
 
 def _introduce_minor_typo(text: str) -> str:
@@ -769,8 +794,7 @@ class ChatEngine:
         if self._should_update_scratchpad():
             self._trigger_scratchpad_update()
 
-        messages = _split_reply(raw_reply, truncated=truncated)
-        result = messages if messages else [raw_reply]
+        result = _sanitize_reply_messages(raw_reply, truncated=truncated)
 
         # 低频人类噪声：偶尔打错字并自我修正，避免回复过于“工整”
         result, noise_applied = self._apply_human_noise_with_flag(result)

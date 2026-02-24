@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from remember_me.analyzer.persona import Persona, analyze
 from remember_me.controller import ChatController
-from remember_me.engine.chat import ChatEngine, _split_reply
+from remember_me.engine.chat import ChatEngine, _sanitize_reply_messages, _split_reply
 from remember_me.engine.emotion import EmotionState
 from remember_me.engine.pending_events import PendingEvent, PendingEventTracker
 from remember_me.importers.base import ChatHistory, ChatMessage
@@ -211,6 +211,17 @@ def test_chat_engine_model_routing_short_ack_uses_light_model() -> None:
 def test_split_reply_keeps_all_short_segments_when_not_truncated() -> None:
     assert _split_reply("嗯|||好|||哦") == ["嗯", "好", "哦"]
     assert _split_reply("嗯|||好|||哦", truncated=True) == ["嗯", "好"]
+
+
+def test_split_reply_filters_internal_monologue_markers() -> None:
+    leaked = "(Internal Monologue/Trial)**:\n* *Message 1*: 就那个唱外"
+    assert _split_reply(leaked) == []
+    assert _split_reply(f"你嘛|||{leaked}|||好") == ["你嘛", "好"]
+
+
+def test_sanitize_reply_messages_uses_safe_fallback_for_leak_only() -> None:
+    leaked = "(Internal Monologue/Trial)**:\n* *Message 1*: 就那个唱外"
+    assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
 
 
 def test_controller_phase_transitions_deep_to_cooldown() -> None:
