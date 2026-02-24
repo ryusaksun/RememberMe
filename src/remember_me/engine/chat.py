@@ -90,11 +90,16 @@ def _build_system_prompt(persona: Persona) -> str:
         lines.append("## 回复格式（必须遵守）")
         lines.append(f"你习惯连发消息，平均每次发 {avg_burst_length:.0f} 条左右。多条消息用 {sep} 分隔。")
         lines.append("")
-        lines.append(f"关键：「笑死」「6」「牛逼」「哈哈哈」这类反应词不算完整回复。反应之后必须跟上你对话题的实际回应。")
-        lines.append(f"错误示例 → 笑死老子了")
-        lines.append(f"正确示例 → 笑死老子了{sep}南方要啥暖气啊你在做梦")
-        lines.append(f"错误示例 → 老子哪知道")
-        lines.append(f"正确示例 → 老子哪知道{sep}你自己不会搜啊")
+        lines.append("关键规则：每次回复必须至少包含一条【有实际内容】的消息。")
+        lines.append(f"「笑死」「6」「牛逼」「哈哈哈」「不知道」这些不算有实际内容，它们后面必须跟一条真正回应话题的消息。")
+        lines.append("")
+        lines.append("示例（✗ 是错的，✓ 是对的）：")
+        lines.append(f"✗ 笑死老子了")
+        lines.append(f"✓ 笑死老子了{sep}南方要啥暖气啊你在做梦")
+        lines.append(f"✗ 老子哪知道")
+        lines.append(f"✓ 老子哪知道{sep}你自己不会搜啊")
+        lines.append(f"✗ 哈哈哈哈哈{sep}你嘛又吃外卖啊")
+        lines.append(f"✓ 哈哈哈哈哈{sep}你嘛又吃外卖啊{sep}你不会自己做饭吗")
         lines.append("")
 
     # ── 真实对话示例 ──
@@ -146,13 +151,23 @@ def _clean_reasoning_leak(msg: str) -> str:
     return msg
 
 
+def _is_pure_english(msg: str) -> bool:
+    """检测整条消息是否为纯英文（中文 persona 不应发纯英文，大概率是推理泄漏）。"""
+    stripped = msg.strip()
+    if len(stripped) < 10:
+        return False
+    non_ascii = sum(1 for c in stripped if ord(c) > 127)
+    # 超过 10 字符且非 ASCII 不足 10% → 纯英文推理泄漏
+    return non_ascii / len(stripped) < 0.1
+
+
 def _split_reply(text: str, truncated: bool = False) -> list[str]:
     """将 ||| 分隔的回复拆成多条消息。自动检测并丢弃截断的末尾消息。"""
     parts = text.split(_MSG_SEPARATOR)
     result = [p.strip() for p in parts if p.strip()]
-    # 清理 LLM 推理泄漏
+    # 清理 LLM 推理泄漏（末尾英文 + 整条纯英文）
     result = [_clean_reasoning_leak(m) for m in result]
-    result = [m for m in result if m]
+    result = [m for m in result if m and not _is_pure_english(m)]
     if len(result) > 1:
         # 显式截断 或 最后一条异常短（≤2字且远短于前面平均长度），视为截断碎片
         avg_len = sum(len(m) for m in result[:-1]) / len(result[:-1])
