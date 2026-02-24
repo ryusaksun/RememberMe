@@ -38,6 +38,7 @@ class ChatController:
         self._on_message: Callable[[list[str], str], None] | None = None  # (msgs, msg_type)
         self._on_typing: Callable[[bool], None] | None = None
         self._running = False
+        self._greeting_task: asyncio.Task | None = None
         self._proactive_task: asyncio.Task | None = None
         self._last_activity = 0.0
         self._history_start_index = 0
@@ -164,7 +165,7 @@ class ChatController:
 
         # 主动开场
         if not no_greet and self._has_topics:
-            asyncio.create_task(self._send_greeting())
+            self._greeting_task = asyncio.create_task(self._send_greeting())
 
         # 启动后台主动消息循环
         self._proactive_task = asyncio.create_task(self._proactive_loop())
@@ -288,12 +289,15 @@ class ChatController:
     async def stop(self):
         """停止控制器，保存会话。"""
         self._running = False
-        if self._proactive_task:
-            self._proactive_task.cancel()
-            try:
-                await self._proactive_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._greeting_task, self._proactive_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._greeting_task = None
+        self._proactive_task = None
         self._save_session()
 
     def _save_session(self):

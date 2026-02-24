@@ -152,6 +152,14 @@ def create_import_page():
                 with log_container:
                     _log_msg(f"[FAIL] {e}", "error")
                 import_btn.enable()
+            finally:
+                # 清理上传的临时文件
+                if uploaded_path:
+                    import os
+                    try:
+                        os.unlink(uploaded_path)
+                    except OSError:
+                        pass
 
 
 def _log_msg(text: str, level: str = "info"):

@@ -517,8 +517,11 @@ def list_personas():
 
     console.print("\n  [bold]已保存的人格档案:[/]\n")
     for p in profiles:
-        persona = Persona.load(p)
-        console.print(f"    [cyan]{persona.name}[/]  ({persona.total_messages} 条消息)")
+        try:
+            persona = Persona.load(p)
+            console.print(f"    [cyan]{persona.name}[/]  ({persona.total_messages} 条消息)")
+        except Exception:
+            console.print(f"    [dim]{p.stem}[/]  [red](档案损坏)[/]")
     console.print()
 
 

@@ -223,13 +223,12 @@ def create_chat_page(persona_name: str):
 
     # ── 初始化 ──
     async def _init():
-        total = controller.get_total_messages()
-
         with messages_container:
             render_system_message(f"正在连接 {persona_name} 的记忆...")
         await _scroll_bottom()
 
         try:
+            total = controller.get_total_messages()
             await controller.start(
                 on_message=_on_message,
                 on_typing=_on_typing,
