@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import logging
-import os
 import random
 import re as _re
 from datetime import date
 
 logger = logging.getLogger(__name__)
 
-import requests as _requests
 from google import genai
 from google.genai import types
 
 from remember_me.analyzer.persona import Persona
+from remember_me.engine.brave import brave_search
 from remember_me.engine.chat import _MSG_SEPARATOR, _build_system_prompt, _split_reply
 
 # 每个话题对应多个搜索词，随机选一个，避免每次搜到同样内容
@@ -73,41 +72,6 @@ _TOPIC_SEARCH_HINTS: dict[str, list[str]] = {
 }
 
 _MODEL = "gemini-3.1-pro-preview"
-
-
-def _brave_search(query: str, count: int = 5) -> list[dict]:
-    """调用 Brave Search API 搜索。返回 [{title, description, url}]。"""
-    api_key = os.environ.get("BRAVE_API_KEY", "")
-    if not api_key:
-        logger.warning("BRAVE_API_KEY 未设置，跳过搜索")
-        return []
-
-    try:
-        resp = _requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
-            params={"q": query, "count": count, "search_lang": "zh-hans", "freshness": "pw"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = []
-        for item in data.get("web", {}).get("results", []):
-            results.append({
-                "title": item.get("title", ""),
-                "description": item.get("description", ""),
-                "url": item.get("url", ""),
-            })
-        return results
-    except _requests.Timeout:
-        logger.warning("Brave Search 超时: %s", query)
-        return []
-    except _requests.HTTPError as e:
-        logger.warning("Brave Search API 错误 %s: %s", e.response.status_code, query)
-        return []
-    except Exception as e:
-        logger.warning("Brave Search 异常: %s", e)
-        return []
 
 
 class TopicStarter:
@@ -204,7 +168,7 @@ class TopicStarter:
         search_hint = random.choice(hints)
 
         # Brave Search
-        results = _brave_search(f"{search_hint}", count=5)
+        results = brave_search(f"{search_hint}", count=5)
 
         # 把搜索结果拼成上下文（无结果时用纯话题生成）
         if results:

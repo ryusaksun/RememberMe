@@ -119,13 +119,15 @@ class TelegramBot:
                 now = datetime.now(TIMEZONE)
                 today_str = now.strftime("%Y-%m-%d")
 
-                # 新的一天或首次启动 → 生成计划
+                # 新的一天或首次启动 → 生成计划 + 更新知识库
                 if self._daily_date != today_str:
                     self._daily_times = self._plan_daily_times()
                     self._daily_date = today_str
                     if self._daily_times:
                         time_strs = [t.strftime("%H:%M") for t in self._daily_times]
                         logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
+                    # 触发知识库每日更新
+                    asyncio.create_task(self._update_knowledge())
 
                 # 检查是否到了计划时刻
                 remaining = []
@@ -140,6 +142,55 @@ class TelegramBot:
                 logger.exception("每日调度异常: %s", e)
 
             await asyncio.sleep(30)
+
+    async def _update_knowledge(self):
+        """每日知识库更新（后台运行）。"""
+        try:
+            from remember_me.analyzer.persona import Persona
+            from remember_me.knowledge.fetcher import KnowledgeFetcher
+            from remember_me.knowledge.store import KnowledgeStore
+
+            profile_path = PROFILES_DIR / f"{PERSONA_NAME}.json"
+            if not profile_path.exists():
+                return
+
+            persona = Persona.load(profile_path)
+            if not getattr(persona, "topic_interests", None):
+                return
+
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+            if not api_key:
+                return
+
+            from google import genai
+            client = genai.Client(api_key=api_key)
+
+            kb_dir = DATA_DIR / "knowledge" / PERSONA_NAME
+            chroma_dir = DATA_DIR / "chroma" / PERSONA_NAME
+            images_dir = kb_dir / "images"
+
+            store = KnowledgeStore(
+                chroma_dir=chroma_dir, knowledge_dir=kb_dir,
+                persona_name=PERSONA_NAME,
+            )
+            fetcher = KnowledgeFetcher(
+                persona_name=PERSONA_NAME,
+                topic_interests=persona.topic_interests,
+                client=client,
+                images_dir=images_dir,
+            )
+
+            loop = asyncio.get_event_loop()
+            items = await loop.run_in_executor(None, fetcher.fetch_daily)
+            if items:
+                await loop.run_in_executor(None, store.add_items, items)
+                logger.info("知识库更新完成: %d 条新知识", len(items))
+
+            # 清理过期条目
+            await loop.run_in_executor(None, store.evict)
+
+        except Exception as e:
+            logger.exception("知识库更新失败: %s", e)
 
     async def _try_send_daily_message(self):
         """尝试发送每日主动消息。"""

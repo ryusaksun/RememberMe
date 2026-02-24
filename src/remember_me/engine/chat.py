@@ -128,12 +128,14 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
 class ChatEngine:
     def __init__(self, persona: Persona, memory: MemoryStore | None = None,
                  api_key: str | None = None, sticker_lib=None,
-                 notes: list[str] | None = None):
+                 notes: list[str] | None = None,
+                 knowledge_store=None):
         if not api_key:
             raise ValueError("GEMINI_API_KEY 未提供，无法初始化对话引擎")
         self._persona = persona
         self._memory = memory
         self._notes = notes or []
+        self._knowledge_store = knowledge_store
         self._system_prompt = _build_system_prompt(persona)
         self._client = genai.Client(api_key=api_key)
         self._history: list[types.Content] = []
@@ -218,6 +220,19 @@ class ChatEngine:
         scratchpad_block = self._scratchpad.to_prompt_block()
         if scratchpad_block:
             system = system + "\n\n" + scratchpad_block
+
+        # 每日知识库（persona 最近关注的动态）
+        if self._knowledge_store:
+            try:
+                query = self._expand_query(user_input)
+                kb_items = self._knowledge_store.search(query, top_k=3)
+                if kb_items:
+                    kb_lines = ["## 你最近关注的新闻和动态（自然地提到，不要像背课文）"]
+                    for item in kb_items:
+                        kb_lines.append(f"- {item.summary}")
+                    system = system + "\n\n" + "\n".join(kb_lines)
+            except Exception as e:
+                logger.debug("知识库检索失败: %s", e)
 
         # 长期记忆（RAG）
         if self._memory:

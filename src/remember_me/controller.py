@@ -23,6 +23,7 @@ CHROMA_DIR = DATA_DIR / "chroma"
 HISTORY_DIR = DATA_DIR / "history"
 SESSIONS_DIR = DATA_DIR / "sessions"
 NOTES_DIR = DATA_DIR / "notes"
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 
 
 class ChatController:
@@ -130,10 +131,24 @@ class ChatController:
         # 加载手动备注
         notes = self._load_notes()
 
+        # 加载知识库
+        from remember_me.knowledge.store import KnowledgeStore
+        knowledge_store = None
+        kb_dir = KNOWLEDGE_DIR / self._name
+        chroma_path = CHROMA_DIR / self._name
+        if kb_dir.exists():
+            try:
+                knowledge_store = KnowledgeStore(
+                    chroma_dir=chroma_path, knowledge_dir=kb_dir,
+                    persona_name=self._name,
+                )
+            except Exception as e:
+                logger.debug("加载知识库失败: %s", e)
+
         self._engine = ChatEngine(
             persona=persona, memory=self._memory,
             api_key=self._api_key, sticker_lib=sticker_lib,
-            notes=notes,
+            notes=notes, knowledge_store=knowledge_store,
         )
 
         # 加载上次对话
