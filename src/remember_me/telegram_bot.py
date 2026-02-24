@@ -1,4 +1,4 @@
-"""RememberMe Telegram Bot — 单 persona 模式。"""
+"""RememberMe Telegram Bot — 单 persona 模式 + 每日主动消息。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,10 @@ import asyncio
 import logging
 import os
 import random
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -26,25 +30,171 @@ from remember_me.controller import ChatController
 logger = logging.getLogger(__name__)
 
 PERSONA_NAME = os.environ.get("PERSONA_NAME", "阴暗扭曲爬行_-_-")
+TIMEZONE = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
+DATA_DIR = Path("data")
+PROFILES_DIR = DATA_DIR / "profiles"
 
 
 class TelegramBot:
-    """单 persona Telegram Bot。"""
+    """单 persona Telegram Bot，含每日主动消息调度。"""
 
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
         self._allowed_users = allowed_users
         self._controller: ChatController | None = None
-        self._chat_id: int | None = None  # 当前绑定的 chat
+        self._chat_id: int | None = None
         self._send_lock = asyncio.Lock()
         self._app: Application | None = None
+        self._last_user_activity: float = 0.0  # 用户最后交互时间
+        # 每日调度
+        self._daily_times: list[datetime] = []
+        self._daily_date: str = ""  # 当前计划对应的日期
 
     def _is_allowed(self, user_id: int) -> bool:
         if self._allowed_users is None:
             return True
         return user_id in self._allowed_users
 
-    async def _ensure_session(self, chat_id: int) -> bool:
+    # ── Persona 数据加载 ──
+
+    def _load_persona_meta(self) -> dict:
+        """加载 persona 的 active_hours 和性格参数（不创建 ChatEngine）。"""
+        from remember_me.analyzer.persona import Persona
+
+        profile_path = PROFILES_DIR / f"{PERSONA_NAME}.json"
+        if not profile_path.exists():
+            logger.warning("persona 档案不存在: %s", profile_path)
+            return {}
+        persona = Persona.load(profile_path)
+        return {
+            "active_hours": getattr(persona, "active_hours", []),
+            "chase_ratio": getattr(persona, "chase_ratio", 0.0),
+            "avg_burst_length": getattr(persona, "avg_burst_length", 1.0),
+        }
+
+    # ── 每日调度 ──
+
+    def _plan_daily_times(self) -> list[datetime]:
+        """根据 persona 的 active_hours 生成今天的主动消息时刻。"""
+        meta = self._load_persona_meta()
+        active_hours = meta.get("active_hours", [])
+        chase_ratio = meta.get("chase_ratio", 0.0)
+        avg_burst = meta.get("avg_burst_length", 1.0)
+
+        if not active_hours:
+            logger.info("persona 无 active_hours，跳过每日调度")
+            return []
+
+        # 决定每天发几次
+        if chase_ratio == 0 and avg_burst < 2:
+            count = 1
+        else:
+            count = random.choice([1, 2])
+
+        now = datetime.now(TIMEZONE)
+        today = now.date()
+
+        # 从 active_hours 中随机选 count 个不同的小时
+        chosen_hours = random.sample(active_hours, min(count, len(active_hours)))
+
+        times = []
+        for hour in chosen_hours:
+            minute = random.randint(0, 59)
+            dt = datetime(today.year, today.month, today.day, hour, minute, tzinfo=TIMEZONE)
+            # 如果这个时间跨午夜（比如 hour=0 或 1），可能是"今天的凌晨"或"明天的凌晨"
+            # 如果时间已过且距现在超过 2 小时，推到明天
+            if dt < now - timedelta(hours=2):
+                dt += timedelta(days=1)
+            times.append(dt)
+
+        times.sort()
+        return times
+
+    async def _daily_scheduler(self):
+        """后台任务：每日主动消息调度，每 30 秒检查一次。"""
+        await asyncio.sleep(5)  # 等 Bot 完全启动
+
+        while True:
+            try:
+                now = datetime.now(TIMEZONE)
+                today_str = now.strftime("%Y-%m-%d")
+
+                # 新的一天或首次启动 → 生成计划
+                if self._daily_date != today_str:
+                    self._daily_times = self._plan_daily_times()
+                    self._daily_date = today_str
+                    if self._daily_times:
+                        time_strs = [t.strftime("%H:%M") for t in self._daily_times]
+                        logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
+
+                # 检查是否到了计划时刻
+                remaining = []
+                for planned_time in self._daily_times:
+                    if now >= planned_time:
+                        await self._try_send_daily_message()
+                    else:
+                        remaining.append(planned_time)
+                self._daily_times = remaining
+
+            except Exception as e:
+                logger.exception("每日调度异常: %s", e)
+
+            await asyncio.sleep(30)
+
+    async def _try_send_daily_message(self):
+        """尝试发送每日主动消息。"""
+        # 没有目标 chat_id（用户从未和 bot 交互过）
+        if not self._chat_id and not self._allowed_users:
+            logger.info("每日消息跳过：无目标 chat_id")
+            return
+        # 如果有白名单但没有 chat_id，用白名单第一个用户
+        chat_id = self._chat_id
+        if not chat_id and self._allowed_users:
+            chat_id = next(iter(self._allowed_users))
+
+        # 最近 30 分钟有互动 → 跳过（已经在聊了）
+        if self._last_user_activity and time.time() - self._last_user_activity < 1800:
+            logger.info("每日消息跳过：最近 30 分钟有互动")
+            return
+
+        logger.info("发送每日主动消息...")
+
+        try:
+            # 确保 session 存活
+            ok = await self._ensure_session(chat_id, no_greet=True)
+            if not ok:
+                return
+
+            # 用 TopicStarter 生成消息
+            controller = self._controller
+            if not controller._engine or not controller._topic_starter:
+                return
+
+            loop = asyncio.get_event_loop()
+            ctx = controller._engine.get_recent_context() if controller._engine else ""
+            msgs = await loop.run_in_executor(
+                None, lambda: controller._topic_starter.generate(recent_context=ctx)
+            )
+            msgs = [m for m in msgs if m and m.strip()]
+            if not msgs:
+                logger.info("每日消息生成为空")
+                return
+
+            # 注入对话历史
+            controller._engine.inject_proactive_message(msgs)
+            controller._update_activity()
+
+            # 发送到 Telegram
+            bot = self._app.bot
+            await self._deliver_messages(bot, chat_id, msgs)
+            logger.info("每日主动消息已发送: %d 条", len(msgs))
+
+        except Exception as e:
+            logger.exception("每日主动消息发送失败: %s", e)
+
+    # ── Session 管理 ──
+
+    async def _ensure_session(self, chat_id: int, no_greet: bool = False) -> bool:
         """确保 controller 已启动。返回 True 表示就绪。"""
         if self._controller and self._chat_id == chat_id:
             return True
@@ -66,8 +216,12 @@ class TelegramBot:
                     bot.send_chat_action(chat_id, ChatAction.TYPING)
                 )
 
-        await self._controller.start(on_message=on_message, on_typing=on_typing)
+        await self._controller.start(
+            on_message=on_message, on_typing=on_typing, no_greet=no_greet,
+        )
         return True
+
+    # ── 命令处理 ──
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
@@ -75,6 +229,7 @@ class TelegramBot:
             return
 
         chat_id = update.effective_chat.id
+        self._last_user_activity = time.time()
         ok = await self._ensure_session(chat_id)
         if not ok:
             await update.message.reply_text("Bot 正在被其他用户使用。")
@@ -108,8 +263,8 @@ class TelegramBot:
             return
 
         chat_id = update.effective_chat.id
+        self._last_user_activity = time.time()
 
-        # 自动启动 session
         ok = await self._ensure_session(chat_id)
         if not ok:
             await update.message.reply_text("Bot 正在被其他用户使用。")
@@ -162,6 +317,8 @@ class TelegramBot:
                 BotCommand("start", "开始对话"),
                 BotCommand("stop", "结束对话"),
             ])
+            # 启动每日调度
+            asyncio.create_task(self._daily_scheduler())
 
         self._app.post_init = post_init
 
