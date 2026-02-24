@@ -416,10 +416,10 @@ class ChatEngine:
             mods = self._emotion_state.get_modifiers(self._persona)
             burst_range = self._emotion_state.compute_burst_range(self._persona, user_input)
 
-        # 根据 burst 范围动态计算 token 预算
+        # 根据 burst 范围动态计算 token 预算（下限 512，保证多条短消息有足够空间）
         _low, high = burst_range
-        tokens_per_msg = 80  # 中文短消息预估 40-60 tokens，给余量
-        mods.max_output_tokens = min(1536, max(256, high * tokens_per_msg))
+        tokens_per_msg = 120
+        mods.max_output_tokens = min(1536, max(512, high * tokens_per_msg))
 
         system = self._build_system(user_input)
 
