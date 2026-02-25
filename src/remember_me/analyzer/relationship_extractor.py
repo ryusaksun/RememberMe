@@ -510,7 +510,10 @@ class RelationshipExtractor:
             if not content:
                 continue
             subject = str(item.get("subject", "both")).strip() or "both"
-            confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0)))
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                confidence = 0.0
             evidence = [
                 self._compact(str(e), limit=36)
                 for e in (item.get("evidence") or [])

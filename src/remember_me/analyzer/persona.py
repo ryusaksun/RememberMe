@@ -351,6 +351,8 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
 
     contents = _get_text_contents(target_msgs)
     total = len(contents)
+    if total == 0:
+        return Persona(name=history.target_name)
 
     # ── 基础统计 ──
     lengths = [len(c) for c in contents]
@@ -502,7 +504,7 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         sampled = pairs
     else:
         step = len(pairs) / max_examples
-        sampled = [pairs[int(i * step)] for i in range(max_examples)]
+        sampled = [pairs[min(int(i * step), len(pairs) - 1)] for i in range(max_examples)]
     example_dialogues = [
         {"user": p[0].content, "reply": p[1].content}
         for p in sampled
@@ -518,7 +520,7 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
             burst_sample = burst_segs
         else:
             step = len(burst_segs) / max_burst_ex
-            burst_sample = [burst_segs[int(i * step)] for i in range(max_burst_ex)]
+            burst_sample = [burst_segs[min(int(i * step), len(burst_segs) - 1)] for i in range(max_burst_ex)]
         burst_examples = [
             {"user": u, "replies": rs}
             for u, rs in burst_sample

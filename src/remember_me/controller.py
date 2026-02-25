@@ -63,6 +63,7 @@ class ChatController:
         self._event_extract_task: asyncio.Task | None = None
         self._relationship_extract_index = 0
         self._relationship_extract_task: asyncio.Task | None = None
+        self._extract_lock = asyncio.Lock()
         self._last_relationship_followup_at = 0.0
         self._last_relationship_fact_id = ""
         self._session_loaded = False
@@ -498,20 +499,21 @@ class ChatController:
 
             # 异步提取待跟进事件（每 6 轮检查一次，与 scratchpad 同步）
             history_len = len(self._engine._history)
-            if (
-                history_len - self._event_extract_index >= 6
-                and (not self._event_extract_task or self._event_extract_task.done())
-            ):
-                self._event_extract_task = asyncio.create_task(self._extract_pending_events())
-            if (
-                history_len - self._relationship_extract_index >= 8
-                and self._relationship_extractor
-                and self._relationship_store
-                and (not self._relationship_extract_task or self._relationship_extract_task.done())
-            ):
-                self._relationship_extract_task = asyncio.create_task(
-                    self._extract_relationship_facts()
-                )
+            async with self._extract_lock:
+                if (
+                    history_len - self._event_extract_index >= 6
+                    and (not self._event_extract_task or self._event_extract_task.done())
+                ):
+                    self._event_extract_task = asyncio.create_task(self._extract_pending_events())
+                if (
+                    history_len - self._relationship_extract_index >= 8
+                    and self._relationship_extractor
+                    and self._relationship_store
+                    and (not self._relationship_extract_task or self._relationship_extract_task.done())
+                ):
+                    self._relationship_extract_task = asyncio.create_task(
+                        self._extract_relationship_facts()
+                    )
 
             return replies
         finally:
@@ -526,7 +528,7 @@ class ChatController:
             snapshot_index = len(self._engine._history)
             messages = []
             for h in self._engine._history[self._event_extract_index:snapshot_index]:
-                if h.parts and h.parts[0].text:
+                if h.parts and len(h.parts) > 0 and getattr(h.parts[0], "text", None):
                     messages.append({"role": h.role, "text": h.parts[0].text})
 
             if not messages:
@@ -551,7 +553,7 @@ class ChatController:
             snapshot_index = len(self._engine._history)
             messages = []
             for h in self._engine._history[self._relationship_extract_index:snapshot_index]:
-                if h.parts and h.parts[0].text:
+                if h.parts and len(h.parts) > 0 and getattr(h.parts[0], "text", None):
                     messages.append({"role": h.role, "text": h.parts[0].text})
             if not messages:
                 return
@@ -702,8 +704,9 @@ class ChatController:
                         self._last_relationship_fact_id = relation_fact_id
                         self._last_relationship_followup_at = now
                     cooldown = self._sample_proactive_cooldown()
-                    if self._engine:
-                        cooldown *= self._engine.proactive_cooldown_factor
+                    factor = getattr(self._engine, "proactive_cooldown_factor", 1.0) if self._engine else 1.0
+                    if isinstance(factor, (int, float)) and factor > 0:
+                        cooldown *= factor
                     self._next_proactive_at = now + cooldown
                     self._set_phase("cooldown", reason="proactive_sent")
                     self._emit_metric(
@@ -724,12 +727,13 @@ class ChatController:
         """停止控制器，保存会话。"""
         self._running = False
         self._set_phase("ending", reason="controller_stop")
-        for task in (
-            self._greeting_task,
-            self._proactive_task,
-            self._event_extract_task,
-            self._relationship_extract_task,
-        ):
+        # 先等待数据写入类任务自然结束（最多 5 秒），避免中断文件 I/O
+        io_tasks = [t for t in (self._event_extract_task, self._relationship_extract_task)
+                    if t and not t.done()]
+        if io_tasks:
+            await asyncio.gather(*io_tasks, return_exceptions=True)
+        # 其余任务直接取消
+        for task in (self._greeting_task, self._proactive_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -763,7 +767,7 @@ class ChatController:
             if self._relationship_extractor and self._relationship_store:
                 rel_msgs = []
                 for h in self._engine._history[self._relationship_extract_index:]:
-                    if h.parts and h.parts[0].text:
+                    if h.parts and len(h.parts) > 0 and getattr(h.parts[0], "text", None):
                         rel_msgs.append({"role": h.role, "text": h.parts[0].text})
                 if rel_msgs:
                     facts = self._relationship_extractor.extract_from_messages(
@@ -783,7 +787,7 @@ class ChatController:
             if self._event_tracker:
                 remaining = []
                 for h in self._engine._history[self._event_extract_index:]:
-                    if h.parts and h.parts[0].text:
+                    if h.parts and len(h.parts) > 0 and getattr(h.parts[0], "text", None):
                         remaining.append({"role": h.role, "text": h.parts[0].text})
                 if remaining:
                     try:

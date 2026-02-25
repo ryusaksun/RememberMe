@@ -305,9 +305,11 @@ class RelationshipMemoryStore:
             cooldown = self._safe_int(meta.get("cooldown_seconds"), default=0)
             if cooldown <= 0:
                 continue
-            last_hit_raw = str(meta.get("last_hit_at", "") or "")
+            last_hit_raw = str(meta.get("last_hit_at", "") or "").strip()
+            if not last_hit_raw:
+                continue
             last_hit_dt = _parse_iso(last_hit_raw)
-            if not last_hit_dt:
+            if last_hit_dt.year <= 1970:
                 continue
             elapsed = (now - last_hit_dt).total_seconds()
             remain = cooldown - elapsed

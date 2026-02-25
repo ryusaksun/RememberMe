@@ -5,10 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 import requests
 from Crypto.Cipher import AES
@@ -176,7 +179,11 @@ class NeteaseAPI:
             f"{_BASE_URL}/api/w/nuser/account/get",
             data=_weapi_encrypt({}),
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except (ValueError, Exception):
+            logger.error("login_status 响应非 JSON (status=%s)", resp.status_code)
+            return None
         profile = data.get("profile")
         if profile:
             self.my_uid = profile.get("userId")

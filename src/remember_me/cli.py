@@ -359,9 +359,10 @@ def chat(name: str, api_key: str | None, no_greet: bool):
 
     def _save_session():
         nonlocal _session_saved
-        if _session_saved:
-            return
-        _session_saved = True
+        with _activity_lock:
+            if _session_saved:
+                return
+            _session_saved = True
         try:
             engine.save_session(session_path)
             new_msgs = engine.get_new_messages(history_start_index)

@@ -183,6 +183,7 @@ class KnowledgeStore:
         if total > max_size_bytes:
             logger.warning("知识库超过 %d GB，强制清理最旧条目", max_size_bytes // (1024**3))
             keep.sort(key=lambda x: x.get("fetched_at", ""))
+            evicted = 0
             while keep and self.total_size_bytes() > max_size_bytes:
                 oldest = keep.pop(0)
                 img = oldest.get("image_path")
@@ -193,7 +194,11 @@ class KnowledgeStore:
                     self._collection.delete(ids=[doc_id])
                 except Exception:
                     pass
-            self._save_index(keep)
+                evicted += 1
+                # 每次删除后保存索引，确保 total_size_bytes 反映最新状态
+                self._save_index(keep)
+                if evicted > 200:  # 安全阀：避免极端情况死循环
+                    break
 
     def total_size_bytes(self) -> int:
         """计算知识库目录总大小。"""

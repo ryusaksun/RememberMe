@@ -121,12 +121,12 @@ class EmotionState:
             self.arousal = _clamp(self.arousal + 0.08 * scale, -1, 1)
 
         # 负向高激动（用户骂人/表达不满）
-        if _NEGATIVE_RE.search(user_input):
+        if _NEGATIVE_RE.search(user_text):
             self.valence = _clamp(self.valence - 0.15 * scale, -1, 1)
             self.arousal = _clamp(self.arousal + 0.15 * scale, -1, 1)
 
         # 低落情绪
-        if _SAD_RE.search(user_input):
+        if _SAD_RE.search(user_text):
             self.valence = _clamp(self.valence - 0.12 * scale, -1, 1)
             self.arousal = _clamp(self.arousal - 0.1 * scale, -1, 1)
 
@@ -218,21 +218,24 @@ class EmotionState:
         """从 Scratchpad LLM 输出同步情绪状态（覆盖规则引擎的微调）。"""
         if not emotion_raw:
             return
+        updated = False
         try:
             v = emotion_raw.get("valence")
-            a = emotion_raw.get("arousal")
             if v is not None:
                 v_f = float(v)
-                if not math.isfinite(v_f):
-                    return
-                self.valence = _clamp(v_f, -1, 1)
+                if math.isfinite(v_f):
+                    self.valence = _clamp(v_f, -1, 1)
+                    updated = True
+            a = emotion_raw.get("arousal")
             if a is not None:
                 a_f = float(a)
-                if not math.isfinite(a_f):
-                    return
-                self.arousal = _clamp(a_f, -1, 1)
+                if math.isfinite(a_f):
+                    self.arousal = _clamp(a_f, -1, 1)
+                    updated = True
         except (ValueError, TypeError):
-            return  # LLM 输出异常值，跳过本次同步
+            pass  # 单个字段异常不影响另一个字段
+        if not updated:
+            return
         trigger = emotion_raw.get("trigger", "")
         if trigger:
             self.trigger = str(trigger)

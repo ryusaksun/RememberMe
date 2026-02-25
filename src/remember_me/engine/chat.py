@@ -1002,13 +1002,13 @@ class ChatEngine:
                 logger.warning("知识库检索失败: %s", e)
 
         # 中期记忆（scratchpad）+ 情绪引导（锁保护，防止后台线程写入时读到不一致状态）
+        # 最小化锁持有时间：只在读取共享状态时持锁，排序/格式化在锁外进行
         with self._state_lock:
             scratchpad_block = self._scratchpad.to_prompt_block()
             emotion_block = self._emotion_state.to_prompt_block(self._persona)
             burst_hint = self._emotion_state.burst_hint(self._persona)
-            open_threads = self._rank_open_threads(
-                user_input, list(self._scratchpad.open_threads),
-            )
+            _raw_threads = list(self._scratchpad.open_threads)
+        open_threads = self._rank_open_threads(user_input, _raw_threads)
         rhythm_hint = self.format_rhythm_hint(
             self.plan_rhythm_policy(kind="reply", user_input=user_input)
         )

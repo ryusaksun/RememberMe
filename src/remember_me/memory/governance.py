@@ -111,6 +111,11 @@ class MemoryGovernance:
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                logger.warning("记忆治理数据格式错误：期望 dict，得到 %s", type(raw).__name__)
+                self._records = []
+                self._core_profile_snapshot = {}
+                return
             self._core_profile_snapshot = raw.get("core_profile_snapshot", {}) or {}
             self._records = [
                 MemoryRecord.from_dict(item)
@@ -254,7 +259,10 @@ class MemoryGovernance:
             return ConflictResult(True, "试图重写身份设定")
 
         if _NO_SWEAR_RE.search(msg):
-            swear_ratio = float((self._core_profile_snapshot or {}).get("swear_ratio", 0.0) or 0.0)
+            try:
+                swear_ratio = float((self._core_profile_snapshot or {}).get("swear_ratio", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                swear_ratio = 0.0
             if swear_ratio > 0.005:
                 return ConflictResult(True, "试图改写导入历史中的语气习惯")
 
@@ -335,8 +343,8 @@ class MemoryGovernance:
         if not message or len(message) < 4 or _TRIVIAL_SESSION_RE.match(message):
             return None
 
-        # 去重：避免同一句短时间重复写入
-        recent = self.list_session_records(include_conflict=True)[:20]
+        # 去重：避免同一句短时间重复写入（扩大窗口覆盖更长时间段）
+        recent = self.list_session_records(include_conflict=True)[:50]
         if any(r.text == message for r in recent):
             return None
 

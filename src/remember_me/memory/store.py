@@ -209,12 +209,24 @@ class MemoryStore:
             return
 
         # 数据已在内存中准备好，删除旧 collection 后立即写入
-        self._client.delete_collection(name=self._safe_name)
-        self._collection = self._client.get_or_create_collection(
-            name=self._safe_name,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=self._ef,
-        )
+        try:
+            self._client.delete_collection(name=self._safe_name)
+        except Exception:
+            pass  # collection 可能不存在
+        try:
+            new_collection = self._client.get_or_create_collection(
+                name=self._safe_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._ef,
+            )
+        except Exception:
+            # 重建失败时尝试恢复，保证 self._collection 始终可用
+            new_collection = self._client.get_or_create_collection(
+                name=self._safe_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._ef,
+            )
+        self._collection = new_collection
         self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
 
     def add_messages(self, messages: list[dict]):
@@ -236,7 +248,7 @@ class MemoryStore:
         if count == 0:
             return []
 
-        candidate_k = min(max(top_k * 2, top_k), count)
+        candidate_k = min(top_k * 2, count)
         results = self._collection.query(
             query_texts=[query],
             n_results=candidate_k,

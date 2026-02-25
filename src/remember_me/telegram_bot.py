@@ -276,13 +276,13 @@ class TelegramBot:
     async def _try_send_daily_message(self):
         """尝试发送每日主动消息。优先发送待跟进事件的追问。"""
         # 没有目标 chat_id（用户从未和 bot 交互过）
-        if not self._chat_id and not self._allowed_users:
+        async with self._send_lock:
+            chat_id = self._chat_id
+            if not chat_id and self._allowed_users:
+                chat_id = next(iter(self._allowed_users))
+        if not chat_id:
             logger.info("每日消息跳过：无目标 chat_id")
             return
-        # 如果有白名单但没有 chat_id，用白名单第一个用户
-        chat_id = self._chat_id
-        if not chat_id and self._allowed_users:
-            chat_id = next(iter(self._allowed_users))
 
         # 最近 30 分钟有互动 → 跳过（已经在聊了）
         if self._last_user_activity and time.time() - self._last_user_activity < 1800:
