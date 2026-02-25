@@ -191,6 +191,24 @@ _MONOLOGUE_LEAK_RE = re.compile(
     r"reasoning(?:\s*trace|\s*process)?|/trial|trial\)\*\*|思考过程|推理过程|内心独白)"
 )
 _MESSAGE_LINE_RE = re.compile(r"(?is).*?message\s*\d+\s*[:：]\s*")
+_PROMPT_LEAK_STRUCT_RE = re.compile(r"(?m)(^\s*##\s*|^\s*[-*]\s+|\*\*[^*]{2,}\*\*)")
+_PROMPT_LEAK_KEYWORDS = (
+    "角色设定",
+    "系统提示",
+    "system prompt",
+    "system instruction",
+    "你就是「",
+    "你就是\"",
+    "以下是从你和对方",
+    "真实聊天记录中提取",
+    "你是什么样的人",
+    "语感参考",
+    "回复格式（必须遵守）",
+    "关键规则",
+    "你过去真实的说话方式",
+    "最重要的是：根据对方说的内容来回复",
+    "绝不承认是 ai",
+)
 _SAFE_REPLY_FALLBACK = "嗯，刚刚卡了一下，你继续说。"
 
 
@@ -210,12 +228,28 @@ def _clean_reasoning_leak(msg: str) -> str:
     return msg
 
 
+def _is_prompt_leak_msg(msg: str) -> bool:
+    """检测系统提示泄漏（如「角色设定/规则」块被模型误输出）。"""
+    stripped = (msg or "").strip()
+    if len(stripped) < 8:
+        return False
+    lowered = stripped.lower()
+    hit_count = sum(1 for kw in _PROMPT_LEAK_KEYWORDS if kw in lowered or kw in stripped)
+    if hit_count >= 2:
+        return True
+    if hit_count == 1 and _PROMPT_LEAK_STRUCT_RE.search(stripped):
+        return True
+    return False
+
+
 def _is_reasoning_leak_msg(msg: str) -> bool:
     """检测整条消息是否为 LLM 推理泄漏（纯英文 / 中文推理片段）。"""
     stripped = msg.strip()
     if len(stripped) < 5:
         return False
     if _MONOLOGUE_LEAK_RE.search(stripped):
+        return True
+    if _is_prompt_leak_msg(stripped):
         return True
     # 1) 纯英文消息（中文 persona 不应发纯英文，但短消息如 "OK" 不过滤）
     non_ascii = sum(1 for c in stripped if ord(c) > 127)
@@ -255,6 +289,17 @@ def _split_reply(text: str, truncated: bool = False) -> list[str]:
     if len(result) > _MAX_BURST:
         result = result[:_MAX_BURST]
     return result
+
+
+def _messages_to_history_text(messages: list[str]) -> str:
+    """将最终发送给用户的多条消息转成历史文本，避免污染后续上下文。"""
+    rows = [str(m).strip() for m in (messages or []) if str(m).strip()]
+    if not rows:
+        return _SAFE_REPLY_FALLBACK
+    texts = [m for m in rows if not m.startswith("[sticker:")]
+    if texts:
+        return _MSG_SEPARATOR.join(texts)
+    return rows[0]
 
 
 def _is_short_ack(text: str) -> bool:
@@ -1168,20 +1213,6 @@ class ChatEngine:
             and response.candidates[0].finish_reason.name == "MAX_TOKENS"
         )
 
-        self._history.append(types.Content(role="model", parts=[types.Part(text=raw_reply)]))
-        self._trim_history()
-
-        # 即时情绪微调（关键词规则）
-        with self._state_lock:
-            self._emotion_state.quick_adjust(user_input, raw_reply, self._persona)
-            self._apply_relationship_emotion_trigger(user_input)
-        # 动态更新表情包概率
-        self._sticker_probability = mods.sticker_probability
-
-        # 异步更新中期记忆
-        if self._should_update_scratchpad():
-            self._trigger_scratchpad_update()
-
         result = _sanitize_reply_messages(raw_reply, truncated=truncated)
 
         # 低频人类噪声：偶尔打错字并自我修正，避免回复过于“工整”
@@ -1196,6 +1227,23 @@ class ChatEngine:
             allow_sticker=not noise_applied,
             max_count=rhythm_policy.max_count,
         )
+
+        # 只把用户可见文本写入历史，防止原始泄漏文本污染后续上下文。
+        history_text = _messages_to_history_text(result)
+        self._history.append(types.Content(role="model", parts=[types.Part(text=history_text)]))
+        self._trim_history()
+
+        # 即时情绪微调（关键词规则）
+        with self._state_lock:
+            self._emotion_state.quick_adjust(user_input, history_text, self._persona)
+            self._apply_relationship_emotion_trigger(user_input)
+        # 动态更新表情包概率
+        self._sticker_probability = mods.sticker_probability
+
+        # 异步更新中期记忆
+        if self._should_update_scratchpad():
+            self._trigger_scratchpad_update()
+
         return result
 
     def _apply_human_noise(self, replies: list[str]) -> list[str]:

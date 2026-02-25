@@ -11,6 +11,7 @@ from remember_me.controller import ChatController
 from remember_me.engine.chat import (
     ChatEngine,
     RhythmPolicy,
+    _messages_to_history_text,
     _sanitize_reply_messages,
     _split_reply,
     normalize_messages_by_policy,
@@ -223,6 +224,21 @@ def test_split_reply_filters_internal_monologue_markers() -> None:
     leaked = "(Internal Monologue/Trial)**:\n* *Message 1*: 就那个唱外"
     assert _split_reply(leaked) == []
     assert _split_reply(f"你嘛|||{leaked}|||好") == ["你嘛", "好"]
+
+
+def test_split_reply_filters_prompt_leak_markers() -> None:
+    leaked = "* **角色设定**: 我是「小明」\n* **规则**: 绝不承认是 AI"
+    assert _split_reply(leaked) == []
+    assert _split_reply(f"你继续说|||{leaked}|||刚刚卡了") == ["你继续说", "刚刚卡了"]
+
+
+def test_sanitize_reply_messages_uses_safe_fallback_for_prompt_leak_only() -> None:
+    leaked = "* **角色设定**: 我是「小明」\n* **规则**: 绝不承认是 AI"
+    assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
+
+
+def test_messages_to_history_text_uses_visible_text_only() -> None:
+    assert _messages_to_history_text(["第一条", "[sticker:/tmp/a.png]", "第二条"]) == "第一条|||第二条"
 
 
 def test_rhythm_policy_event_priority_over_emotion() -> None:
