@@ -552,26 +552,38 @@ class ChatEngine:
 
     @property
     def reply_delay_factor(self) -> float:
-        """情绪驱动的回复延迟系数，供外部（telegram_bot/gui）使用。"""
-        return self._emotion_state.get_modifiers(self._persona).reply_delay_factor
+        """情绪+空间驱动的回复延迟系数，供外部（telegram_bot/gui）使用。"""
+        with self._state_lock:
+            base = self._emotion_state.get_modifiers(self._persona).reply_delay_factor
+            space = self._space_state.get_modifiers().reply_delay_factor
+        return min(6.0, base * space)
 
     @property
     def proactive_cooldown_factor(self) -> float:
         """情绪驱动的主动消息冷却系数。"""
-        return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
+        with self._state_lock:
+            return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
+
+    def advance_space(self):
+        """推进空间状态到当前时间（线程安全）。"""
+        with self._state_lock:
+            self._space_state.advance(datetime.now(_TIMEZONE))
 
     @property
     def space_modifiers(self) -> SpaceModifiers:
         """空间驱动的行为修饰。"""
-        return self._space_state.get_modifiers()
+        with self._state_lock:
+            return self._space_state.get_modifiers()
 
     @property
     def current_location(self) -> str:
-        return self._space_state.current_location
+        with self._state_lock:
+            return self._space_state.current_location
 
     @property
     def current_activity(self) -> str:
-        return self._space_state.current_activity
+        with self._state_lock:
+            return self._space_state.current_activity
 
     def regenerate_daily_schedule(self, routine, day_of_week: int, date_str: str):
         """生成今日日程（会话启动或午夜调用）。"""
@@ -857,14 +869,12 @@ class ChatEngine:
         elif phase == "warmup":
             max_count = max(min_count, min(max_count, 3))
 
-        # 空间修饰调整
-        s_mods = self._space_state.get_modifiers()
+        # 空间修饰调整（条数偏移；消息长度由 send_multi 的 token 预算统一处理）
+        with self._state_lock:
+            s_mods = self._space_state.get_modifiers()
         if s_mods.burst_count_bias != 0:
             max_count = max(1, min(_MAX_BURST, max_count + s_mods.burst_count_bias))
             prefer_count = max(1, min(max_count, prefer_count + s_mods.burst_count_bias))
-        if s_mods.message_length_factor < 0.8:
-            max_len = max(min_len + 2, int(max_len * s_mods.message_length_factor))
-            prefer_len = max(min_len, min(max_len, int(prefer_len * s_mods.message_length_factor)))
 
         max_count = max(1, min(_MAX_BURST, max_count))
         min_count = max(1, min(max_count, min_count))
@@ -1123,6 +1133,10 @@ class ChatEngine:
         """将对话历史保存到文件。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        with self._state_lock:
+            scratchpad_data = self._scratchpad.to_dict()
+            emotion_data = self._emotion_state.to_dict()
+            space_data = self._space_state.to_dict()
         data = {
             "name": self._persona.name,
             "updated_at": datetime.now().isoformat(),
@@ -1131,9 +1145,9 @@ class ChatEngine:
                 for h in self._history
             ],
             "session_phase": self._session_phase,
-            "scratchpad": self._scratchpad.to_dict(),
-            "emotion_state": self._emotion_state.to_dict(),
-            "space_state": self._space_state.to_dict(),
+            "scratchpad": scratchpad_data,
+            "emotion_state": emotion_data,
+            "space_state": space_data,
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1230,15 +1244,14 @@ class ChatEngine:
             mods = self._emotion_state.get_modifiers(self._persona)
         rhythm_policy = self.plan_rhythm_policy(kind="reply", user_input=user_input)
 
-        # 叠加空间修饰
-        space_mods = self._space_state.get_modifiers()
-        mods.reply_delay_factor = min(6.0, mods.reply_delay_factor * space_mods.reply_delay_factor)
-        mods.burst_count_bias = max(-3, mods.burst_count_bias + space_mods.burst_count_bias)
+        # 叠加空间修饰（delay 已内化到 reply_delay_factor 属性，这里处理 token 预算）
+        with self._state_lock:
+            space_mods = self._space_state.get_modifiers()
 
         # 根据节奏策略动态计算 token 预算（下限 512，保证多条短消息有足够空间）
         tokens_per_msg = max(80, min(180, rhythm_policy.prefer_len * 8))
         mods.max_output_tokens = min(1536, max(512, rhythm_policy.max_count * tokens_per_msg))
-        # 空间消息长度系数
+        # 空间消息长度系数（唯一应用点）
         mods.max_output_tokens = max(384, int(mods.max_output_tokens * space_mods.message_length_factor))
 
         system = self._build_system(user_input)

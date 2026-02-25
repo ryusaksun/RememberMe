@@ -218,11 +218,15 @@ class TelegramBot:
                         logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
                     # 触发知识库每日更新
                     self._track_task(asyncio.create_task(self._update_knowledge()), "daily_knowledge_update")
-                    # 刷新空间日程
+                    # 刷新空间日程（run_in_executor 避免阻塞事件循环）
                     if self._controller and self._controller._routine and self._controller._engine:
                         try:
-                            self._controller._engine.regenerate_daily_schedule(
-                                self._controller._routine, now.weekday(), today_str,
+                            ctrl = self._controller
+                            await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: ctrl._engine.regenerate_daily_schedule(
+                                    ctrl._routine, now.weekday(), today_str,
+                                ),
                             )
                         except Exception as e:
                             logger.warning("每日空间日程刷新失败: %s", e)
@@ -350,7 +354,9 @@ class TelegramBot:
 
             # 优先级 2：常规新话题
             if not msgs:
-                ctx = controller._engine.get_recent_context() if controller._engine else ""
+                if not controller._engine:
+                    return
+                ctx = controller._engine.get_recent_context()
                 proactive_policy = controller._engine.plan_rhythm_policy(
                     kind="proactive",
                     user_input=ctx,
@@ -792,14 +798,12 @@ class TelegramBot:
         if not msgs:
             return
 
-        # 获取情绪+空间驱动的延迟系数
+        # 获取情绪+空间驱动的延迟系数（已内化到属性中）
         delay_factor = 1.0
         engine = None
         if self._controller and self._controller._engine:
             engine = self._controller._engine
             delay_factor = engine.reply_delay_factor
-            space_mods = engine.space_modifiers
-            delay_factor = min(6.0, delay_factor * space_mods.reply_delay_factor)
 
         for i, msg in enumerate(msgs):
             # 第一条也加延迟，区分正常回复 / 主动接话

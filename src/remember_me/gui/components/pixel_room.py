@@ -2064,6 +2064,8 @@ function updateLabel(t){
   if(el)el.textContent='[ '+t+' ]';
 }
 function setState(s){
+  /* 从 away 回来时重置到入口位置 */
+  if(ch.state==='away'&&s!=='away'&&ch.x<0){ch.x=30;ch.y=LF;ch.currentRoom='living';}
   ch.state=s;ch.sTimer=0;ch.bubble='';ch.jumpOff=0;ch.jumpT=0;ch.lastAct=simMs;
   switch(s){
     case'idle':ch.pose='stand';ch.idleWait=2+rand()*3;
@@ -2075,8 +2077,8 @@ function setState(s){
     case'reading':ch.path=buildPath('living',180,LF);ch.pathIdx=0;ch.moving=true;updateLabel('reading...');break;
     case'excited':ch.pose='stand';ch.jumpT=0;ch.bubble='!';updateLabel('excited!');break;
     case'cooking':ch.path=buildPath('kitchen',CX+CW+200,LF);ch.pathIdx=0;ch.moving=true;updateLabel('cooking...');break;
-    case'showering':ch.path=buildPath('bathroom',CX+CW+150,UF);ch.pathIdx=0;ch.moving=true;ch.bubble='~';updateLabel('showering...');break;
-    case'watching_tv':ch.path=buildPath('living',180,LF);ch.pathIdx=0;ch.moving=true;updateLabel('watching tv...');break;
+    case'showering':ch.path=buildPath('bathroom',CX+CW+220,UF);ch.pathIdx=0;ch.moving=true;ch.bubble='~';updateLabel('showering...');break;
+    case'watching_tv':ch.path=buildPath('living',160,LF);ch.pathIdx=0;ch.moving=true;updateLabel('watching tv...');break;
     case'away':ch.path=[{x:-30,y:ch.y}];ch.pathIdx=0;ch.moving=true;updateLabel('away...');break;
   }
 }
@@ -2119,7 +2121,7 @@ function update(dt){
         else if(ch.state==='reading'){ch.y=LF-16;ch.pose='readSofa';ch.dir=0;}
         else if(ch.state==='cooking'){ch.pose='stand';ch.dir=1;}
         else if(ch.state==='showering'){ch.pose='stand';ch.dir=0;}
-        else if(ch.state==='watching_tv'){ch.y=LF-16;ch.pose='readSofa';ch.dir=0;}
+        else if(ch.state==='watching_tv'){ch.y=LF-16;ch.pose='sit';ch.dir=1;}
         else if(ch.state==='away'){ch.pose='stand';ch.moving=false;}
       }
     }else{
@@ -2133,8 +2135,10 @@ function update(dt){
   if(ch.state==='excited'){ch.jumpT+=dt;ch.jumpOff=Math.round(Math.sin(ch.jumpT*8)*5);}
   var idle=simMs-ch.lastAct;
   var lockedStates={'cooking':1,'showering':1,'watching_tv':1,'away':1};
-  if(ch.state==='idle'&&idle>60000&&!lockedStates[ch.state])setState('reading');
-  else if(ch.state==='reading'&&idle>180000)setState('sleeping');
+  if(!lockedStates[ch.state]){
+    if(ch.state==='idle'&&idle>60000)setState('reading');
+    else if(ch.state==='reading'&&idle>180000)setState('sleeping');
+  }
   if(ch.state==='sleeping'&&!ch.moving)ch.bubble='z'.repeat((Math.floor(ch.sTimer*1.5)%3)+1);
   if(ch.state==='thinking')ch.bubble='.'.repeat((Math.floor(ch.sTimer*2)%3)+1);
   if(ch.state==='showering'&&!ch.moving)ch.bubble='~'.repeat((Math.floor(ch.sTimer*1.2)%3)+1);

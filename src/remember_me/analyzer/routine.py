@@ -90,20 +90,20 @@ class DailyRoutine:
                 if not isinstance(item, dict):
                     continue
                 result.append(RoutineSlot(
-                    hour=int(item.get("hour", 0)),
-                    minute=int(item.get("minute", 0)),
-                    activity=str(item.get("activity", "")),
-                    location=str(item.get("location", "bedroom")),
-                    confidence=float(item.get("confidence", 0.0)),
-                    responsiveness=float(item.get("responsiveness", 1.0)),
+                    hour=int(item["hour"]) if item.get("hour") is not None else 0,
+                    minute=int(item["minute"]) if item.get("minute") is not None else 0,
+                    activity=item.get("activity") or "",
+                    location=item.get("location") or "bedroom",
+                    confidence=float(item["confidence"]) if item.get("confidence") is not None else 0.0,
+                    responsiveness=float(item["responsiveness"]) if item.get("responsiveness") is not None else 1.0,
                 ))
             return result
 
         return cls(
             weekday_slots=_parse_slots(data.get("weekday_slots")),
             weekend_slots=_parse_slots(data.get("weekend_slots")),
-            sleep_start=int(data.get("sleep_start", 1)),
-            sleep_end=int(data.get("sleep_end", 8)),
+            sleep_start=int(data["sleep_start"]) if data.get("sleep_start") is not None else 1,
+            sleep_end=int(data["sleep_end"]) if data.get("sleep_end") is not None else 8,
         )
 
 
@@ -259,8 +259,10 @@ def _fill_defaults(
                     confidence=0.3, responsiveness=0.9),
     ]
     merged = list(existing)
+    seen_hours = set(existing_hours)
     for d in defaults:
-        if d.hour not in existing_hours:
+        if d.hour not in seen_hours:
             merged.append(d)
+            seen_hours.add(d.hour)
     merged.sort(key=lambda s: (s.hour, s.minute))
     return merged

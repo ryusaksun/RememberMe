@@ -391,7 +391,10 @@ class ChatController:
                 now_dt = datetime.now(_TIMEZONE)
                 date_str = now_dt.strftime("%Y-%m-%d")
                 if not self._engine._space_state.schedule or self._engine._space_state.schedule_date != date_str:
-                    self._engine.regenerate_daily_schedule(self._routine, now_dt.weekday(), date_str)
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, lambda: self._engine.regenerate_daily_schedule(self._routine, now_dt.weekday(), date_str),
+                    )
             except Exception as e:
                 logger.warning("加载作息/生成日程失败: %s", e)
 
@@ -470,9 +473,6 @@ class ChatController:
         """
         if not self._engine:
             raise RuntimeError("引擎未初始化，请先调用 start()")
-
-        # 推进空间状态到当前时间
-        self._engine._space_state.advance(datetime.now(_TIMEZONE))
 
         idle_before = self._get_idle_seconds()
         self._user_turn_count += 1
@@ -621,18 +621,23 @@ class ChatController:
             if idle <= 30 or now <= self._next_proactive_at:
                 continue
 
-            # 午夜日程刷新
+            # 午夜日程刷新（run_in_executor 避免阻塞事件循环）
             if self._routine and self._engine:
                 now_dt = datetime.now(_TIMEZONE)
                 current_date = now_dt.strftime("%Y-%m-%d")
                 if self._engine._space_state.schedule_date != current_date:
                     try:
-                        self._engine.regenerate_daily_schedule(self._routine, now_dt.weekday(), current_date)
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, lambda: self._engine.regenerate_daily_schedule(
+                                self._routine, now_dt.weekday(), current_date),
+                        )
                     except Exception as e:
                         logger.warning("午夜日程刷新失败: %s", e)
 
-            # 空间检查：睡觉/上课时不主动发消息
+            # 推进空间状态到当前时间 → 再检查是否允许主动消息
             if self._engine:
+                self._engine.advance_space()
                 space_mods = self._engine.space_modifiers
                 if not space_mods.proactive_allowed:
                     continue
@@ -927,13 +932,18 @@ class ChatController:
         # 提取作息模板
         if on_progress:
             on_progress("正在提取日常作息模式...")
-        from remember_me.analyzer.routine import analyze_routine, DailyRoutine
-        routine = await loop.run_in_executor(None, lambda: analyze_routine(history))
-        routine_path = PROFILES_DIR / f"{target_name}_routine.json"
-        routine.save(routine_path)
-        slot_count = len(routine.weekday_slots) + len(routine.weekend_slots)
-        if on_progress:
-            on_progress(f"作息提取完成 — 识别到 {slot_count} 个日常时段")
+        try:
+            from remember_me.analyzer.routine import analyze_routine, DailyRoutine
+            routine = await loop.run_in_executor(None, lambda: analyze_routine(history))
+            routine_path = PROFILES_DIR / f"{target_name}_routine.json"
+            routine.save(routine_path)
+            slot_count = len(routine.weekday_slots) + len(routine.weekend_slots)
+            if on_progress:
+                on_progress(f"作息提取完成 — 识别到 {slot_count} 个日常时段")
+        except Exception as e:
+            logger.warning("作息提取失败: %s", e)
+            if on_progress:
+                on_progress(f"作息提取失败（不影响其他功能）: {e}")
 
         if on_progress:
             on_progress("正在提取关系记忆...")

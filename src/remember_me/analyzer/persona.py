@@ -626,16 +626,8 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         example_dialogues=example_dialogues,
         burst_examples=burst_examples,
         emotion_profile=emotion_profile,
-        daily_routine=_extract_routine_dict(history),
+        daily_routine={},  # 由 cli/controller 的 import 流程单独提取并保存
         style_summary=style_summary,
     )
 
 
-def _extract_routine_dict(history: ChatHistory) -> dict:
-    """提取作息模板并返回 dict（延迟导入避免循环依赖）。"""
-    try:
-        from remember_me.analyzer.routine import analyze_routine
-        routine = analyze_routine(history)
-        return routine.to_dict()
-    except Exception:
-        return {}

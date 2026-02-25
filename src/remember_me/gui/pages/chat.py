@@ -246,6 +246,9 @@ def create_chat_page(persona_name: str):
     async def _sync_space_location():
         """定期同步空间系统位置到像素房间（每 60 秒）。"""
         if controller._engine and not sending:
+            await asyncio.get_event_loop().run_in_executor(
+                None, controller._engine.advance_space,
+            )
             await pixel_room.set_location(controller._engine.current_location)
 
     ui.timer(60, _sync_space_location)

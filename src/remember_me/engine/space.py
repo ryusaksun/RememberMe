@@ -178,6 +178,16 @@ _RESPONSIVENESS_MAP = {
     "洗澡": "busy", "做饭": "eating", "吃饭": "eating",
     "休闲": "relaxing", "外出吃饭": "eating", "逛街": "relaxing",
     "外出": "relaxing", "吃午饭": "eating", "吃晚饭": "eating",
+    # 补充 LLM 可能生成的活动
+    "自习": "busy", "写作业": "busy", "复习": "busy", "考试": "busy",
+    "健身": "busy", "运动": "busy", "跑步": "busy",
+    "约会": "relaxing", "聚会": "relaxing", "和朋友": "relaxing",
+    "打游戏": "relaxing", "玩游戏": "relaxing", "看剧": "relaxing",
+    "看电影": "relaxing", "刷手机": "free", "发呆": "free",
+    "早餐": "eating", "吃早饭": "eating", "吃早餐": "eating",
+    "午休": "sleeping", "午睡": "sleeping", "小憩": "sleeping",
+    "购物": "relaxing", "买东西": "relaxing",
+    "工作": "busy", "加班": "busy", "实习": "busy",
 }
 
 
@@ -247,21 +257,24 @@ def generate_daily_schedule(
 
         entries = []
         for item in entries_data:
-            if not isinstance(item, dict):
-                continue
-            activity = str(item.get("activity", "休息"))
-            location = str(item.get("location", "bedroom"))
-            if location not in LOCATIONS:
-                location = "bedroom"
-            responsiveness = _RESPONSIVENESS_MAP.get(activity, "free")
-            entries.append(ScheduleEntry(
-                hour=int(item.get("hour", 0)) % 24,
-                minute=int(item.get("minute", 0)) % 60,
-                activity=activity,
-                location=location,
-                responsiveness=responsiveness,
-                context_hint=str(item.get("context_hint", "")),
-            ))
+            try:
+                if not isinstance(item, dict):
+                    continue
+                activity = str(item.get("activity", "休息"))
+                location = str(item.get("location", "bedroom"))
+                if location not in LOCATIONS:
+                    location = "bedroom"
+                responsiveness = _RESPONSIVENESS_MAP.get(activity, "free")
+                entries.append(ScheduleEntry(
+                    hour=int(item.get("hour", 0)) % 24,
+                    minute=int(item.get("minute", 0)) % 60,
+                    activity=activity,
+                    location=location,
+                    responsiveness=responsiveness,
+                    context_hint=str(item.get("context_hint", "")),
+                ))
+            except (TypeError, ValueError, KeyError) as exc:
+                logger.debug("跳过无效日程条目 %s: %s", item, exc)
 
         if entries:
             entries.sort(key=lambda e: (e.hour, e.minute))
@@ -283,10 +296,11 @@ def _fallback_schedule(slots, routine) -> list[ScheduleEntry]:
         total_min = max(0, min(23 * 60 + 59, total_min))
         hour = total_min // 60
         minute = total_min % 60
+        location = s.location if s.location in LOCATIONS else "bedroom"
         responsiveness = _RESPONSIVENESS_MAP.get(s.activity, "free")
         entries.append(ScheduleEntry(
             hour=hour, minute=minute,
-            activity=s.activity, location=s.location,
+            activity=s.activity, location=location,
             responsiveness=responsiveness,
             context_hint="",
         ))
@@ -295,11 +309,11 @@ def _fallback_schedule(slots, routine) -> list[ScheduleEntry]:
 
 
 def _default_schedule(routine) -> list[ScheduleEntry]:
-    """最小默认日程。"""
+    """最小默认日程（按时间排序，覆盖全天）。"""
     sleep_start = getattr(routine, "sleep_start", 1)
     sleep_end = getattr(routine, "sleep_end", 8)
-    return [
-        ScheduleEntry(hour=sleep_start, minute=0, activity="睡觉",
+    entries = [
+        ScheduleEntry(hour=0, minute=0, activity="睡觉",
                        location="bedroom", responsiveness="sleeping"),
         ScheduleEntry(hour=sleep_end, minute=30, activity="起床",
                        location="bedroom", responsiveness="free",
@@ -316,3 +330,5 @@ def _default_schedule(routine) -> list[ScheduleEntry]:
         ScheduleEntry(hour=sleep_start, minute=0, activity="睡觉",
                        location="bedroom", responsiveness="sleeping"),
     ]
+    entries.sort(key=lambda e: e.hour * 60 + e.minute)
+    return entries

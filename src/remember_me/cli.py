@@ -178,6 +178,23 @@ def chat(name: str, api_key: str | None, no_greet: bool):
     session_loaded = engine.load_session(session_path)
     history_start_index = len(engine._history)
 
+    # 加载作息模板 → 生成今日日程
+    _cli_routine = None
+    from remember_me.analyzer.routine import DailyRoutine
+    routine_path = PROFILES_DIR / f"{name}_routine.json"
+    if routine_path.exists():
+        try:
+            _cli_routine = DailyRoutine.load(routine_path)
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            _tz = _ZI(os.environ.get("TZ", "Asia/Shanghai"))
+            _now = _dt.now(_tz)
+            _date_str = _now.strftime("%Y-%m-%d")
+            if not engine._space_state.schedule or engine._space_state.schedule_date != _date_str:
+                engine.regenerate_daily_schedule(_cli_routine, _now.weekday(), _date_str)
+        except Exception as e:
+            logger.debug("加载作息/生成日程失败: %s", e)
+
     # 加载历史消息数
     from remember_me.importers.base import ChatHistory
     history_path = HISTORY_DIR / f"{name}.json"
