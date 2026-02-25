@@ -186,9 +186,18 @@ class RhythmPolicy:
 _REASONING_LEAK_RE = re.compile(
     r'[\s"\')}\]\.\-,;:。！？…—]+[A-Z][a-zA-Z\s,\'\"\-\*\(\)\.!?;:]{8,}$'
 )
+# 尾部数字标注：LLM 有时输出 " (7)、"(7)、(7) 等内部计数/评分
+_TRAILING_ANNOTATION_RE = re.compile(r'["\u201c\u201d]?\s*\(\d+\)\s*$')
 _MONOLOGUE_LEAK_RE = re.compile(
     r"(?i)(internal\s+monologue|chain\s*of\s*thought|thought\s*process|"
-    r"reasoning(?:\s*trace|\s*process)?|/trial|trial\)\*\*|思考过程|推理过程|内心独白)"
+    r"reasoning(?:\s*trace|\s*process)?|/trial|trial\)\*\*|思考过程|推理过程|内心独白|"
+    r"refining\s+for\s+constraints|adjusting\s+(?:tone|style|response)|"
+    r"considering\s+the\s+(?:context|user|persona|constraint))"
+)
+# Markdown italic 包裹的 LLM 元注释：*Refining...*, *Note:*, *Response:* 等
+_META_COMMENTARY_RE = re.compile(
+    r"(?i)^\s*\*+\s*(?:refin|consider|adjust|note|response|thinking|planning|"
+    r"constraint|approach|revis|generat|output|deliver|craft|maintain|keep)"
 )
 _MESSAGE_LINE_RE = re.compile(r"(?is).*?message\s*\d+\s*[:：]\s*")
 _PROMPT_LEAK_STRUCT_RE = re.compile(r"(?m)(^\s*##\s*|^\s*[-*]\s+|\*\*[^*]{2,}\*\*)")
@@ -220,6 +229,8 @@ def _clean_reasoning_leak(msg: str) -> str:
         if candidate and not _MONOLOGUE_LEAK_RE.search(candidate):
             return candidate
         return ""
+    # 剥离尾部数字标注：如 老子继续躺着了" (7) → 老子继续躺着了
+    msg = _TRAILING_ANNOTATION_RE.sub("", msg).rstrip()
     m = _REASONING_LEAK_RE.search(msg)
     if m:
         cleaned = msg[:m.start()].strip()
@@ -250,6 +261,9 @@ def _is_reasoning_leak_msg(msg: str) -> bool:
     if _MONOLOGUE_LEAK_RE.search(stripped):
         return True
     if _is_prompt_leak_msg(stripped):
+        return True
+    # 0) Markdown italic 包裹的元注释：*Refining...*、*Note:* 等
+    if _META_COMMENTARY_RE.search(stripped):
         return True
     # 1) 纯英文消息（中文 persona 不应发纯英文，但短消息如 "OK" 不过滤）
     non_ascii = sum(1 for c in stripped if ord(c) > 127)
