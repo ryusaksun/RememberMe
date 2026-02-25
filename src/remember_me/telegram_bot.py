@@ -169,6 +169,21 @@ class TelegramBot:
         now = datetime.now(TIMEZONE)
         today = now.date()
 
+        # 优先选 routine 中空闲的时段
+        routine_path = PROFILES_DIR / f"{PERSONA_NAME}_routine.json"
+        if routine_path.exists():
+            try:
+                from remember_me.analyzer.routine import DailyRoutine
+                routine = DailyRoutine.load(routine_path)
+                slots = routine.weekend_slots if now.weekday() >= 5 else routine.weekday_slots
+                free_hours = [s.hour for s in slots if s.responsiveness >= 0.7]
+                if free_hours:
+                    preferred = [h for h in active_hours if h in free_hours]
+                    if preferred:
+                        active_hours = preferred
+            except Exception:
+                pass
+
         # 从 active_hours 中随机选 count 个不同的小时
         chosen_hours = random.sample(active_hours, min(count, len(active_hours)))
 
@@ -203,6 +218,14 @@ class TelegramBot:
                         logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
                     # 触发知识库每日更新
                     self._track_task(asyncio.create_task(self._update_knowledge()), "daily_knowledge_update")
+                    # 刷新空间日程
+                    if self._controller and self._controller._routine and self._controller._engine:
+                        try:
+                            self._controller._engine.regenerate_daily_schedule(
+                                self._controller._routine, now.weekday(), today_str,
+                            )
+                        except Exception as e:
+                            logger.warning("每日空间日程刷新失败: %s", e)
 
                 # 检查是否到了计划时刻（每次最多触发 1 条，避免连发）
                 remaining = []
@@ -769,12 +792,14 @@ class TelegramBot:
         if not msgs:
             return
 
-        # 获取情绪驱动的延迟系数
+        # 获取情绪+空间驱动的延迟系数
         delay_factor = 1.0
         engine = None
         if self._controller and self._controller._engine:
             engine = self._controller._engine
             delay_factor = engine.reply_delay_factor
+            space_mods = engine.space_modifiers
+            delay_factor = min(6.0, delay_factor * space_mods.reply_delay_factor)
 
         for i, msg in enumerate(msgs):
             # 第一条也加延迟，区分正常回复 / 主动接话

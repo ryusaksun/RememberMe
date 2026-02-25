@@ -80,6 +80,9 @@ class Persona:
     # 情绪画像（用于情绪系统基线）
     emotion_profile: dict = field(default_factory=dict)
 
+    # 作息模板（用于空间/日程系统）
+    daily_routine: dict = field(default_factory=dict)
+
     # 综合描述
     style_summary: str = ""
 
@@ -623,5 +626,16 @@ def analyze(history: ChatHistory, max_examples: int = 30) -> Persona:
         example_dialogues=example_dialogues,
         burst_examples=burst_examples,
         emotion_profile=emotion_profile,
+        daily_routine=_extract_routine_dict(history),
         style_summary=style_summary,
     )
+
+
+def _extract_routine_dict(history: ChatHistory) -> dict:
+    """提取作息模板并返回 dict（延迟导入避免循环依赖）。"""
+    try:
+        from remember_me.analyzer.routine import analyze_routine
+        routine = analyze_routine(history)
+        return routine.to_dict()
+    except Exception:
+        return {}

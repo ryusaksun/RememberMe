@@ -45,6 +45,12 @@ class PixelRoom:
             f'if(window.pixelRoomSetState) window.pixelRoomSetState("{state}")'
         )
 
+    async def set_location(self, location: str):
+        """根据空间系统位置更新角色所在房间和状态。"""
+        await ui.run_javascript(
+            f'if(window.pixelRoomSetLocation) window.pixelRoomSetLocation("{location}")'
+        )
+
 
 # ---------------------------------------------------------------------------
 # JS 动画引擎（内嵌）— Floor796 风格侧视截面公寓 v2
@@ -1621,7 +1627,7 @@ function drawCharReading(x,y,dir){
 function drawChar(){
   var CS=1.5; /* Character scale factor */
   var breathe=0;
-  if(!ch.moving&&(ch.pose==='stand'||ch.pose==='sit'||ch.pose==='sitThink'||ch.pose==='readSofa')){
+  if(!ch.moving&&(ch.pose==='stand'||ch.pose==='sit'||ch.pose==='sitThink'||ch.pose==='readSofa')&&ch.state!=='away'){
     breathe=Math.sin(envT*2.6)*0.8;
   }
   var ix=Math.round(ch.x),iy=Math.round(ch.y)+ch.jumpOff+breathe;
@@ -2068,6 +2074,10 @@ function setState(s){
     case'sleeping':ch.path=buildPath('bedroom',260,UF);ch.pathIdx=0;ch.moving=true;ch.bubble='zzz';updateLabel('sleeping...');break;
     case'reading':ch.path=buildPath('living',180,LF);ch.pathIdx=0;ch.moving=true;updateLabel('reading...');break;
     case'excited':ch.pose='stand';ch.jumpT=0;ch.bubble='!';updateLabel('excited!');break;
+    case'cooking':ch.path=buildPath('kitchen',CX+CW+200,LF);ch.pathIdx=0;ch.moving=true;updateLabel('cooking...');break;
+    case'showering':ch.path=buildPath('bathroom',CX+CW+150,UF);ch.pathIdx=0;ch.moving=true;ch.bubble='~';updateLabel('showering...');break;
+    case'watching_tv':ch.path=buildPath('living',180,LF);ch.pathIdx=0;ch.moving=true;updateLabel('watching tv...');break;
+    case'away':ch.path=[{x:-30,y:ch.y}];ch.pathIdx=0;ch.moving=true;updateLabel('away...');break;
   }
 }
 function isTypingFieldFocused(){
@@ -2107,6 +2117,10 @@ function update(dt){
         else if(ch.state==='thinking'){ch.pose='sitThink';ch.dir=0;ch.y=UF-20;}
         else if(ch.state==='sleeping'){ch.x=260;ch.y=UF-18;ch.pose='sleep';}
         else if(ch.state==='reading'){ch.y=LF-16;ch.pose='readSofa';ch.dir=0;}
+        else if(ch.state==='cooking'){ch.pose='stand';ch.dir=1;}
+        else if(ch.state==='showering'){ch.pose='stand';ch.dir=0;}
+        else if(ch.state==='watching_tv'){ch.y=LF-16;ch.pose='readSofa';ch.dir=0;}
+        else if(ch.state==='away'){ch.pose='stand';ch.moving=false;}
       }
     }else{
       var spd=ch.speed*dt;ch.x+=(dx/dist)*Math.min(spd,dist);ch.y+=(dy/dist)*Math.min(spd,dist);
@@ -2118,10 +2132,12 @@ function update(dt){
     var t=randomIdleTarget();ch.path=buildPath(t.room,t.x,t.y);ch.pathIdx=0;ch.moving=true;}}
   if(ch.state==='excited'){ch.jumpT+=dt;ch.jumpOff=Math.round(Math.sin(ch.jumpT*8)*5);}
   var idle=simMs-ch.lastAct;
-  if(ch.state==='idle'&&idle>60000)setState('reading');
+  var lockedStates={'cooking':1,'showering':1,'watching_tv':1,'away':1};
+  if(ch.state==='idle'&&idle>60000&&!lockedStates[ch.state])setState('reading');
   else if(ch.state==='reading'&&idle>180000)setState('sleeping');
   if(ch.state==='sleeping'&&!ch.moving)ch.bubble='z'.repeat((Math.floor(ch.sTimer*1.5)%3)+1);
   if(ch.state==='thinking')ch.bubble='.'.repeat((Math.floor(ch.sTimer*2)%3)+1);
+  if(ch.state==='showering'&&!ch.moving)ch.bubble='~'.repeat((Math.floor(ch.sTimer*1.2)%3)+1);
   /* Cat */
   if(cat.state==='idle'){cat.waitT-=dt;if(cat.waitT<=0){
     if(rand()<0.3){cat.state='sleep';cat.sleepT=5+rand()*8;}
@@ -2242,6 +2258,15 @@ function loop(t){
 setState('idle');
 requestAnimationFrame(function(t){last=t;rafId=requestAnimationFrame(loop);});
 window.pixelRoomSetState=function(s){setState(s);};
+window.pixelRoomSetLocation=function(loc){
+  var map={
+    'bedroom':'idle','living_room':'watching_tv','kitchen':'cooking',
+    'bathroom':'showering','school':'away','work':'away',
+    'commute':'away','outside_dining':'away','outside_shopping':'away','outside_other':'away'
+  };
+  var st=map[loc]||'idle';
+  setState(st);
+};
 window.pixelRoomSetSeed=function(seed){return setSeed(seed);};
 window.pixelRoomGetSnapshot=function(){return getSnapshotObject();};
 window.render_game_to_text=function(){return renderGameToText();};

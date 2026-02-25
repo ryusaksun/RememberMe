@@ -9,6 +9,8 @@ import os
 import random
 import re
 import time
+import zoneinfo
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +30,7 @@ HISTORY_DIR = DATA_DIR / "history"
 SESSIONS_DIR = DATA_DIR / "sessions"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 
+_TIMEZONE = zoneinfo.ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
 _SESSION_PHASES = {"warmup", "normal", "deep_talk", "cooldown", "ending"}
 _ENDING_RE = re.compile(
     r"(再见|拜拜|bye|晚安|睡了|去忙|不聊了|回头聊|先这样|先撤|下次聊)", re.I,
@@ -74,6 +77,7 @@ class ChatController:
         self._consecutive_proactive = 0  # 连续主动消息计数（用户回复后归零）
         self._last_interaction_type: str = "none"  # "reply" | "proactive" | "none"
         self._fresh_session = True  # 新开 GUI 页面，跳过 is_conversation_ended 检查
+        self._routine = None  # DailyRoutine（作息模板）
         self._session_phase = "warmup"
         self._user_turn_count = 0
         self._phase_updated_at = 0.0
@@ -378,6 +382,19 @@ class ChatController:
         self._engine.set_session_phase(self._session_phase)
         self._phase_updated_at = time.time()
 
+        # 加载作息模板 → 生成今日日程
+        from remember_me.analyzer.routine import DailyRoutine
+        routine_path = PROFILES_DIR / f"{self._name}_routine.json"
+        if routine_path.exists():
+            try:
+                self._routine = DailyRoutine.load(routine_path)
+                now_dt = datetime.now(_TIMEZONE)
+                date_str = now_dt.strftime("%Y-%m-%d")
+                if not self._engine._space_state.schedule or self._engine._space_state.schedule_date != date_str:
+                    self._engine.regenerate_daily_schedule(self._routine, now_dt.weekday(), date_str)
+            except Exception as e:
+                logger.warning("加载作息/生成日程失败: %s", e)
+
         self._topic_starter = TopicStarter(persona=persona, client=self._engine.client)
         self._has_topics = bool(getattr(persona, "topic_interests", None))
 
@@ -453,6 +470,9 @@ class ChatController:
         """
         if not self._engine:
             raise RuntimeError("引擎未初始化，请先调用 start()")
+
+        # 推进空间状态到当前时间
+        self._engine._space_state.advance(datetime.now(_TIMEZONE))
 
         idle_before = self._get_idle_seconds()
         self._user_turn_count += 1
@@ -600,6 +620,22 @@ class ChatController:
             self._set_phase(self._derive_phase_from_idle(idle), reason="idle")
             if idle <= 30 or now <= self._next_proactive_at:
                 continue
+
+            # 午夜日程刷新
+            if self._routine and self._engine:
+                now_dt = datetime.now(_TIMEZONE)
+                current_date = now_dt.strftime("%Y-%m-%d")
+                if self._engine._space_state.schedule_date != current_date:
+                    try:
+                        self._engine.regenerate_daily_schedule(self._routine, now_dt.weekday(), current_date)
+                    except Exception as e:
+                        logger.warning("午夜日程刷新失败: %s", e)
+
+            # 空间检查：睡觉/上课时不主动发消息
+            if self._engine:
+                space_mods = self._engine.space_modifiers
+                if not space_mods.proactive_allowed:
+                    continue
             if self._session_phase == "ending":
                 continue
             # 新 GUI 会话跳过"对话已结束"检查（用户主动打开页面说明想聊）
@@ -710,6 +746,10 @@ class ChatController:
                     factor = getattr(self._engine, "proactive_cooldown_factor", 1.0) if self._engine else 1.0
                     if isinstance(factor, (int, float)) and factor > 0:
                         cooldown *= factor
+                    # 叠加空间冷却因子
+                    if self._engine:
+                        s_factor = self._engine.space_modifiers.proactive_cooldown_factor
+                        cooldown *= s_factor
                     self._next_proactive_at = now + cooldown
                     self._set_phase("cooldown", reason="proactive_sent")
                     self._emit_metric(
@@ -883,6 +923,17 @@ class ChatController:
 
         if on_progress:
             on_progress(f"人格分析完成 — {persona.style_summary[:60]}")
+
+        # 提取作息模板
+        if on_progress:
+            on_progress("正在提取日常作息模式...")
+        from remember_me.analyzer.routine import analyze_routine, DailyRoutine
+        routine = await loop.run_in_executor(None, lambda: analyze_routine(history))
+        routine_path = PROFILES_DIR / f"{target_name}_routine.json"
+        routine.save(routine_path)
+        slot_count = len(routine.weekday_slots) + len(routine.weekend_slots)
+        if on_progress:
+            on_progress(f"作息提取完成 — 识别到 {slot_count} 个日常时段")
 
         if on_progress:
             on_progress("正在提取关系记忆...")

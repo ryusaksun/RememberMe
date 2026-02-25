@@ -80,6 +80,15 @@ def import_chat(file: str, fmt: str, target: str, user: str | None):
     console.print(f"  [green]✓[/] 人格分析完成")
     console.print(f"    说话风格: {persona.style_summary}")
 
+    # 提取作息模板
+    with console.status("  [dim]正在提取日常作息模式...[/]"):
+        from remember_me.analyzer.routine import analyze_routine
+        routine = analyze_routine(history)
+        routine_path = PROFILES_DIR / f"{target}_routine.json"
+        routine.save(routine_path)
+    slot_count = len(routine.weekday_slots) + len(routine.weekend_slots)
+    console.print(f"  [green]✓[/] 作息提取完成 — {slot_count} 个时段")
+
     # 重建核心记忆快照（导入历史是唯一真源）
     governance = MemoryGovernance(target, data_dir=DATA_DIR)
     governance.bootstrap_core_from_persona(persona, force=True)

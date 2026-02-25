@@ -164,17 +164,24 @@ def create_chat_page(persona_name: str):
                     )
                 await _scroll_bottom()
 
-            # 像素房间：回复完成 → excited 或 idle
+            # 像素房间：回复完成 → excited 或恢复空间位置
             if is_excited:
                 await pixel_room.update_state("excited")
                 await asyncio.sleep(2.0)
-            await pixel_room.update_state("idle")
+            # 恢复到空间系统对应的位置状态
+            if controller._engine:
+                await pixel_room.set_location(controller._engine.current_location)
+            else:
+                await pixel_room.update_state("idle")
 
         except Exception as e:
             with messages_container:
                 render_system_message(f"出错了: {e}")
             await _scroll_bottom()
-            await pixel_room.update_state("idle")
+            if controller._engine:
+                await pixel_room.set_location(controller._engine.current_location)
+            else:
+                await pixel_room.update_state("idle")
         finally:
             sending = False
 
@@ -225,13 +232,23 @@ def create_chat_page(persona_name: str):
                             is_burst_continuation=(i > 0),
                         )
                     await _scroll_bottom()
-                # 主动消息显示完毕 → idle
-                await pixel_room.update_state("idle")
+                # 主动消息显示完毕 → 恢复空间位置
+                if controller._engine:
+                    await pixel_room.set_location(controller._engine.current_location)
+                else:
+                    await pixel_room.update_state("idle")
             except queue.Empty:
                 pass
 
     # 每 0.3 秒轮询队列（在 NiceGUI 上下文中执行，安全操作 UI）
     ui.timer(0.3, _poll_queues)
+
+    async def _sync_space_location():
+        """定期同步空间系统位置到像素房间（每 60 秒）。"""
+        if controller._engine and not sending:
+            await pixel_room.set_location(controller._engine.current_location)
+
+    ui.timer(60, _sync_space_location)
 
     async def _scroll_bottom():
         await asyncio.sleep(0.05)
@@ -256,6 +273,9 @@ def create_chat_page(persona_name: str):
                 )
                 render_system_message("输入消息开始对话")
             await _scroll_bottom()
+            # 初始化像素房间到当前空间位置
+            if controller._engine:
+                await pixel_room.set_location(controller._engine.current_location)
         except Exception as e:
             with messages_container:
                 render_system_message(f"初始化失败: {e}")
