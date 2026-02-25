@@ -94,7 +94,7 @@ def _extract_text(msg: dict, target_name: str = "") -> str | None:
         song = payload.get("song", {})
         name = song.get("name", "未知歌曲")
         artists = song.get("artists", [])
-        artist = artists[0].get("name", "") if artists else ""
+        artist = artists[0].get("name", "") if artists and isinstance(artists[0], dict) else ""
         if artist:
             return f"[分享歌曲] {name} - {artist}"
         return f"[分享歌曲] {name}"

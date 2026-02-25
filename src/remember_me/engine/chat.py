@@ -870,8 +870,8 @@ class ChatEngine:
         recent_model = [h for h in self._history[-6:] if h.role == "model"]
         if len(recent_model) < 2:
             return False
-        lengths = [len(h.parts[0].text) for h in recent_model if h.parts]
-        return sum(lengths) / len(lengths) < 10
+        lengths = [len(h.parts[0].text) for h in recent_model if h.parts and getattr(h.parts[0], "text", None)]
+        return bool(lengths) and sum(lengths) / len(lengths) < 10
 
     def get_recent_context(self) -> str:
         """获取最近几轮对话的文本，供外部判断当前话题。"""

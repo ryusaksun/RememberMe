@@ -113,7 +113,7 @@ def create_chat_page(persona_name: str):
 
                 ui.icon("send", size="22px").style(
                     f"color: {NEON_CYAN}; cursor: pointer; flex-shrink: 0;"
-                ).on("click", lambda: _handle_send())
+                ).on("click", _handle_send)
 
     # ── 事件处理 ──
     async def _handle_send():
@@ -179,7 +179,7 @@ def create_chat_page(persona_name: str):
             sending = False
 
     # 回车发送
-    input_ref.on("keydown.enter", lambda: _handle_send())
+    input_ref.on("keydown.enter", _handle_send)
 
     def _on_message(msgs: list[str], msg_type: str):
         """回调：收到主动消息或开场消息（可能从后台 task 调用，通过队列传递）。"""

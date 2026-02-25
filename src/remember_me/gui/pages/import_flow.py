@@ -75,6 +75,14 @@ def create_import_page():
 
             async def on_upload(e: events.UploadEventArguments):
                 nonlocal uploaded_path
+                # 清理上一次上传的临时文件（防止多次上传泄漏）
+                if uploaded_path:
+                    import os
+                    try:
+                        os.unlink(uploaded_path)
+                    except OSError:
+                        pass
+                    uploaded_path = None
                 # NiceGUI 3.x: e.file 是 FileUpload 对象，.read() 是 async
                 import tempfile
                 data = await e.file.read()
@@ -115,6 +123,7 @@ def create_import_page():
             )
 
         async def _run_import():
+            nonlocal uploaded_path
             target = target_input.value.strip() if target_input.value else ""
             user = user_input.value.strip() if user_input.value else None
             fmt = fmt_select.value
@@ -154,7 +163,6 @@ def create_import_page():
                 import_btn.enable()
             finally:
                 # 清理上传的临时文件并重置路径
-                nonlocal uploaded_path
                 if uploaded_path:
                     import os
                     try:

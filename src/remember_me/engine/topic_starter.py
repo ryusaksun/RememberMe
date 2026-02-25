@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 import re as _re
+import threading
 from datetime import date
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ class TopicStarter:
         self._last_proactive: list[str] = []
         self._followup_count = 0
         self._proactive_count = 0
+        self._state_lock = threading.Lock()
         self._chase_ratio = getattr(persona, "chase_ratio", 0.0)
         avg_burst = getattr(persona, "avg_burst_length", 1.0)
         # 综合评分：chase_ratio 为主，avg_burst_length 为辅
@@ -108,22 +110,26 @@ class TopicStarter:
     def prefetch(self):
         """后台预生成消息，不修改任何状态。"""
         # 保存并恢复状态，防止 generate() 的副作用
-        saved_last = self._last_proactive
-        saved_followup = self._followup_count
-        saved_proactive = self._proactive_count
-        self._cached = self.generate()
-        self._last_proactive = saved_last
-        self._followup_count = saved_followup
-        self._proactive_count = saved_proactive
+        with self._state_lock:
+            saved_last = self._last_proactive
+            saved_followup = self._followup_count
+            saved_proactive = self._proactive_count
+        result = self.generate()
+        with self._state_lock:
+            self._cached = result
+            self._last_proactive = saved_last
+            self._followup_count = saved_followup
+            self._proactive_count = saved_proactive
 
     def pop_cached(self) -> list[str] | None:
-        cached = self._cached
-        self._cached = None
-        if cached:
-            self._last_proactive = cached
-            self._followup_count = 0
-            self._proactive_count += 1
-        return cached
+        with self._state_lock:
+            cached = self._cached
+            self._cached = None
+            if cached:
+                self._last_proactive = cached
+                self._followup_count = 0
+                self._proactive_count += 1
+            return cached
 
     def pick_topic(self) -> str | None:
         interests = self._persona.topic_interests
@@ -263,9 +269,10 @@ class TopicStarter:
             user_input=recent_context,
         )
         if msgs:
-            self._last_proactive = msgs
-            self._followup_count = 0
-            self._proactive_count += 1
+            with self._state_lock:
+                self._last_proactive = msgs
+                self._followup_count = 0
+                self._proactive_count += 1
         return msgs
 
     def should_send_proactive(self) -> bool:
@@ -295,9 +302,10 @@ class TopicStarter:
             user_input=recent_context,
         )
         if msgs:
-            self._last_proactive = msgs
-            self._followup_count = 0
-            self._proactive_count += 1
+            with self._state_lock:
+                self._last_proactive = msgs
+                self._followup_count = 0
+                self._proactive_count += 1
         return msgs
 
     def generate_followup(
@@ -371,9 +379,10 @@ class TopicStarter:
             user_input=event_context,
         )
         if msgs:
-            self._last_proactive = msgs
-            self._followup_count = 0
-            self._proactive_count += 1
+            with self._state_lock:
+                self._last_proactive = msgs
+                self._followup_count = 0
+                self._proactive_count += 1
         return msgs
 
     def generate_relationship_followup(
@@ -446,12 +455,14 @@ class TopicStarter:
             user_input=recent_context or fact_content,
         )
         if msgs:
-            self._last_proactive = msgs
-            self._followup_count = 0
-            self._proactive_count += 1
+            with self._state_lock:
+                self._last_proactive = msgs
+                self._followup_count = 0
+                self._proactive_count += 1
         return msgs
 
     def on_user_replied(self):
-        self._followup_count = 0
-        self._last_proactive = []
-        self._proactive_count = 0
+        with self._state_lock:
+            self._followup_count = 0
+            self._last_proactive = []
+            self._proactive_count = 0

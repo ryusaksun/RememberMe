@@ -344,13 +344,12 @@ class TelegramBot:
                 logger.info("每日消息生成为空")
                 return
 
-            # 注入对话历史
-            controller._engine.inject_proactive_message(msgs)
-            controller._update_activity()
-
-            # 发送到 Telegram
-            bot = self._app.bot
-            await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
+            # 注入对话历史并发送（加锁防止与 send_message 并发修改 engine 状态）
+            async with self._send_lock:
+                controller._engine.inject_proactive_message(msgs)
+                controller._update_activity()
+                bot = self._app.bot
+                await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
             logger.info("每日主动消息已发送: %d 条", len(msgs))
 
         except Exception as e:
