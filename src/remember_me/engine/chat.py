@@ -93,7 +93,7 @@ def _build_system_prompt(persona: Persona) -> str:
 
     # ── 连发格式 ──
     burst_ratio = getattr(persona, "burst_ratio", 0)
-    avg_burst_length = getattr(persona, "avg_burst_length", 1.0)
+    avg_burst_length = float(getattr(persona, "avg_burst_length", 1.0) or 1.0)
     burst_examples = getattr(persona, "burst_examples", [])
 
     if burst_ratio > 0.2:

@@ -268,7 +268,7 @@ class MemoryGovernance:
 
         if _OVERRIDE_CUE_RE.search(msg):
             tokens = self._core_tokens()
-            if any(tok and tok in msg for tok in tokens):
+            if any(tok and len(tok) >= 3 and tok in msg for tok in tokens):
                 return ConflictResult(True, "试图覆盖导入历史的核心表达")
 
         return ConflictResult(False, "")

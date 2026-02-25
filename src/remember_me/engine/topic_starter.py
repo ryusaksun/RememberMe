@@ -97,7 +97,7 @@ class TopicStarter:
         self._proactive_count = 0
         self._state_lock = threading.Lock()
         self._chase_ratio = getattr(persona, "chase_ratio", 0.0)
-        avg_burst = getattr(persona, "avg_burst_length", 1.0)
+        avg_burst = float(getattr(persona, "avg_burst_length", 1.0) or 1.0)
         # 综合评分：chase_ratio 为主，avg_burst_length 为辅
         chase_score = self._chase_ratio * 0.7 + min((avg_burst - 1) * 0.1, 0.3)
         if chase_score < 0.05:
@@ -276,7 +276,8 @@ class TopicStarter:
         return msgs
 
     def should_send_proactive(self) -> bool:
-        return self._proactive_count < self._max_proactive_per_silence
+        with self._state_lock:
+            return self._proactive_count < self._max_proactive_per_silence
 
     def generate_checkin(
         self,

@@ -318,7 +318,7 @@ class EmotionState:
         具体发几条由 LLM 根据对话内容自行判断，这里只给合理范围。
         """
         # persona 基线
-        base = getattr(persona, "avg_burst_length", 2.0)
+        base = float(getattr(persona, "avg_burst_length", 2.0) or 2.0)
 
         # 情绪系数：兴奋话多 ×1.5，低落话少 ×0.5
         mods = self.get_modifiers(persona)

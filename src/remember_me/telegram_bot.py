@@ -143,8 +143,8 @@ class TelegramBot:
         persona = Persona.load(profile_path)
         return {
             "active_hours": getattr(persona, "active_hours", []),
-            "chase_ratio": getattr(persona, "chase_ratio", 0.0),
-            "avg_burst_length": getattr(persona, "avg_burst_length", 1.0),
+            "chase_ratio": float(getattr(persona, "chase_ratio", 0.0) or 0.0),
+            "avg_burst_length": float(getattr(persona, "avg_burst_length", 1.0) or 1.0),
         }
 
     # ── 每日调度 ──
