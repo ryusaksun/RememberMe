@@ -172,6 +172,25 @@ def test_relationship_store_manual_confirm_reject_supports_large_fact_set(tmp_pa
     assert any(f.id == target and f.status == "rejected" for f in store.list_facts(limit=600))
 
 
+def test_relationship_store_get_fact_by_id(tmp_path) -> None:
+    store = RelationshipMemoryStore("小明", data_dir=tmp_path)
+    store.upsert_facts([
+        RelationshipFact(
+            id="rel_x",
+            type="shared_event",
+            subject="both",
+            content="共同经历 X",
+            evidence=["证据 X"],
+            confidence=0.7,
+            status="candidate",
+        )
+    ])
+    fact = store.get_fact_by_id("rel_x")
+    assert fact is not None
+    assert fact.id == "rel_x"
+    assert store.get_fact_by_id("not_exists") is None
+
+
 def test_relationship_extractor_rules_and_conflict_filter() -> None:
     history = ChatHistory(
         target_name="小明",

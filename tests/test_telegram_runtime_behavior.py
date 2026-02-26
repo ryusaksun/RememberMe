@@ -462,6 +462,76 @@ def test_note_rel_confirm_uses_last_list_index_cache() -> None:
     asyncio.run(_run())
 
 
+def test_note_rel_confirm_cache_uses_direct_id_lookup_not_limited_list() -> None:
+    class _Fact:
+        def __init__(self, fid: str, status: str, content: str):
+            self.id = fid
+            self.status = status
+            self.content = content
+            self.type = "shared_event"
+            self.confidence = 0.8
+            self.evidence = []
+
+    class _Store:
+        def __init__(self):
+            self.rows = [_Fact(f"rel_{i}", "candidate", f"候选 {i}") for i in range(600)]
+            self.rows.append(_Fact("rel_target", "rejected", "目标记录"))
+            self.confirmed: list[str] = []
+
+        def list_facts(self, **kwargs):
+            statuses = kwargs.get("statuses")
+            limit = int(kwargs.get("limit", 50))
+            rows = list(self.rows)
+            if statuses:
+                rows = [x for x in rows if x.status in statuses]
+            # 模拟分页截断：全量查询时 target 在 500 之后会被截断
+            return rows[:limit]
+
+        def get_fact_by_id(self, fact_id: str):
+            for row in self.rows:
+                if row.id == fact_id:
+                    return row
+            return None
+
+        def confirm_fact(self, ref):
+            self.confirmed.append(str(ref))
+            return True
+
+        def reject_fact(self, ref, reason: str = "manual_reject"):
+            return True
+
+    class _Msg:
+        def __init__(self, text: str):
+            self.text = text
+            self.replies: list[str] = []
+
+        async def reply_text(self, text: str):
+            self.replies.append(text)
+
+    store = _Store()
+    bot = TelegramBot("token")
+    bot._get_relationship_store = lambda: store  # type: ignore[assignment]
+
+    async def _run():
+        msg_list = _Msg("/note rel list rejected")
+        upd_list = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_list,
+        )
+        await bot._cmd_note(upd_list, SimpleNamespace())
+        assert msg_list.replies and "目标记录" in msg_list.replies[-1]
+
+        msg_confirm = _Msg("/note rel confirm 1")
+        upd_confirm = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_confirm,
+        )
+        await bot._cmd_note(upd_confirm, SimpleNamespace())
+        assert store.confirmed == ["rel_target"]
+
+    asyncio.run(_run())
+
+
 def test_daily_proactive_uses_rhythm_policy() -> None:
     class _FakeEngine:
         def __init__(self):
@@ -679,6 +749,9 @@ def test_daily_event_followup_not_mark_done_when_delivery_failed() -> None:
             self.done_ids.append(event_id)
 
     class _FakeEngine:
+        def __init__(self):
+            self.injected: list[str] | None = None
+
         def plan_rhythm_policy(self, *, kind: str, user_input: str = ""):
             return SimpleNamespace(
                 min_count=1,
@@ -694,7 +767,7 @@ def test_daily_event_followup_not_mark_done_when_delivery_failed() -> None:
             return "压缩上下文"
 
         def inject_proactive_message(self, msgs: list[str]):
-            return None
+            self.injected = list(msgs)
 
     class _FakeStarter:
         def generate_event_followup(self, *_args, **_kwargs):
@@ -730,6 +803,7 @@ def test_daily_event_followup_not_mark_done_when_delivery_failed() -> None:
     ok = asyncio.run(bot._try_send_daily_message())
     assert ok is False
     assert tracker.done_ids == []
+    assert bot._controller._engine.injected is None
 
 
 def test_telegram_proactive_signature_dedup_supports_near_match() -> None:
@@ -802,6 +876,47 @@ def test_ensure_session_on_message_skip_proactive_when_user_active() -> None:
 
     asyncio.run(_run())
     assert delivered["n"] == 0
+
+
+def test_ensure_session_on_message_rolls_back_proactive_on_delivery_failure() -> None:
+    class _FakeController:
+        def __init__(self, persona_name: str):
+            self.persona_name = persona_name
+            self.session_loaded = False
+            self.rollback_calls: list[list[str]] = []
+
+        async def start(self, on_message, on_typing=None, no_greet: bool = False):
+            on_message(["在吗"], "proactive")
+
+        def rollback_proactive_delivery(self, msgs: list[str], *, reason: str = "delivery_failed"):
+            self.rollback_calls.append(list(msgs))
+            return True
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            return None
+
+    async def _run():
+        bot = TelegramBot("token")
+        bot._app = SimpleNamespace(bot=_FakeBot())
+        bot._last_user_activity = 0.0
+
+        async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+            raise RuntimeError("send failed")
+
+        bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+        original = tg_mod.ChatController
+        try:
+            tg_mod.ChatController = _FakeController  # type: ignore[assignment]
+            ok = await bot._ensure_session(chat_id=123)
+            assert ok
+            await asyncio.sleep(0.05)
+            assert bot._controller.rollback_calls == [["在吗"]]
+        finally:
+            tg_mod.ChatController = original  # type: ignore[assignment]
+
+    asyncio.run(_run())
 
 
 def test_split_telegram_text_respects_limit() -> None:

@@ -171,6 +171,39 @@ class ChatController:
         self._prune_proactive_signatures(window_seconds=1800)
         self._recent_proactive_signatures.append((time.time(), sig))
 
+    def _unmark_proactive_sent(self, msgs: list[str]) -> bool:
+        sig = self._build_proactive_signature(msgs)
+        if not sig:
+            return False
+        for idx in range(len(self._recent_proactive_signatures) - 1, -1, -1):
+            if self._recent_proactive_signatures[idx][1] == sig:
+                del self._recent_proactive_signatures[idx]
+                return True
+        return False
+
+    def rollback_proactive_delivery(self, msgs: list[str], *, reason: str = "delivery_failed") -> bool:
+        """下游发送失败时，回滚主动消息注入与节奏状态。"""
+        rolled_history = False
+        if self._engine and hasattr(self._engine, "rollback_last_proactive_message"):
+            try:
+                rolled_history = bool(self._engine.rollback_last_proactive_message(msgs))
+            except Exception:
+                rolled_history = False
+        self._unmark_proactive_sent(msgs)
+        if self._consecutive_proactive > 0:
+            self._consecutive_proactive -= 1
+        if self._last_interaction_type == "proactive":
+            self._last_interaction_type = "reply"
+        now = time.time()
+        if self._next_proactive_at <= 0 or self._next_proactive_at > now + 90:
+            self._next_proactive_at = now + 90
+        self._emit_metric(
+            "proactive_delivery_rollback",
+            rolled_history=bool(rolled_history),
+            reason=reason,
+        )
+        return rolled_history
+
     def _build_outbound_system(self, user_input: str = "") -> str | None:
         engine = self._engine
         if not engine or not hasattr(engine, "build_system_for_generation"):

@@ -470,6 +470,15 @@ class RelationshipMemoryStore:
                 return fact
         return None
 
+    def get_fact_by_id(self, fact_id: str) -> RelationshipFact | None:
+        target = str(fact_id or "").strip()
+        if not target:
+            return None
+        for fact in self._facts:
+            if fact.id == target:
+                return fact
+        return None
+
     def confirm_fact(self, ref: str | int) -> bool:
         rows = self._sort_rows(self._facts)
         target = self._resolve_ref(ref, rows)

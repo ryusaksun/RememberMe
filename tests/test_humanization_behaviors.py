@@ -126,6 +126,18 @@ def test_chat_engine_human_noise_layer(monkeypatch) -> None:
     assert out[1].startswith("打错字了，")
 
 
+def test_chat_engine_rolls_back_injected_proactive_message() -> None:
+    engine = ChatEngine.__new__(ChatEngine)
+    engine._history = [
+        SimpleNamespace(role="user", parts=[SimpleNamespace(text="你好")]),
+        SimpleNamespace(role="model", parts=[SimpleNamespace(text="在吗|||忙完了吗")]),
+    ]
+
+    ok = engine.rollback_last_proactive_message(["在吗", "忙完了吗"])
+    assert ok
+    assert len(engine._history) == 1
+
+
 def test_chat_engine_generate_content_with_retry_on_transient_error(monkeypatch) -> None:
     class _TransientErr(Exception):
         pass
@@ -343,6 +355,31 @@ def test_memory_search_reranks_by_recency_but_returns_raw_distance() -> None:
 def test_profile_bounds_fallback_on_non_dict_profile() -> None:
     c = ChatController("x")
     assert c._profile_bounds([1], (20, 45), 0.1, 0.2, 45, 90) == (20, 45)
+
+
+def test_controller_rollback_proactive_delivery_resets_state() -> None:
+    class _FakeEngine:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def rollback_last_proactive_message(self, msgs: list[str]):
+            self.calls.append(list(msgs))
+            return True
+
+    c = ChatController("x")
+    c._engine = _FakeEngine()
+    c._consecutive_proactive = 2
+    c._last_interaction_type = "proactive"
+    c._next_proactive_at = time.time() + 600
+    c._recent_proactive_signatures = [(time.time(), c._build_proactive_signature(["在吗"]))]
+
+    rolled = c.rollback_proactive_delivery(["在吗"], reason="test")
+    assert rolled is True
+    assert c._engine.calls == [["在吗"]]
+    assert c._consecutive_proactive == 1
+    assert c._last_interaction_type == "reply"
+    assert c._next_proactive_at <= time.time() + 95
+    assert c._recent_proactive_signatures == []
 
 
 def test_chat_delay_sampling_fallback_on_non_dict_profile() -> None:

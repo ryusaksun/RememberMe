@@ -737,10 +737,10 @@ class TelegramBot:
 
             # 注入对话历史并发送（加锁防止与 send_message 并发修改 engine 状态）
             async with self._send_lock:
-                controller._engine.inject_proactive_message(msgs)
-                controller._update_activity()
                 bot = self._app.bot
                 await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
+                controller._engine.inject_proactive_message(msgs)
+                controller._update_activity()
                 self._mark_proactive_sent(msgs)
                 if event_to_mark_done and controller._event_tracker:
                     controller._event_tracker.mark_done(event_to_mark_done)
@@ -771,21 +771,41 @@ class TelegramBot:
                 clean = [m for m in (msgs or []) if m and str(m).strip()]
                 if not clean:
                     return
-                async with self._send_lock:
-                    if not self._controller or self._chat_id != chat_id:
-                        return
-                    if is_followup and time.time() - self._last_user_activity < 8:
-                        logger.info("主动消息跳过：用户刚有输入活动")
-                        return
-                    if is_followup and self._is_duplicate_proactive(clean):
-                        logger.info("主动消息跳过：命中 Telegram 去重")
-                        return
-                    await self._deliver_messages(
-                        bot, chat_id, clean,
-                        first_delay_phase="followup" if is_followup else "first",
-                    )
-                    if is_followup:
-                        self._mark_proactive_sent(clean)
+                try:
+                    async with self._send_lock:
+                        if not self._controller or self._chat_id != chat_id:
+                            return
+                        if is_followup and time.time() - self._last_user_activity < 8:
+                            logger.info("主动消息跳过：用户刚有输入活动")
+                            return
+                        if is_followup and self._is_duplicate_proactive(clean):
+                            logger.info("主动消息跳过：命中 Telegram 去重")
+                            return
+                        await self._deliver_messages(
+                            bot, chat_id, clean,
+                            first_delay_phase="followup" if is_followup else "first",
+                        )
+                        if is_followup:
+                            self._mark_proactive_sent(clean)
+                except Exception as e:
+                    rolled_back = False
+                    if is_followup and self._controller:
+                        controller = self._controller
+                        rollback_fn = getattr(controller, "rollback_proactive_delivery", None)
+                        if callable(rollback_fn):
+                            with contextlib.suppress(Exception):
+                                rolled_back = bool(
+                                    rollback_fn(clean, reason="telegram_send_failed")
+                                )
+                        elif getattr(controller, "_engine", None):
+                            with contextlib.suppress(Exception):
+                                rolled_back = bool(
+                                    controller._engine.rollback_last_proactive_message(clean)
+                                )
+                    if rolled_back:
+                        logger.warning("主动消息发送失败，已回滚未送达消息: %s", e)
+                    else:
+                        logger.warning("消息发送失败: %s", e)
 
             self._track_task(asyncio.create_task(_deliver_task()), f"deliver_{msg_type}")
 
@@ -889,14 +909,20 @@ class TelegramBot:
             if idx > len(cached_ids):
                 return None, f"序号超出范围（1-{len(cached_ids)}）。"
             target_id = cached_ids[idx - 1]
-            rows = store.list_facts(
-                statuses={"candidate", "confirmed", "rejected"},
-                include_conflict=True,
-                limit=500,
-            )
-            for fact in rows:
-                if fact.id == target_id:
+            finder = getattr(store, "get_fact_by_id", None)
+            if callable(finder):
+                fact = finder(target_id)
+                if fact:
                     return fact, None
+            else:
+                rows = store.list_facts(
+                    statuses={"candidate", "confirmed", "rejected"},
+                    include_conflict=True,
+                    limit=2000,
+                )
+                for fact in rows:
+                    if fact.id == target_id:
+                        return fact, None
             return None, "该序号对应记录已变化，请先 /note rel list 刷新后重试。"
 
         rows = store.list_facts(

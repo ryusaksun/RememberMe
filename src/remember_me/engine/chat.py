@@ -986,6 +986,26 @@ class ChatEngine:
         )
         self._trim_history()
 
+    def rollback_last_proactive_message(self, messages: list[str], max_scan: int = 8) -> bool:
+        """发送失败时，回滚最近一次注入但未送达的主动消息。"""
+        raw = _MSG_SEPARATOR.join(messages)
+        if not raw or not self._history:
+            return False
+        end = len(self._history) - 1
+        start = max(0, end - max(1, int(max_scan)) + 1)
+        for idx in range(end, start - 1, -1):
+            item = self._history[idx]
+            if getattr(item, "role", "") != "model":
+                continue
+            parts = getattr(item, "parts", None) or []
+            text = ""
+            if parts and getattr(parts[0], "text", None):
+                text = str(parts[0].text)
+            if text == raw:
+                del self._history[idx]
+                return True
+        return False
+
     def detect_cold_chat(self) -> bool:
         """检测最近对话是否冷场（回复越来越短）。"""
         if len(self._history) < 6:
