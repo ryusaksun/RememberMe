@@ -554,6 +554,11 @@ def test_split_reply_filters_rhythm_meta_leak_fragments() -> None:
     assert _split_reply(f"{leaked_1}|||{leaked_2}|||那你刚吃啥了") == ["那你刚吃啥了"]
 
 
+def test_split_reply_strips_char_count_fragments() -> None:
+    raw = "老子下午就在家躺|||着打王者啊 (1|||3 chars)"
+    assert _split_reply(raw) == ["老子下午就在家躺", "着打王者啊"]
+
+
 def test_sanitize_reply_messages_uses_safe_fallback_for_prompt_leak_only() -> None:
     leaked = "* **角色设定**: 我是「小明」\n* **规则**: 绝不承认是 AI"
     assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
@@ -562,6 +567,10 @@ def test_sanitize_reply_messages_uses_safe_fallback_for_prompt_leak_only() -> No
 def test_sanitize_reply_messages_uses_safe_fallback_for_rhythm_meta_only() -> None:
     leaked = "回复2-4条?|||-> 设定为2条。* 单条大约4"
     assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
+
+
+def test_sanitize_reply_messages_drops_pure_char_count_fragment() -> None:
+    assert _sanitize_reply_messages("在家躺着|||3 chars)") == ["在家躺着"]
 
 
 def test_messages_to_history_text_uses_visible_text_only() -> None:

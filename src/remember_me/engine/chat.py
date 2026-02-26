@@ -189,6 +189,9 @@ _REASONING_LEAK_RE = re.compile(
 )
 # 尾部数字标注：LLM 有时输出 " (7)、"(7)、(7) 等内部计数/评分
 _TRAILING_ANNOTATION_RE = re.compile(r'["\u201c\u201d]?\s*\(\d+\)\s*$')
+_TRAILING_CHAR_COUNT_RE = re.compile(r"(?i)\s*(?:\(|（)?\d+\s*chars?\)?\s*$")
+_TRAILING_BROKEN_COUNT_PREFIX_RE = re.compile(r"\s*(?:\(|（)\d+\s*$")
+_PURE_CHAR_COUNT_FRAGMENT_RE = re.compile(r"(?i)^\s*\d+\s*chars?\)?\s*$")
 _MONOLOGUE_LEAK_RE = re.compile(
     r"(?i)(internal\s+monologue|chain\s*of\s*thought|thought\s*process|"
     r"reasoning(?:\s*trace|\s*process)?|/trial|trial\)\*\*|思考过程|推理过程|内心独白|"
@@ -244,6 +247,9 @@ def _clean_reasoning_leak(msg: str) -> str:
         return ""
     # 剥离尾部数字标注：如 老子继续躺着了" (7) → 老子继续躺着了
     msg = _TRAILING_ANNOTATION_RE.sub("", msg).rstrip()
+    # 剥离尾部字符计数注释：如 "(13 chars)"，以及被截断的 "(1"
+    msg = _TRAILING_CHAR_COUNT_RE.sub("", msg).rstrip()
+    msg = _TRAILING_BROKEN_COUNT_PREFIX_RE.sub("", msg).rstrip()
     m = _REASONING_LEAK_RE.search(msg)
     if m:
         cleaned = msg[:m.start()].strip()
@@ -274,6 +280,10 @@ def _is_reasoning_leak_msg(msg: str) -> bool:
     if _MONOLOGUE_LEAK_RE.search(stripped):
         return True
     if _is_prompt_leak_msg(stripped):
+        return True
+    if _PURE_CHAR_COUNT_FRAGMENT_RE.match(stripped):
+        return True
+    if stripped.lower() in {"chars)", "char)", "(chars)", "(char)"}:
         return True
     # 0.5) 节奏约束元文本泄漏（如 "回复2-4条?"、"设定为2条。单条大约4"）
     if _RHYTHM_COUNT_LEAK_RE.match(stripped):
