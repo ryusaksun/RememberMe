@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -338,6 +339,41 @@ def test_embedding_function_lazy_init_is_thread_safe(monkeypatch) -> None:
         assert len({id(x) for x in results}) == 1
     finally:
         store_mod._ef_instance = original
+
+
+def test_memory_governance_concurrent_read_write_is_stable(tmp_path) -> None:
+    governance = MemoryGovernance("x", data_dir=tmp_path)
+    errors: list[Exception] = []
+
+    def _writer():
+        try:
+            for i in range(200):
+                governance.add_session_record(
+                    f"并发写入记录 {i}，用于稳定性测试",
+                    persist=False,
+                )
+        except Exception as e:  # pragma: no cover - 仅用于收集并发异常
+            errors.append(e)
+
+    def _reader():
+        try:
+            for _ in range(200):
+                governance.list_session_records(include_conflict=True)
+                governance.build_prompt_blocks()
+        except Exception as e:  # pragma: no cover - 仅用于收集并发异常
+            errors.append(e)
+
+    threads = [threading.Thread(target=_writer), threading.Thread(target=_reader)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+
+    governance.save()
+    payload = json.loads((tmp_path / "memories" / "x.json").read_text(encoding="utf-8"))
+    assert isinstance(payload.get("records"), list)
 
 
 def test_recency_bonus_prefers_recent_memory() -> None:

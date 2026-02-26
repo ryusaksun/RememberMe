@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -103,46 +104,49 @@ class MemoryGovernance:
         self._name = persona_name
         self._data_dir = Path(data_dir)
         self._path = self._data_dir / "memories" / f"{persona_name}.json"
+        self._lock = threading.RLock()
         self._records: list[MemoryRecord] = []
         self._core_profile_snapshot: dict = {}
         self._relationship_store: RelationshipMemoryStore | None = None
         self.load()
 
     def load(self):
-        if not self._path.exists():
-            self._records = []
-            self._core_profile_snapshot = {}
-            return
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                logger.warning("记忆治理数据格式错误：期望 dict，得到 %s", type(raw).__name__)
+        with self._lock:
+            if not self._path.exists():
                 self._records = []
                 self._core_profile_snapshot = {}
                 return
-            self._core_profile_snapshot = raw.get("core_profile_snapshot", {}) or {}
-            self._records = [
-                MemoryRecord.from_dict(item)
-                for item in (raw.get("records") or [])
-                if isinstance(item, dict)
-            ]
-        except Exception as e:
-            logger.warning("加载记忆治理数据失败: %s", e)
-            self._records = []
-            self._core_profile_snapshot = {}
+            try:
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    logger.warning("记忆治理数据格式错误：期望 dict，得到 %s", type(raw).__name__)
+                    self._records = []
+                    self._core_profile_snapshot = {}
+                    return
+                self._core_profile_snapshot = raw.get("core_profile_snapshot", {}) or {}
+                self._records = [
+                    MemoryRecord.from_dict(item)
+                    for item in (raw.get("records") or [])
+                    if isinstance(item, dict)
+                ]
+            except Exception as e:
+                logger.warning("加载记忆治理数据失败: %s", e)
+                self._records = []
+                self._core_profile_snapshot = {}
 
     def save(self):
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "persona_name": self._name,
-            "updated_at": _now_iso(),
-            "core_profile_snapshot": self._core_profile_snapshot,
-            "records": [asdict(r) for r in self._records],
-        }
-        self._path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with self._lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "persona_name": self._name,
+                "updated_at": _now_iso(),
+                "core_profile_snapshot": self._core_profile_snapshot,
+                "records": [asdict(r) for r in self._records],
+            }
+            self._path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     @staticmethod
     def _build_snapshot_from_persona(persona: Persona) -> dict:
@@ -199,103 +203,108 @@ class MemoryGovernance:
         return records
 
     def bootstrap_core_from_persona(self, persona: Persona, force: bool = False):
-        snapshot = self._build_snapshot_from_persona(persona)
-        existing_runtime = [
-            r for r in self._records
-            if r.source_type == "runtime_session" and not r.is_expired()
-        ]
-        existing_core = [r for r in self._records if r.source_type == "imported_history"]
-        if existing_core and not force:
-            if not self._core_profile_snapshot:
-                self._core_profile_snapshot = snapshot
-                self.save()
-            return
+        with self._lock:
+            snapshot = self._build_snapshot_from_persona(persona)
+            existing_runtime = [
+                r for r in self._records
+                if r.source_type == "runtime_session" and not r.is_expired()
+            ]
+            existing_core = [r for r in self._records if r.source_type == "imported_history"]
+            if existing_core and not force:
+                if not self._core_profile_snapshot:
+                    self._core_profile_snapshot = snapshot
+                    self.save()
+                return
 
-        self._core_profile_snapshot = snapshot
-        self._records = self._build_core_records(snapshot)
-        if not force:
-            self._records.extend(existing_runtime)
-        self.save()
+            self._core_profile_snapshot = snapshot
+            self._records = self._build_core_records(snapshot)
+            if not force:
+                self._records.extend(existing_runtime)
+            self.save()
 
     def ensure_core_from_persona(self, persona: Persona):
-        self.load()
-        has_core = any(r.source_type == "imported_history" for r in self._records)
-        if not has_core:
-            self.bootstrap_core_from_persona(persona, force=False)
-        elif not self._core_profile_snapshot:
-            self._core_profile_snapshot = self._build_snapshot_from_persona(persona)
-            self.save()
+        with self._lock:
+            self.load()
+            has_core = any(r.source_type == "imported_history" for r in self._records)
+            if not has_core:
+                self.bootstrap_core_from_persona(persona, force=False)
+            elif not self._core_profile_snapshot:
+                self._core_profile_snapshot = self._build_snapshot_from_persona(persona)
+                self.save()
 
     def cleanup_expired(self):
-        before = len(self._records)
-        self._records = [
-            r for r in self._records
-            if not (r.source_type == "runtime_session" and r.is_expired())
-        ]
-        if len(self._records) != before:
-            self.save()
+        with self._lock:
+            before = len(self._records)
+            self._records = [
+                r for r in self._records
+                if not (r.source_type == "runtime_session" and r.is_expired())
+            ]
+            if len(self._records) != before:
+                self.save()
 
     def _core_tokens(self) -> set[str]:
-        snapshot = self._core_profile_snapshot or {}
-        tokens: set[str] = set()
-        tokens |= _normalize_tokens(snapshot.get("catchphrases", []))
-        tokens |= _normalize_tokens(snapshot.get("tone_markers", []))
-        tokens |= _normalize_tokens(snapshot.get("self_references", []))
-        tokens |= _normalize_tokens((snapshot.get("topic_interests", {}) or {}).keys())
-        style = snapshot.get("style_summary", "")
-        if style:
-            tokens |= _normalize_tokens([style])
-        return {t for t in tokens if t}
+        with self._lock:
+            snapshot = self._core_profile_snapshot or {}
+            tokens: set[str] = set()
+            tokens |= _normalize_tokens(snapshot.get("catchphrases", []))
+            tokens |= _normalize_tokens(snapshot.get("tone_markers", []))
+            tokens |= _normalize_tokens(snapshot.get("self_references", []))
+            tokens |= _normalize_tokens((snapshot.get("topic_interests", {}) or {}).keys())
+            style = snapshot.get("style_summary", "")
+            if style:
+                tokens |= _normalize_tokens([style])
+            return {t for t in tokens if t}
 
     def validate_against_imported_history(
         self,
         text: str,
         persona: Persona | None = None,
     ) -> ConflictResult:
-        msg = (text or "").strip()
-        if not msg:
+        with self._lock:
+            msg = (text or "").strip()
+            if not msg:
+                return ConflictResult(False, "")
+            normalized = re.sub(r"\s+", "", msg).lower()
+
+            if persona and not self._core_profile_snapshot:
+                self._core_profile_snapshot = self._build_snapshot_from_persona(persona)
+
+            if _AI_IDENTITY_RE.search(msg) or any(
+                token in normalized
+                for token in (
+                    "你其实是ai",
+                    "你是ai",
+                    "你是人工智能",
+                    "你是机器人",
+                    "你只是程序",
+                    "你不是真人",
+                )
+            ):
+                return ConflictResult(True, "试图重写身份设定")
+
+            if _NO_SWEAR_RE.search(msg):
+                try:
+                    swear_ratio = float((self._core_profile_snapshot or {}).get("swear_ratio", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    swear_ratio = 0.0
+                if swear_ratio > 0.005:
+                    return ConflictResult(True, "试图改写导入历史中的语气习惯")
+
+            if _STYLE_FORBID_RE.search(msg):
+                snapshot = self._core_profile_snapshot or {}
+                style_tokens = set()
+                style_tokens |= _normalize_tokens(snapshot.get("catchphrases", []))
+                style_tokens |= _normalize_tokens(snapshot.get("tone_markers", []))
+                style_tokens |= _normalize_tokens(snapshot.get("self_references", []))
+                if any(tok and len(tok) >= 2 and tok in msg for tok in style_tokens):
+                    return ConflictResult(True, "试图禁用导入历史中的表达习惯")
+
+            if _OVERRIDE_CUE_RE.search(msg):
+                tokens = self._core_tokens()
+                if any(tok and len(tok) >= 2 and tok in msg for tok in tokens):
+                    return ConflictResult(True, "试图覆盖导入历史的核心表达")
+
             return ConflictResult(False, "")
-        normalized = re.sub(r"\s+", "", msg).lower()
-
-        if persona and not self._core_profile_snapshot:
-            self._core_profile_snapshot = self._build_snapshot_from_persona(persona)
-
-        if _AI_IDENTITY_RE.search(msg) or any(
-            token in normalized
-            for token in (
-                "你其实是ai",
-                "你是ai",
-                "你是人工智能",
-                "你是机器人",
-                "你只是程序",
-                "你不是真人",
-            )
-        ):
-            return ConflictResult(True, "试图重写身份设定")
-
-        if _NO_SWEAR_RE.search(msg):
-            try:
-                swear_ratio = float((self._core_profile_snapshot or {}).get("swear_ratio", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                swear_ratio = 0.0
-            if swear_ratio > 0.005:
-                return ConflictResult(True, "试图改写导入历史中的语气习惯")
-
-        if _STYLE_FORBID_RE.search(msg):
-            snapshot = self._core_profile_snapshot or {}
-            style_tokens = set()
-            style_tokens |= _normalize_tokens(snapshot.get("catchphrases", []))
-            style_tokens |= _normalize_tokens(snapshot.get("tone_markers", []))
-            style_tokens |= _normalize_tokens(snapshot.get("self_references", []))
-            if any(tok and len(tok) >= 2 and tok in msg for tok in style_tokens):
-                return ConflictResult(True, "试图禁用导入历史中的表达习惯")
-
-        if _OVERRIDE_CUE_RE.search(msg):
-            tokens = self._core_tokens()
-            if any(tok and len(tok) >= 2 and tok in msg for tok in tokens):
-                return ConflictResult(True, "试图覆盖导入历史的核心表达")
-
-        return ConflictResult(False, "")
 
     def validate_relationship_fact(
         self,
@@ -331,27 +340,29 @@ class MemoryGovernance:
         return ConflictResult(False, "")
 
     def list_core_records(self) -> list[MemoryRecord]:
-        return [
-            r for r in self._records
-            if r.source_type == "imported_history" and r.type == "core"
-        ]
+        with self._lock:
+            return [
+                r for r in self._records
+                if r.source_type == "imported_history" and r.type == "core"
+            ]
 
     def list_session_records(
         self,
         tag: str | None = None,
         include_conflict: bool = True,
     ) -> list[MemoryRecord]:
-        self.cleanup_expired()
-        records = [
-            r for r in self._records
-            if r.source_type == "runtime_session" and r.type == "session"
-        ]
-        if tag:
-            records = [r for r in records if tag in (r.tags or [])]
-        if not include_conflict:
-            records = [r for r in records if not r.conflict_with_history]
-        records.sort(key=lambda x: x.updated_at, reverse=True)
-        return records
+        with self._lock:
+            self.cleanup_expired()
+            records = [
+                r for r in self._records
+                if r.source_type == "runtime_session" and r.type == "session"
+            ]
+            if tag:
+                records = [r for r in records if tag in (r.tags or [])]
+            if not include_conflict:
+                records = [r for r in records if not r.conflict_with_history]
+            records.sort(key=lambda x: x.updated_at, reverse=True)
+            return records
 
     def add_session_record(
         self,
@@ -363,40 +374,41 @@ class MemoryGovernance:
         confidence: float = 0.55,
         persist: bool = True,
     ) -> MemoryRecord | None:
-        message = (text or "").strip()
-        if not message or len(message) < 4 or _TRIVIAL_SESSION_RE.match(message):
-            return None
+        with self._lock:
+            message = (text or "").strip()
+            if not message or len(message) < 4 or _TRIVIAL_SESSION_RE.match(message):
+                return None
 
-        # 去重：避免同一句短时间重复写入（扩大窗口覆盖更长时间段）
-        recent = self.list_session_records(include_conflict=True)[:50]
-        if any(r.text == message for r in recent):
-            return None
+            # 去重：避免同一句短时间重复写入（扩大窗口覆盖更长时间段）
+            recent = self.list_session_records(include_conflict=True)[:50]
+            if any(r.text == message for r in recent):
+                return None
 
-        verdict = self.validate_against_imported_history(message, persona=persona)
-        now = datetime.now()
-        expires_at = ""
-        if ttl_seconds and ttl_seconds > 0:
-            expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
+            verdict = self.validate_against_imported_history(message, persona=persona)
+            now = datetime.now()
+            expires_at = ""
+            if ttl_seconds and ttl_seconds > 0:
+                expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
 
-        record = MemoryRecord(
-            id=f"sess_{uuid.uuid4().hex[:10]}",
-            type="session",
-            text=message,
-            source_type="runtime_session",
-            locked=False,
-            conflict_with_history=verdict.conflict,
-            conflict_reason=verdict.reason,
-            confidence=max(0.0, min(1.0, confidence)),
-            tags=list(tags or ["runtime"]),
-            ttl_seconds=ttl_seconds,
-            created_at=now.isoformat(),
-            updated_at=now.isoformat(),
-            expires_at=expires_at,
-        )
-        self._records.append(record)
-        if persist:
-            self.save()
-        return record
+            record = MemoryRecord(
+                id=f"sess_{uuid.uuid4().hex[:10]}",
+                type="session",
+                text=message,
+                source_type="runtime_session",
+                locked=False,
+                conflict_with_history=verdict.conflict,
+                conflict_reason=verdict.reason,
+                confidence=max(0.0, min(1.0, confidence)),
+                tags=list(tags or ["runtime"]),
+                ttl_seconds=ttl_seconds,
+                created_at=now.isoformat(),
+                updated_at=now.isoformat(),
+                expires_at=expires_at,
+            )
+            self._records.append(record)
+            if persist:
+                self.save()
+            return record
 
     def filter_messages_for_long_term(
         self,
@@ -427,39 +439,41 @@ class MemoryGovernance:
         return filtered
 
     def replace_manual_notes(self, notes: list[str], persona: Persona | None = None):
-        self.cleanup_expired()
-        keep = []
-        for record in self._records:
-            if record.source_type == "runtime_session" and "manual" in (record.tags or []):
-                continue
-            keep.append(record)
-        self._records = keep
+        with self._lock:
+            self.cleanup_expired()
+            keep = []
+            for record in self._records:
+                if record.source_type == "runtime_session" and "manual" in (record.tags or []):
+                    continue
+                keep.append(record)
+            self._records = keep
 
-        for text in notes:
-            self.add_session_record(
-                text,
-                persona=persona,
-                ttl_seconds=None,
-                tags=["manual", "session_note"],
-                confidence=0.75,
-                persist=False,
-            )
-        self.save()
+            for text in notes:
+                self.add_session_record(
+                    text,
+                    persona=persona,
+                    ttl_seconds=None,
+                    tags=["manual", "session_note"],
+                    confidence=0.75,
+                    persist=False,
+                )
+            self.save()
 
     def list_manual_notes(self) -> list[MemoryRecord]:
         return self.list_session_records(tag="manual", include_conflict=True)
 
     def delete_manual_note_by_index(self, index: int) -> bool:
-        notes = self.list_manual_notes()
-        if index < 0 or index >= len(notes):
-            return False
-        target_id = notes[index].id
-        before = len(self._records)
-        self._records = [r for r in self._records if r.id != target_id]
-        changed = len(self._records) != before
-        if changed:
-            self.save()
-        return changed
+        with self._lock:
+            notes = self.list_manual_notes()
+            if index < 0 or index >= len(notes):
+                return False
+            target_id = notes[index].id
+            before = len(self._records)
+            self._records = [r for r in self._records if r.id != target_id]
+            changed = len(self._records) != before
+            if changed:
+                self.save()
+            return changed
 
     def build_prompt_blocks(
         self,
@@ -468,40 +482,42 @@ class MemoryGovernance:
         session_limit: int = 5,
         conflict_limit: int = 2,
     ) -> tuple[str, str, str]:
-        self.cleanup_expired()
-        core = self.list_core_records()[:core_limit]
-        session = self.list_session_records(include_conflict=False)[:session_limit]
-        conflicts = [
-            r for r in self.list_session_records(include_conflict=True)
-            if r.conflict_with_history
-        ][:conflict_limit]
+        with self._lock:
+            self.cleanup_expired()
+            core = self.list_core_records()[:core_limit]
+            session = self.list_session_records(include_conflict=False)[:session_limit]
+            conflicts = [
+                r for r in self.list_session_records(include_conflict=True)
+                if r.conflict_with_history
+            ][:conflict_limit]
 
-        core_block = ""
-        if core:
-            lines = ["## 导入聊天记录的核心事实（最高优先级，不可违背）"]
-            for record in core:
-                lines.append(f"- {record.text}")
-            core_block = "\n".join(lines)
+            core_block = ""
+            if core:
+                lines = ["## 导入聊天记录的核心事实（最高优先级，不可违背）"]
+                for record in core:
+                    lines.append(f"- {record.text}")
+                core_block = "\n".join(lines)
 
-        session_block = ""
-        if session:
-            lines = ["## 近期会话上下文（低优先级，可持续累积）"]
-            for record in session:
-                lines.append(f"- {record.text}")
-            session_block = "\n".join(lines)
+            session_block = ""
+            if session:
+                lines = ["## 近期会话上下文（低优先级，可持续累积）"]
+                for record in session:
+                    lines.append(f"- {record.text}")
+                session_block = "\n".join(lines)
 
-        conflict_block = ""
-        if conflicts:
-            lines = ["## 可能与导入历史冲突的新信息（仅参考，不得覆盖核心设定）"]
-            for record in conflicts:
-                reason = f"（{record.conflict_reason}）" if record.conflict_reason else ""
-                lines.append(f"- {record.text}{reason}")
-            conflict_block = "\n".join(lines)
+            conflict_block = ""
+            if conflicts:
+                lines = ["## 可能与导入历史冲突的新信息（仅参考，不得覆盖核心设定）"]
+                for record in conflicts:
+                    reason = f"（{record.conflict_reason}）" if record.conflict_reason else ""
+                    lines.append(f"- {record.text}{reason}")
+                conflict_block = "\n".join(lines)
 
-        return core_block, session_block, conflict_block
+            return core_block, session_block, conflict_block
 
     def set_relationship_store(self, store: RelationshipMemoryStore | None):
-        self._relationship_store = store
+        with self._lock:
+            self._relationship_store = store
 
     def build_relationship_block(self, limit: int = 10) -> str:
         if not self._relationship_store:
