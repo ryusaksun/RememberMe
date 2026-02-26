@@ -25,6 +25,14 @@ from remember_me.models import MODEL_LIGHT
 
 _SUMMARY_MODEL = MODEL_LIGHT
 _TOPIC_CONCURRENCY = 3
+_DYNAMIC_SITE_DOMAINS = (
+    "bilibili.com",
+    "b23.tv",
+    "douyin.com",
+    "tiktok.com",
+    "xiaohongshu.com",
+    "weibo.com",
+)
 
 
 def _extract_article(url: str) -> str | None:
@@ -41,6 +49,13 @@ def _extract_article(url: str) -> str | None:
     except Exception as e:
         logger.debug("文章提取失败 %s: %s", url, e)
         return None
+
+
+def _should_skip_full_extract(url: str) -> bool:
+    raw = (url or "").strip().lower()
+    if not raw:
+        return True
+    return any(domain in raw for domain in _DYNAMIC_SITE_DOMAINS)
 
 
 def _download_thumbnail(url: str, save_dir: Path, name_hint: str) -> str | None:
@@ -205,8 +220,12 @@ class KnowledgeFetcher:
             if not url:
                 continue
 
-            full_text = _extract_article(url)
-            time.sleep(1)  # 抓取间隔
+            if _should_skip_full_extract(url):
+                # 动态站点正文提取成功率低且噪音高，直接用搜索摘要降级。
+                full_text = r.get("description", "")
+            else:
+                full_text = _extract_article(url)
+                time.sleep(1)  # 抓取间隔
 
             if not full_text or len(full_text) < 50:
                 # 提取失败，用搜索描述作为 fallback
