@@ -399,6 +399,69 @@ def test_note_rel_list_confirm_reject_flow() -> None:
     asyncio.run(_run())
 
 
+def test_note_rel_confirm_uses_last_list_index_cache() -> None:
+    class _Fact:
+        def __init__(self, fid: str, status: str, content: str):
+            self.id = fid
+            self.status = status
+            self.content = content
+            self.type = "shared_event"
+            self.confidence = 0.8
+            self.evidence = []
+
+    class _Store:
+        def __init__(self):
+            self.rows = [
+                _Fact("rel_candidate", "candidate", "候选记录"),
+                _Fact("rel_rejected", "rejected", "被拒绝记录"),
+            ]
+            self.confirmed: list[str] = []
+
+        def list_facts(self, **kwargs):
+            statuses = kwargs.get("statuses")
+            if statuses:
+                return [x for x in self.rows if x.status in statuses]
+            return list(self.rows)
+
+        def confirm_fact(self, ref):
+            self.confirmed.append(str(ref))
+            return True
+
+        def reject_fact(self, ref, reason: str = "manual_reject"):
+            return True
+
+    class _Msg:
+        def __init__(self, text: str):
+            self.text = text
+            self.replies: list[str] = []
+
+        async def reply_text(self, text: str):
+            self.replies.append(text)
+
+    store = _Store()
+    bot = TelegramBot("token")
+    bot._get_relationship_store = lambda: store  # type: ignore[assignment]
+
+    async def _run():
+        msg_list = _Msg("/note rel list rejected")
+        upd_list = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_list,
+        )
+        await bot._cmd_note(upd_list, SimpleNamespace())
+        assert msg_list.replies and "被拒绝记录" in msg_list.replies[-1]
+
+        msg_confirm = _Msg("/note rel confirm 1")
+        upd_confirm = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_confirm,
+        )
+        await bot._cmd_note(upd_confirm, SimpleNamespace())
+        assert store.confirmed == ["rel_rejected"]
+
+    asyncio.run(_run())
+
+
 def test_daily_proactive_uses_rhythm_policy() -> None:
     class _FakeEngine:
         def __init__(self):
@@ -674,3 +737,71 @@ def test_plan_daily_times_filters_before_sampling_avoids_empty_plan(monkeypatch)
     times = bot._plan_daily_times()
     assert len(times) == 1
     assert times[0].hour == 8
+
+
+def test_daily_scheduler_requeues_slot_when_send_failed(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+
+    bot = TelegramBot("token")
+    bot._daily_date = "2026-02-26"
+    bot._daily_times = [_FixedDateTime(2026, 2, 26, 9, 50, tzinfo=tg_mod.TIMEZONE)]
+
+    async def _try_send():
+        return False
+
+    sleep_calls = {"n": 0}
+
+    async def _sleep(_seconds: float):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    bot._try_send_daily_message = _try_send  # type: ignore[assignment]
+    monkeypatch.setattr(tg_mod.asyncio, "sleep", _sleep)
+
+    try:
+        asyncio.run(bot._daily_scheduler())
+    except asyncio.CancelledError:
+        pass
+
+    assert len(bot._daily_times) == 1
+    assert bot._daily_times[0].hour == 10
+    assert bot._daily_times[0].minute == 10
+
+
+def test_daily_scheduler_consumes_slot_on_send_success(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+
+    bot = TelegramBot("token")
+    bot._daily_date = "2026-02-26"
+    bot._daily_times = [_FixedDateTime(2026, 2, 26, 9, 50, tzinfo=tg_mod.TIMEZONE)]
+
+    async def _try_send():
+        return True
+
+    sleep_calls = {"n": 0}
+
+    async def _sleep(_seconds: float):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    bot._try_send_daily_message = _try_send  # type: ignore[assignment]
+    monkeypatch.setattr(tg_mod.asyncio, "sleep", _sleep)
+
+    try:
+        asyncio.run(bot._daily_scheduler())
+    except asyncio.CancelledError:
+        pass
+
+    assert bot._daily_times == []

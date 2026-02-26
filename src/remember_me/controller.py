@@ -922,7 +922,14 @@ class ChatController:
         io_tasks = [t for t in (self._event_extract_task, self._relationship_extract_task)
                     if t and not t.done()]
         if io_tasks:
-            await asyncio.gather(*io_tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(io_tasks, timeout=5)
+            if pending:
+                logger.warning("停止会话时后台提取任务超时，强制取消: %d", len(pending))
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
         # 其余任务直接取消
         for task in (self._greeting_task, self._proactive_task):
             if task and not task.done():

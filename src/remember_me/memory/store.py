@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import logging
 import os
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -21,6 +24,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 _ef_instance: embedding_functions.SentenceTransformerEmbeddingFunction | None = None
+_ef_lock = threading.Lock()
 
 
 def _get_embedding_function() -> embedding_functions.SentenceTransformerEmbeddingFunction:
@@ -28,18 +32,15 @@ def _get_embedding_function() -> embedding_functions.SentenceTransformerEmbeddin
     global _ef_instance
     if _ef_instance is not None:
         return _ef_instance
-    import io
-    import sys
-    # 模型加载时 HF/safetensors 直接 print，临时重定向 stdout/stderr
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
-    try:
-        _ef_instance = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=_BGE_MODEL,
-        )
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
+    with _ef_lock:
+        if _ef_instance is not None:
+            return _ef_instance
+        # 模型加载时 HF/safetensors 可能直接 print，首次加载阶段临时静默。
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            _ef_instance = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=_BGE_MODEL,
+            )
     return _ef_instance
 
 from remember_me.importers.base import ChatHistory

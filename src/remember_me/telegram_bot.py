@@ -92,6 +92,7 @@ class TelegramBot:
         self._bg_tasks: set[asyncio.Task] = set()
         self._recent_proactive_signatures: list[tuple[float, str]] = []
         self._last_error_reply_at: float = 0.0
+        self._relationship_view_cache: dict[int, list[str]] = {}
 
     def _is_allowed(self, user_id: int) -> bool:
         if self._allowed_users is None:
@@ -543,14 +544,25 @@ class TelegramBot:
 
                 # 检查是否到了计划时刻（每次最多触发 1 条，避免连发）
                 remaining = []
-                sent = False
+                attempted = False
                 for planned_time in self._daily_times:
-                    if not sent and now >= planned_time:
-                        await self._try_send_daily_message()
-                        sent = True
-                    else:
-                        remaining.append(planned_time)
-                self._daily_times = remaining
+                    if not attempted and now >= planned_time:
+                        attempted = True
+                        consumed = await self._try_send_daily_message()
+                        if consumed:
+                            continue
+                        retry_at = now + timedelta(minutes=10)
+                        if retry_at.date() == planned_time.date():
+                            remaining.append(retry_at)
+                            logger.info(
+                                "每日消息发送未成功，时段延后到 %s 重试",
+                                retry_at.strftime("%H:%M"),
+                            )
+                        else:
+                            logger.info("每日消息发送未成功且已跨天，放弃本次时段")
+                        continue
+                    remaining.append(planned_time)
+                self._daily_times = sorted(remaining)
 
             except asyncio.CancelledError:
                 raise
@@ -610,8 +622,8 @@ class TelegramBot:
         except Exception as e:
             logger.exception("知识库更新失败: %s", e)
 
-    async def _try_send_daily_message(self):
-        """尝试发送每日主动消息。优先发送待跟进事件的追问。"""
+    async def _try_send_daily_message(self) -> bool:
+        """尝试发送每日主动消息。返回 True 表示当前时段可消费，False 表示应稍后重试。"""
         # 没有目标 chat_id（用户从未和 bot 交互过）
         async with self._send_lock:
             chat_id = self._chat_id
@@ -619,12 +631,12 @@ class TelegramBot:
                 chat_id = next(iter(self._allowed_users))
         if not chat_id:
             logger.info("每日消息跳过：无目标 chat_id")
-            return
+            return False
 
         # 最近 30 分钟有互动 → 跳过（已经在聊了）
         if self._last_user_activity and time.time() - self._last_user_activity < 1800:
             logger.info("每日消息跳过：最近 30 分钟有互动")
-            return
+            return True
 
         logger.info("发送每日主动消息...")
 
@@ -632,11 +644,11 @@ class TelegramBot:
             # 确保 session 存活
             ok = await self._ensure_session(chat_id, no_greet=True)
             if not ok:
-                return
+                return False
 
             controller = self._controller
             if not controller._engine or not controller._topic_starter:
-                return
+                return False
 
             loop = asyncio.get_event_loop()
             msgs = None
@@ -700,10 +712,10 @@ class TelegramBot:
             msgs = [m for m in (msgs or []) if m and m.strip()]
             if not msgs:
                 logger.info("每日消息生成为空")
-                return
+                return True
             if self._is_duplicate_proactive(msgs):
                 logger.info("每日消息跳过：与近期主动消息重复")
-                return
+                return True
 
             # 注入对话历史并发送（加锁防止与 send_message 并发修改 engine 状态）
             async with self._send_lock:
@@ -713,9 +725,11 @@ class TelegramBot:
                 await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
                 self._mark_proactive_sent(msgs)
             logger.info("每日主动消息已发送: %d 条", len(msgs))
+            return True
 
         except Exception as e:
             logger.exception("每日主动消息发送失败: %s", e)
+            return False
 
     # ── Session 管理 ──
 
@@ -824,6 +838,56 @@ class TelegramBot:
             suffix += f" 证据:{evidence[0][:20]}"
         return f"{idx}. [{status_label}][{type_label}] {content} {suffix}"
 
+    @staticmethod
+    def _effective_user_id(update: Update) -> int:
+        user = getattr(update, "effective_user", None)
+        user_id = getattr(user, "id", 0)
+        try:
+            return int(user_id)
+        except (TypeError, ValueError):
+            return 0
+
+    def _remember_relationship_view(self, user_id: int, rows: list[object]):
+        if user_id <= 0:
+            return
+        self._relationship_view_cache[user_id] = [
+            str(getattr(fact, "id", "") or "")
+            for fact in rows
+            if str(getattr(fact, "id", "") or "")
+        ]
+
+    def _pick_relationship_fact_by_index(
+        self,
+        store: RelationshipMemoryStore,
+        user_id: int,
+        idx: int,
+    ):
+        if idx < 1:
+            return None, "序号必须大于等于 1。"
+        cached_ids = self._relationship_view_cache.get(user_id) if user_id > 0 else None
+        if cached_ids:
+            if idx > len(cached_ids):
+                return None, f"序号超出范围（1-{len(cached_ids)}）。"
+            target_id = cached_ids[idx - 1]
+            rows = store.list_facts(
+                statuses={"candidate", "confirmed", "rejected"},
+                include_conflict=True,
+                limit=500,
+            )
+            for fact in rows:
+                if fact.id == target_id:
+                    return fact, None
+            return None, "该序号对应记录已变化，请先 /note rel list 刷新后重试。"
+
+        rows = store.list_facts(
+            statuses={"candidate", "confirmed"},
+            include_conflict=True,
+            limit=200,
+        )
+        if idx > len(rows):
+            return None, f"序号超出范围（1-{len(rows)}）。"
+        return rows[idx - 1], None
+
     async def _cmd_note_rel(self, update: Update, raw: str, parts: list[str]):
         if len(parts) < 3:
             await update.message.reply_text(
@@ -839,6 +903,7 @@ class TelegramBot:
         subcmd = parts[2].lower()
 
         if subcmd == "list":
+            user_id = self._effective_user_id(update)
             fact_type = None
             statuses = {"candidate", "confirmed"}
             include_conflict = False
@@ -864,8 +929,10 @@ class TelegramBot:
                 limit=50,
             )
             if not rows:
+                self._remember_relationship_view(user_id, [])
                 await update.message.reply_text("暂无关系记忆记录。")
                 return
+            self._remember_relationship_view(user_id, rows)
             lines = [self._format_relationship_item(i + 1, fact) for i, fact in enumerate(rows)]
             await update.message.reply_text("\n".join(lines))
             return
@@ -879,15 +946,11 @@ class TelegramBot:
             except ValueError:
                 await update.message.reply_text("序号必须是数字。")
                 return
-            rows = store.list_facts(
-                statuses={"candidate", "confirmed"},
-                include_conflict=True,
-                limit=200,
-            )
-            if idx < 1 or idx > len(rows):
-                await update.message.reply_text(f"序号超出范围（1-{len(rows)}）。")
+            user_id = self._effective_user_id(update)
+            fact, err = self._pick_relationship_fact_by_index(store, user_id, idx)
+            if not fact:
+                await update.message.reply_text(err or "未找到对应记录。")
                 return
-            fact = rows[idx - 1]
             ok = store.confirm_fact(fact.id)
             if not ok:
                 await update.message.reply_text("该记录无法确认（可能与核心人格冲突）。")
@@ -904,20 +967,16 @@ class TelegramBot:
             except ValueError:
                 await update.message.reply_text("序号必须是数字。")
                 return
-            rows = store.list_facts(
-                statuses={"candidate", "confirmed"},
-                include_conflict=True,
-                limit=200,
-            )
-            if idx < 1 or idx > len(rows):
-                await update.message.reply_text(f"序号超出范围（1-{len(rows)}）。")
+            user_id = self._effective_user_id(update)
+            fact, err = self._pick_relationship_fact_by_index(store, user_id, idx)
+            if not fact:
+                await update.message.reply_text(err or "未找到对应记录。")
                 return
             reason = ""
             if len(parts) >= 5:
                 reason = raw.split(None, 4)[4].strip()
             if not reason:
                 reason = "manual_reject"
-            fact = rows[idx - 1]
             store.reject_fact(fact.id, reason=f"manual:{reason}")
             await update.message.reply_text(f"已拒绝：{fact.content}")
             return

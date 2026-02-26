@@ -169,7 +169,7 @@ class PendingEventTracker:
             self._events.append(ev)
 
         if new_events:
-            self._evict_old()
+            self._evict_old(now=now)
             self._save()
             logger.info(
                 "提取到 %d 个待跟进事件: %s",
@@ -238,52 +238,53 @@ class PendingEventTracker:
         return False
 
     def get_due_events(self) -> list[PendingEvent]:
-        """获取已到追问时间的 pending 事件（同时淘汰过期事件）。"""
+        """获取已到追问时间的 pending 事件，并顺带清理过期/无效旧记录。"""
         now = datetime.now()
-        cutoff = now - timedelta(hours=_MAX_EVENT_AGE_HOURS)
+        changed = self._evict_old(now=now)
         due = []
-        evicted = False
         for e in self._events:
             if e.status != "pending":
                 continue
-            # 淘汰过期事件
-            try:
-                extracted = datetime.fromisoformat(e.extracted_at)
-                if extracted < cutoff:
-                    e.status = "expired"
-                    evicted = True
-                    continue
-            except ValueError:
-                pass
             try:
                 followup_at = datetime.fromisoformat(e.followup_after)
                 if followup_at <= now:
                     due.append(e)
             except ValueError:
                 continue
-        if evicted:
+        if changed:
             self._save()
         return due
 
     def mark_done(self, event_id: str):
         """标记事件为已完成。"""
+        changed = False
         for e in self._events:
             if e.id == event_id:
+                if e.status != "done":
+                    changed = True
                 e.status = "done"
                 break
-        self._save()
+        if self._evict_old() or changed:
+            self._save()
 
-    def _evict_old(self):
+    def _evict_old(self, now: datetime | None = None) -> bool:
         """清理过期事件。"""
-        now = datetime.now()
+        if now is None:
+            now = datetime.now()
         cutoff = now - timedelta(hours=_MAX_EVENT_AGE_HOURS)
         kept = []
+        changed = False
         for e in self._events:
             try:
                 extracted = datetime.fromisoformat(e.extracted_at)
                 if extracted < cutoff:
+                    changed = True
                     continue  # 太旧了，丢弃
             except ValueError:
-                pass
+                if e.status != "pending":
+                    changed = True
+                    continue
             kept.append(e)
-        self._events = kept
+        if changed:
+            self._events = kept
+        return changed

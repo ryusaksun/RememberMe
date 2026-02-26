@@ -204,6 +204,107 @@ def test_pending_event_duplicate_handles_none_context(tmp_path) -> None:
     assert tracker._is_duplicate("明天面试", None) is False
 
 
+def test_pending_event_get_due_events_evicts_old_done(tmp_path) -> None:
+    tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
+    now = datetime.now()
+    tracker._events = [
+        PendingEvent(
+            id="old_done",
+            event="旧事件",
+            context="",
+            followup_hint="",
+            followup_after=(now - timedelta(hours=80)).isoformat(),
+            extracted_at=(now - timedelta(hours=80)).isoformat(),
+            status="done",
+        ),
+        PendingEvent(
+            id="due_pending",
+            event="新事件",
+            context="",
+            followup_hint="",
+            followup_after=(now - timedelta(minutes=1)).isoformat(),
+            extracted_at=now.isoformat(),
+            status="pending",
+        ),
+    ]
+
+    due = tracker.get_due_events()
+    assert [e.id for e in due] == ["due_pending"]
+    assert [e.id for e in tracker._events] == ["due_pending"]
+
+
+def test_pending_event_mark_done_also_evicts_old_records(tmp_path) -> None:
+    tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
+    now = datetime.now()
+    tracker._events = [
+        PendingEvent(
+            id="old_pending",
+            event="过期事件",
+            context="",
+            followup_hint="",
+            followup_after=(now - timedelta(hours=80)).isoformat(),
+            extracted_at=(now - timedelta(hours=80)).isoformat(),
+            status="pending",
+        ),
+        PendingEvent(
+            id="active",
+            event="当前事件",
+            context="",
+            followup_hint="",
+            followup_after=(now + timedelta(minutes=10)).isoformat(),
+            extracted_at=now.isoformat(),
+            status="pending",
+        ),
+    ]
+
+    tracker.mark_done("active")
+    ids = [e.id for e in tracker._events]
+    assert ids == ["active"]
+    assert tracker._events[0].status == "done"
+
+
+def test_embedding_function_lazy_init_is_thread_safe(monkeypatch) -> None:
+    import time as pytime
+
+    import remember_me.memory.store as store_mod
+
+    calls = {"n": 0}
+    original = store_mod._ef_instance
+    store_mod._ef_instance = None
+
+    class _FakeEmbeddingFn:
+        def __init__(self, model_name: str):
+            pytime.sleep(0.01)
+            calls["n"] += 1
+            self.model_name = model_name
+
+        def __call__(self, texts):
+            return [[0.0] for _ in texts]
+
+    monkeypatch.setattr(
+        store_mod.embedding_functions,
+        "SentenceTransformerEmbeddingFunction",
+        _FakeEmbeddingFn,
+    )
+
+    try:
+        results = []
+
+        def _worker():
+            results.append(store_mod._get_embedding_function())
+
+        threads = [threading.Thread(target=_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert calls["n"] == 1
+        assert len({id(x) for x in results}) == 1
+    finally:
+        store_mod._ef_instance = original
+
+
 def test_recency_bonus_prefers_recent_memory() -> None:
     now = 1_000_000.0
     recent = _recency_bonus(999_900.0, now_ts=now)
