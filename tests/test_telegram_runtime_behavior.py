@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import time
+from datetime import timedelta
 from types import SimpleNamespace
 
 import remember_me.telegram_bot as tg_mod
@@ -68,6 +70,73 @@ def test_deliver_messages_uses_phase_delay_sampling() -> None:
 
     assert phase_calls[0] == "followup"
     assert "burst" in phase_calls
+
+
+def test_run_with_typing_heartbeat_repeats_until_task_done() -> None:
+    calls = {"typing": 0}
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            calls["typing"] += 1
+
+    async def _slow_reply():
+        await asyncio.sleep(0.03)
+        return ["ok"]
+
+    bot = TelegramBot("token")
+    bot.TYPING_HEARTBEAT_INTERVAL = 0.01
+
+    async def _run():
+        result = await bot._run_with_typing_heartbeat(_FakeBot(), 123, _slow_reply())
+        assert result == ["ok"]
+
+    asyncio.run(_run())
+    assert calls["typing"] >= 2
+
+
+def test_send_text_retries_on_retry_after(monkeypatch) -> None:
+    calls = {"send": 0}
+
+    class _FakeRetryAfter(Exception):
+        def __init__(self, seconds: int):
+            self._retry_after = timedelta(seconds=seconds)
+
+    monkeypatch.setattr(tg_mod, "RetryAfter", _FakeRetryAfter)
+
+    class _FakeBot:
+        async def send_message(self, chat_id: int, text: str):
+            calls["send"] += 1
+            if calls["send"] == 1:
+                raise _FakeRetryAfter(0)
+            return None
+
+    bot = TelegramBot("token")
+
+    asyncio.run(bot._send_text(_FakeBot(), 123, "hello"))
+    assert calls["send"] == 2
+
+
+def test_send_photo_retry_resets_stream_cursor(monkeypatch) -> None:
+    calls: list[bytes] = []
+
+    class _FakeRetryAfter(Exception):
+        def __init__(self, seconds: int):
+            self._retry_after = timedelta(seconds=seconds)
+
+    monkeypatch.setattr(tg_mod, "RetryAfter", _FakeRetryAfter)
+
+    class _FakeBot:
+        async def send_photo(self, chat_id: int, photo):
+            calls.append(photo.read())
+            if len(calls) == 1:
+                raise _FakeRetryAfter(0)
+            return None
+
+    bot = TelegramBot("token")
+    photo = io.BytesIO(b"fake_image_bytes")
+
+    asyncio.run(bot._send_photo(_FakeBot(), 123, photo))
+    assert calls == [b"fake_image_bytes", b"fake_image_bytes"]
 
 
 def test_flush_coalesce_skip_when_controller_closed() -> None:
@@ -260,6 +329,9 @@ def test_daily_proactive_uses_rhythm_policy() -> None:
                 allow_single_short_ack=False,
             )
 
+        def get_proactive_context(self, max_chars: int = 460) -> str:
+            return "压缩上下文"
+
         def get_recent_context(self) -> str:
             return "最近在聊游戏和工作"
 
@@ -305,7 +377,7 @@ def test_daily_proactive_uses_rhythm_policy() -> None:
 
     asyncio.run(bot._try_send_daily_message())
     assert starter.last_policy is not None
-    assert engine.policy_calls and engine.policy_calls[0][0] == "proactive"
+    assert engine.policy_calls and engine.policy_calls[0] == ("proactive", "压缩上下文")
     assert engine.injected == ["在吗"]
     assert delivered["msgs"] == ["在吗"]
 

@@ -92,6 +92,27 @@ def test_chat_engine_adds_open_thread_priority() -> None:
     assert "考试结果怎么样了" in system
 
 
+def test_chat_engine_builds_compact_proactive_context() -> None:
+    engine = ChatEngine.__new__(ChatEngine)
+    engine._persona = Persona(name="小明")
+    engine._history = [
+        SimpleNamespace(role="user", parts=[SimpleNamespace(text="明天体检结果要出了，我有点紧张")]),
+        SimpleNamespace(role="model", parts=[SimpleNamespace(text="别慌，到时候你把结果发我看看")]),
+        SimpleNamespace(role="user", parts=[SimpleNamespace(text="行，那我先去睡了")]),
+    ]
+    engine._state_lock = threading.Lock()
+    engine._scratchpad = Scratchpad(
+        open_threads=["体检结果什么时候出"],
+        facts=["对方明天有体检结果"],
+    )
+    engine._emotion_state = EmotionState()
+
+    context = engine.get_proactive_context(max_chars=180)
+    assert "未完话题" in context
+    assert "体检结果" in context
+    assert len(context) <= 180
+
+
 def test_chat_engine_human_noise_layer(monkeypatch) -> None:
     engine = ChatEngine.__new__(ChatEngine)
     engine._human_noise_probability = 1.0

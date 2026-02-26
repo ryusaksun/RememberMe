@@ -19,6 +19,7 @@ load_dotenv()
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -64,6 +65,11 @@ class TelegramBot:
     PROACTIVE_DEDUP_WINDOW = 45 * 60
     # Telegram 单条文本上限 4096，这里留安全余量
     TELEGRAM_TEXT_LIMIT = 3800
+    # typing 心跳频率（秒）：生成期间持续刷新，避免“卡住”观感
+    TYPING_HEARTBEAT_INTERVAL = 4.5
+    # Telegram API 发送层重试参数
+    TELEGRAM_API_MAX_RETRIES = 4
+    TELEGRAM_RETRY_BASE_DELAY = 0.45
 
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
@@ -228,6 +234,86 @@ class TelegramBot:
             return 1.0
         return min(1.7, 1.0 + (length / 180.0))
 
+    async def _telegram_call_with_retry(self, op_name: str, op):
+        """统一 Telegram API 发送重试：处理限流和短暂网络抖动。"""
+        delay = self.TELEGRAM_RETRY_BASE_DELAY
+        for attempt in range(1, self.TELEGRAM_API_MAX_RETRIES + 1):
+            try:
+                return await op()
+            except RetryAfter as e:
+                # PTB v22 的 retry_after 属性在默认配置下会触发弃用告警，优先读内部 timedelta 字段。
+                retry_after = getattr(e, "_retry_after", None)
+                if retry_after is None:
+                    retry_after = getattr(e, "retry_after", 1)
+                if isinstance(retry_after, timedelta):
+                    wait = max(0.2, float(retry_after.total_seconds()))
+                else:
+                    try:
+                        wait = max(0.2, float(retry_after))
+                    except (TypeError, ValueError):
+                        wait = 1.0
+                if attempt >= self.TELEGRAM_API_MAX_RETRIES:
+                    raise
+                logger.warning(
+                    "Telegram %s 遇到限流，第 %d/%d 次重试，%.2fs 后重试",
+                    op_name, attempt, self.TELEGRAM_API_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+            except (TimedOut, NetworkError) as e:
+                if attempt >= self.TELEGRAM_API_MAX_RETRIES:
+                    raise
+                logger.warning(
+                    "Telegram %s 网络异常，第 %d/%d 次重试: %s",
+                    op_name, attempt, self.TELEGRAM_API_MAX_RETRIES, e,
+                )
+                await asyncio.sleep(delay)
+                delay = min(4.0, delay * 1.8)
+
+    async def _send_typing(self, bot, chat_id: int):
+        await self._telegram_call_with_retry(
+            "send_chat_action",
+            lambda: bot.send_chat_action(chat_id, ChatAction.TYPING),
+        )
+
+    async def _send_text(self, bot, chat_id: int, text: str):
+        await self._telegram_call_with_retry(
+            "send_message",
+            lambda: bot.send_message(chat_id, text),
+        )
+
+    async def _send_photo(self, bot, chat_id: int, photo):
+        async def _op():
+            if hasattr(photo, "seek"):
+                with contextlib.suppress(Exception):
+                    photo.seek(0)
+            return await bot.send_photo(chat_id, photo=photo)
+
+        await self._telegram_call_with_retry(
+            "send_photo",
+            _op,
+        )
+
+    async def _run_with_typing_heartbeat(self, bot, chat_id: int, coro):
+        """执行耗时协程期间持续发送 typing 心跳。"""
+        task = asyncio.create_task(coro)
+        try:
+            while not task.done():
+                await self._send_typing(bot, chat_id)
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=self.TYPING_HEARTBEAT_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            return await task
+        except Exception:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+            raise
+
     @staticmethod
     def _call_topic_starter(
         fn,
@@ -241,6 +327,26 @@ class TelegramBot:
             except TypeError:
                 pass
         return fn(*args, **kwargs)
+
+    @staticmethod
+    def _get_engine_context(engine, max_chars: int = 460) -> str:
+        if not engine:
+            return ""
+        get_proactive = getattr(engine, "get_proactive_context", None)
+        if callable(get_proactive):
+            try:
+                return str(get_proactive(max_chars=max_chars) or "")
+            except TypeError:
+                return str(get_proactive() or "")
+            except Exception as e:
+                logger.debug("读取压缩上下文失败，回退 recent_context: %s", e)
+        get_recent = getattr(engine, "get_recent_context", None)
+        if callable(get_recent):
+            try:
+                return str(get_recent() or "")
+            except Exception:
+                return ""
+        return ""
 
     def _compute_coalesce_delay(self, text: str, is_first: bool) -> float:
         if is_first:
@@ -490,7 +596,7 @@ class TelegramBot:
             if not msgs:
                 if not controller._engine:
                     return
-                ctx = controller._engine.get_recent_context()
+                ctx = self._get_engine_context(controller._engine, max_chars=460)
                 proactive_policy = controller._engine.plan_rhythm_policy(
                     kind="proactive",
                     user_input=ctx,
@@ -572,7 +678,7 @@ class TelegramBot:
         def on_typing(is_typing: bool):
             if is_typing:
                 self._track_task(
-                    asyncio.create_task(bot.send_chat_action(chat_id, ChatAction.TYPING)),
+                    asyncio.create_task(self._send_typing(bot, chat_id)),
                     "typing_indicator",
                 )
 
@@ -891,14 +997,15 @@ class TelegramBot:
             if not controller or self._chat_id != chat_id:
                 logger.info("聚合消息发送前会话已结束，丢弃本次缓冲内容")
                 return
-            await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
             try:
-                replies = await controller.send_message(merged)
+                replies = await self._run_with_typing_heartbeat(
+                    bot, chat_id, controller.send_message(merged),
+                )
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送消息失败")
-                await bot.send_message(chat_id, f"出错了：{e}")
+                await self._send_text(bot, chat_id, f"出错了：{e}")
 
     async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
@@ -935,11 +1042,14 @@ class TelegramBot:
             if not controller or self._chat_id != chat_id:
                 await update.message.reply_text("当前会话已结束，请先 /start。")
                 return
-            await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
             try:
-                replies = await controller.send_message(
-                    caption, image=(bytes(image_bytes), "image/jpeg"),
+                replies = await self._run_with_typing_heartbeat(
+                    bot,
+                    chat_id,
+                    controller.send_message(
+                        caption, image=(bytes(image_bytes), "image/jpeg"),
+                    ),
                 )
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
@@ -974,21 +1084,21 @@ class TelegramBot:
                     delay = (0.45 + random.random() * 0.9) * delay_factor
                 delay *= self._typing_delay_scale(msg)
                 await asyncio.sleep(max(0.05, delay))
-                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await self._send_typing(bot, chat_id)
 
             if msg.startswith("[sticker:"):
                 sticker_path = Path(msg[9:].rstrip("]"))
                 try:
                     if sticker_path.exists():
                         with open(sticker_path, "rb") as f:
-                            await bot.send_photo(chat_id, photo=f)
+                            await self._send_photo(bot, chat_id, f)
                     else:
                         logger.warning("表情包文件不存在: %s", sticker_path)
                 except Exception as e:
                     logger.warning("发送表情包失败: %s", e)
             else:
                 for chunk in self._split_telegram_text(msg):
-                    await bot.send_message(chat_id, chunk)
+                    await self._send_text(bot, chat_id, chunk)
 
             if i < len(msgs) - 1:
                 if engine:
@@ -997,7 +1107,7 @@ class TelegramBot:
                     delay = (0.4 + random.random() * 0.8) * delay_factor
                 delay *= self._typing_delay_scale(msgs[i + 1])
                 await asyncio.sleep(delay)
-                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await self._send_typing(bot, chat_id)
 
     def run(self):
         """启动 Bot（阻塞）。"""

@@ -965,6 +965,58 @@ class ChatEngine:
                 lines.append(f"{role}: {h.parts[0].text[:100]}")
         return "\n".join(lines)
 
+    def get_proactive_context(self, max_chars: int = 480) -> str:
+        """为主动消息链路提供压缩上下文（近期对话 + 中期记忆线索）。"""
+        self._ensure_runtime_state()
+        budget = max(160, int(max_chars))
+
+        recent = self._history[-10:] if len(self._history) >= 10 else self._history
+        recent_lines: list[str] = []
+        for h in recent:
+            if not h.parts or not h.parts[0].text:
+                continue
+            role = "对方" if h.role == "user" else "你"
+            text = h.parts[0].text.replace(_MSG_SEPARATOR, " / ")
+            recent_lines.append(f"{role}: {text[:90]}")
+        recent_block = "\n".join(recent_lines[-6:])
+
+        with self._state_lock:
+            open_threads = [
+                str(x).strip()
+                for x in (self._scratchpad.open_threads or [])
+                if str(x).strip()
+            ][:2]
+            facts = [
+                str(x).strip()
+                for x in (self._scratchpad.facts or [])
+                if str(x).strip()
+            ][:2]
+
+        memo_parts: list[str] = []
+        if open_threads:
+            memo_parts.append(f"未完话题：{'；'.join(open_threads)}")
+        if facts:
+            memo_parts.append(f"近期要点：{'；'.join(facts)}")
+        memo_block = "\n".join(memo_parts)
+
+        if memo_block and recent_block:
+            merged = f"{memo_block}\n最近对话：\n{recent_block}"
+        else:
+            merged = memo_block or recent_block
+
+        if not merged:
+            return self.get_recent_context()
+
+        if len(merged) <= budget:
+            return merged
+
+        if memo_block and recent_block:
+            prefix = f"{memo_block}\n最近对话：\n"
+            remain = max(60, budget - len(prefix))
+            return f"{prefix}{recent_block[-remain:]}"
+
+        return merged[-budget:]
+
     def is_conversation_ended(self) -> bool:
         """检测最近对话是否已自然结束（说了再见/去忙了）。"""
         if not self._history:

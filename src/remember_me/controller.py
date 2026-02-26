@@ -182,6 +182,26 @@ class ChatController:
             return None
 
     @staticmethod
+    def _get_engine_context(engine, max_chars: int = 480) -> str:
+        if not engine:
+            return ""
+        get_proactive = getattr(engine, "get_proactive_context", None)
+        if callable(get_proactive):
+            try:
+                return str(get_proactive(max_chars=max_chars) or "")
+            except TypeError:
+                return str(get_proactive() or "")
+            except Exception as e:
+                logger.debug("读取压缩上下文失败，回退 recent_context: %s", e)
+        get_recent = getattr(engine, "get_recent_context", None)
+        if callable(get_recent):
+            try:
+                return str(get_recent() or "")
+            except Exception:
+                return ""
+        return ""
+
+    @staticmethod
     def _call_topic_starter(
         fn,
         *args,
@@ -522,7 +542,7 @@ class ChatController:
         if self._on_typing:
             self._on_typing(True)
         try:
-            ctx = self._engine.get_recent_context() if self._session_loaded else ""
+            ctx = self._get_engine_context(self._engine, max_chars=460) if self._session_loaded else ""
             loop = asyncio.get_event_loop()
             greet_policy = self._engine.plan_rhythm_policy(kind="greet", user_input=ctx)
             system_instruction = self._build_outbound_system(ctx)
@@ -787,7 +807,7 @@ class ChatController:
                 if not msgs and idle > 90 and (now - self._last_relationship_followup_at) >= 1800:
                     fact = self._pick_shared_event_fact()
                     if fact:
-                        ctx = self._engine.get_recent_context()
+                        ctx = self._get_engine_context(self._engine, max_chars=460)
                         relation_input = f"{ctx}\n{fact.content}"
                         rel_policy = self._engine.plan_rhythm_policy(
                             kind="relationship_followup",
@@ -814,7 +834,7 @@ class ChatController:
                         # 回复后沉默 → 接话/关心，不引新话题
                         if idle < self._reply_checkin_wait or self._consecutive_proactive >= 1:
                             continue
-                        ctx = self._engine.get_recent_context()
+                        ctx = self._get_engine_context(self._engine, max_chars=460)
                         checkin_policy = self._engine.plan_rhythm_policy(
                             kind="followup",
                             user_input=ctx,
@@ -834,7 +854,7 @@ class ChatController:
                         if self._consecutive_proactive >= 2:
                             continue
                         if self._topic_starter._last_proactive:
-                            ctx = self._engine.get_recent_context()
+                            ctx = self._get_engine_context(self._engine, max_chars=460)
                             followup_policy = self._engine.plan_rhythm_policy(
                                 kind="followup",
                                 user_input=ctx,
