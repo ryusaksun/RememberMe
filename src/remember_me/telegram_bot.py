@@ -489,10 +489,10 @@ class TelegramBot:
         for hour in chosen_hours:
             minute = random.randint(0, 59)
             dt = datetime(today.year, today.month, today.day, hour, minute, tzinfo=TIMEZONE)
-            # 如果这个时间跨午夜（比如 hour=0 或 1），可能是"今天的凌晨"或"明天的凌晨"
-            # 如果时间已过且距现在超过 2 小时，推到明天
+            # 每日计划只包含“今天”能触发的时刻。
+            # 若该时段已过去太久（超过 2 小时），直接跳过，避免被推到明天后在午夜刷新时丢失。
             if dt < now - timedelta(hours=2):
-                dt += timedelta(days=1)
+                continue
             times.append(dt)
 
         times.sort()

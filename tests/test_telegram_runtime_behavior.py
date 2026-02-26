@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import remember_me.telegram_bot as tg_mod
@@ -607,3 +607,47 @@ def test_split_telegram_text_respects_limit() -> None:
     assert len(chunks) == 4
     assert all(len(c) <= 30 for c in chunks)
     assert "".join(chunks) == text
+
+
+def test_plan_daily_times_skips_expired_slots_instead_of_pushing_to_tomorrow(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 6, 33, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+    monkeypatch.setattr(tg_mod.random, "sample", lambda seq, k: list(seq)[:k])
+    monkeypatch.setattr(tg_mod.random, "randint", lambda a, b: 30)
+
+    bot = TelegramBot("token")
+    bot._load_persona_meta = lambda: {  # type: ignore[assignment]
+        "active_hours": [1],  # 明显是今天已过太久的时段
+        "chase_ratio": 0.0,
+        "avg_burst_length": 1.0,
+    }
+
+    times = bot._plan_daily_times()
+    assert times == []
+
+
+def test_plan_daily_times_keeps_today_future_slots(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 6, 33, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+    monkeypatch.setattr(tg_mod.random, "sample", lambda seq, k: list(seq)[:k])
+    monkeypatch.setattr(tg_mod.random, "randint", lambda a, b: 30)
+
+    bot = TelegramBot("token")
+    bot._load_persona_meta = lambda: {  # type: ignore[assignment]
+        "active_hours": [8],
+        "chase_ratio": 0.0,
+        "avg_burst_length": 1.0,
+    }
+
+    times = bot._plan_daily_times()
+    assert len(times) == 1
+    assert times[0].date() == _FixedDateTime.now(tg_mod.TIMEZONE).date()
+    assert times[0].hour == 8
