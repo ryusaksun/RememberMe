@@ -321,13 +321,41 @@ class TelegramBot:
                     await task
             raise
 
-    @staticmethod
-    def _humanized_error_text() -> str:
-        return random.choice([
+    def _persona_style_token(self) -> str:
+        controller = self._controller
+        persona = getattr(controller, "_persona", None) if controller else None
+        if not persona:
+            return ""
+        options: list[str] = []
+        options.extend(list(getattr(persona, "self_references", []) or [])[:3])
+        options.extend(list(getattr(persona, "catchphrases", []) or [])[:6])
+        options.extend(list(getattr(persona, "tone_markers", []) or [])[:4])
+        cleaned = []
+        for item in options:
+            token = str(item or "").strip()
+            if not token:
+                continue
+            if " " in token or "\n" in token:
+                continue
+            if len(token) > 8:
+                continue
+            cleaned.append(token)
+        if not cleaned:
+            return ""
+        return random.choice(cleaned)
+
+    def _humanized_error_text(self) -> str:
+        base = random.choice([
             "我这边刚卡了一下，你再发一条试试。",
             "等等，我这边网络抽了下，你再说一次。",
             "刚刚没接上，你再发一遍我马上回。",
         ])
+        token = self._persona_style_token()
+        if not token:
+            return base
+        if base.startswith(token):
+            return base
+        return f"{token}，{base}"
 
     async def _maybe_send_humanized_error(self, bot, chat_id: int):
         now = time.time()
@@ -335,6 +363,24 @@ class TelegramBot:
             return
         self._last_error_reply_at = now
         await self._send_text(bot, chat_id, self._humanized_error_text())
+
+    @staticmethod
+    def _is_transient_app_error(exc: Exception) -> bool:
+        if isinstance(exc, (NetworkError, TimedOut, RetryAfter)):
+            return True
+        text = f"{type(exc).__name__}: {exc}".lower()
+        keys = ("bad gateway", "timeout", "temporar", "connection reset", "rate limit", "429")
+        return any(k in text for k in keys)
+
+    async def _on_app_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        err = getattr(context, "error", None)
+        if not isinstance(err, Exception):
+            logger.warning("Telegram runtime error handler 收到非异常对象: %r", err)
+            return
+        if self._is_transient_app_error(err):
+            logger.warning("Telegram 运行时临时异常（已由全局 handler 捕获）: %s", err)
+            return
+        logger.exception("Telegram 运行时异常: %s", err)
 
     @staticmethod
     def _call_topic_starter(
@@ -1146,6 +1192,7 @@ class TelegramBot:
         self._app.add_handler(
             MessageHandler(filters.PHOTO, self._handle_photo)
         )
+        self._app.add_error_handler(self._on_app_error)
 
         async def post_init(app: Application):
             await app.bot.set_my_commands([

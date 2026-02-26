@@ -7,6 +7,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import remember_me.telegram_bot as tg_mod
+from telegram.error import NetworkError
 from remember_me.telegram_bot import TelegramBot
 
 
@@ -255,6 +256,27 @@ def test_humanized_error_reply_is_rate_limited() -> None:
     bot._last_error_reply_at = time.time()
     asyncio.run(bot._maybe_send_humanized_error(_FakeBot(), 123))
     assert sent == []
+
+
+def test_humanized_error_text_uses_persona_style_token(monkeypatch) -> None:
+    bot = TelegramBot("token")
+    bot._controller = SimpleNamespace(
+        _persona=SimpleNamespace(
+            self_references=["老子"],
+            catchphrases=["笑死"],
+            tone_markers=["啊"],
+        )
+    )
+    monkeypatch.setattr(tg_mod.random, "choice", lambda seq: seq[0])
+
+    text = bot._humanized_error_text()
+    assert text.startswith("老子，")
+
+
+def test_on_app_error_handles_transient_network_error() -> None:
+    bot = TelegramBot("token")
+    ctx = SimpleNamespace(error=NetworkError("Bad Gateway"))
+    asyncio.run(bot._on_app_error(None, ctx))
 
 
 def test_handle_photo_when_controller_dropped_replies_session_ended() -> None:
