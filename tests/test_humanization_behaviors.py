@@ -673,3 +673,25 @@ def test_controller_stop_cancels_event_extract_task() -> None:
         assert c._relationship_extract_task is None
 
     asyncio.run(_run())
+
+
+def test_controller_stop_closes_engine_client() -> None:
+    async def _run():
+        c = ChatController("x")
+        closed = {"ok": False}
+
+        class _Engine:
+            def set_session_phase(self, phase: str):
+                return None
+
+            async def aclose_client(self):
+                closed["ok"] = True
+
+        c._engine = _Engine()
+        c._save_session = lambda: None  # type: ignore[assignment]
+        c._running = True
+        c._event_tracker = None
+        await c.stop()
+        assert closed["ok"] is True
+
+    asyncio.run(_run())

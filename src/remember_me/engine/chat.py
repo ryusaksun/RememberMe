@@ -1133,6 +1133,34 @@ class ChatEngine:
         """对外暴露统一 system 构建，供主动消息链路复用同一人格/记忆约束。"""
         return self._build_system(user_input)
 
+    async def aclose_client(self):
+        """关闭底层 Gemini 客户端，减少退出时悬挂协程告警。"""
+        client = getattr(self, "_client", None)
+        if not client:
+            return
+        api = getattr(client, "_api_client", None)
+        if api:
+            aclose = getattr(api, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as e:
+                    logger.debug("关闭 Gemini async client 失败: %s", e)
+                # BaseApiClient.__del__ 会 create_task(self.aclose())；替换为 no-op 可避免关停尾部噪音。
+                try:
+                    async def _noop_aclose():
+                        return None
+                    setattr(api, "aclose", _noop_aclose)
+                except Exception:
+                    pass
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                # sync close 再兜底一次 httpx client 释放
+                close()
+            except Exception as e:
+                logger.debug("关闭 Gemini sync client 失败: %s", e)
+
     def _apply_relationship_emotion_trigger(self, user_input: str):
         governance = getattr(self, "_memory_governance", None)
         if not governance:

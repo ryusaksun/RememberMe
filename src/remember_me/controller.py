@@ -916,6 +916,11 @@ class ChatController:
         self._event_extract_task = None
         self._relationship_extract_task = None
         self._save_session()
+        if self._engine and hasattr(self._engine, "aclose_client"):
+            try:
+                await self._engine.aclose_client()
+            except Exception as e:
+                logger.debug("关闭聊天引擎客户端失败: %s", e)
         self._emit_metric("session_stopped")
 
     def _save_session(self):
