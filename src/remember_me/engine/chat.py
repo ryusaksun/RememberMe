@@ -219,6 +219,12 @@ _PROMPT_LEAK_KEYWORDS = (
     "最重要的是：根据对方说的内容来回复",
     "绝不承认是 ai",
 )
+_RHYTHM_COUNT_LEAK_RE = re.compile(
+    r"^\s*(?:回复|回覆)\s*\d+\s*(?:[-~到]\s*\d+)?\s*条[？?]?\s*$",
+    re.I,
+)
+_RHYTHM_DECISION_LEAK_RE = re.compile(r"(?:->|=>|→)?\s*(?:设定为|設定為)\s*\d+\s*条", re.I)
+_RHYTHM_LEN_LEAK_RE = re.compile(r"单条(?:大约|約|约)?\s*\d+", re.I)
 _SAFE_REPLY_FALLBACK = "嗯，刚刚卡了一下，你继续说。"
 _GEN_RETRY_ATTEMPTS = 3
 _TRANSIENT_GEN_ERR_RE = re.compile(
@@ -268,6 +274,13 @@ def _is_reasoning_leak_msg(msg: str) -> bool:
     if _MONOLOGUE_LEAK_RE.search(stripped):
         return True
     if _is_prompt_leak_msg(stripped):
+        return True
+    # 0.5) 节奏约束元文本泄漏（如 "回复2-4条?"、"设定为2条。单条大约4"）
+    if _RHYTHM_COUNT_LEAK_RE.match(stripped):
+        return True
+    if _RHYTHM_DECISION_LEAK_RE.search(stripped) and _RHYTHM_LEN_LEAK_RE.search(stripped):
+        return True
+    if ("用 |||" in stripped or "用|||分隔" in stripped) and _RHYTHM_LEN_LEAK_RE.search(stripped):
         return True
     # 0) Markdown italic 包裹的元注释：*Refining...*、*Note:* 等
     if _META_COMMENTARY_RE.search(stripped):

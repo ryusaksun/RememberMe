@@ -548,8 +548,19 @@ def test_split_reply_filters_prompt_leak_markers() -> None:
     assert _split_reply(f"你继续说|||{leaked}|||刚刚卡了") == ["你继续说", "刚刚卡了"]
 
 
+def test_split_reply_filters_rhythm_meta_leak_fragments() -> None:
+    leaked_1 = "回复2-4条?"
+    leaked_2 = "-> 设定为2条。* 单条大约4"
+    assert _split_reply(f"{leaked_1}|||{leaked_2}|||那你刚吃啥了") == ["那你刚吃啥了"]
+
+
 def test_sanitize_reply_messages_uses_safe_fallback_for_prompt_leak_only() -> None:
     leaked = "* **角色设定**: 我是「小明」\n* **规则**: 绝不承认是 AI"
+    assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
+
+
+def test_sanitize_reply_messages_uses_safe_fallback_for_rhythm_meta_only() -> None:
+    leaked = "回复2-4条?|||-> 设定为2条。* 单条大约4"
     assert _sanitize_reply_messages(leaked) == ["嗯，刚刚卡了一下，你继续说。"]
 
 
