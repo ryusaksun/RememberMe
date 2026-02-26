@@ -94,6 +94,25 @@ def test_run_with_typing_heartbeat_repeats_until_task_done() -> None:
     assert calls["typing"] >= 2
 
 
+def test_run_with_typing_heartbeat_tolerates_typing_errors() -> None:
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            raise RuntimeError("typing failed")
+
+    async def _slow_reply():
+        await asyncio.sleep(0.01)
+        return ["ok"]
+
+    bot = TelegramBot("token")
+    bot.TYPING_HEARTBEAT_INTERVAL = 0.005
+
+    async def _run():
+        result = await bot._run_with_typing_heartbeat(_FakeBot(), 123, _slow_reply())
+        assert result == ["ok"]
+
+    asyncio.run(_run())
+
+
 def test_send_text_retries_on_retry_after(monkeypatch) -> None:
     calls = {"send": 0}
 

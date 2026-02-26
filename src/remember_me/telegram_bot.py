@@ -298,7 +298,11 @@ class TelegramBot:
         task = asyncio.create_task(coro)
         try:
             while not task.done():
-                await self._send_typing(bot, chat_id)
+                try:
+                    await self._send_typing(bot, chat_id)
+                except Exception as e:
+                    # typing 仅用于体验增强，不应影响真实回复生成。
+                    logger.debug("typing 心跳发送失败，忽略并继续等待主任务: %s", e)
                 try:
                     return await asyncio.wait_for(
                         asyncio.shield(task),
