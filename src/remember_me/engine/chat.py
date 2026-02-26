@@ -545,6 +545,20 @@ class ChatEngine:
         self._space_state = SpaceState()
         self._state_lock = threading.Lock()  # 保护 scratchpad/emotion/space 的跨线程访问
         self._memory_cache: OrderedDict[str, tuple[float, list[tuple[str, float]]]] = OrderedDict()
+        self._ensure_runtime_state()
+
+    def _ensure_runtime_state(self):
+        """兼容 __new__ 构造的测试对象，确保运行态字段存在。"""
+        if not hasattr(self, "_state_lock") or self._state_lock is None:
+            self._state_lock = threading.Lock()
+        if not hasattr(self, "_scratchpad") or self._scratchpad is None:
+            self._scratchpad = Scratchpad()
+        if not hasattr(self, "_emotion_state") or self._emotion_state is None:
+            self._emotion_state = EmotionState()
+        if not hasattr(self, "_space_state") or self._space_state is None:
+            self._space_state = SpaceState()
+        if not hasattr(self, "_memory_cache") or self._memory_cache is None:
+            self._memory_cache = OrderedDict()
 
     @property
     def client(self) -> genai.Client:
@@ -553,6 +567,7 @@ class ChatEngine:
     @property
     def reply_delay_factor(self) -> float:
         """情绪+空间驱动的回复延迟系数，供外部（telegram_bot/gui）使用。"""
+        self._ensure_runtime_state()
         with self._state_lock:
             base = self._emotion_state.get_modifiers(self._persona).reply_delay_factor
             space = self._space_state.get_modifiers().reply_delay_factor
@@ -561,32 +576,38 @@ class ChatEngine:
     @property
     def proactive_cooldown_factor(self) -> float:
         """情绪驱动的主动消息冷却系数。"""
+        self._ensure_runtime_state()
         with self._state_lock:
             return self._emotion_state.get_modifiers(self._persona).proactive_cooldown_factor
 
     def advance_space(self):
         """推进空间状态到当前时间（线程安全）。"""
+        self._ensure_runtime_state()
         with self._state_lock:
             self._space_state.advance(datetime.now(_TIMEZONE))
 
     @property
     def space_modifiers(self) -> SpaceModifiers:
         """空间驱动的行为修饰。"""
+        self._ensure_runtime_state()
         with self._state_lock:
             return self._space_state.get_modifiers()
 
     @property
     def current_location(self) -> str:
+        self._ensure_runtime_state()
         with self._state_lock:
             return self._space_state.current_location
 
     @property
     def current_activity(self) -> str:
+        self._ensure_runtime_state()
         with self._state_lock:
             return self._space_state.current_activity
 
     def regenerate_daily_schedule(self, routine, day_of_week: int, date_str: str):
         """生成今日日程（会话启动或午夜调用）。"""
+        self._ensure_runtime_state()
         from remember_me.engine.space import generate_daily_schedule
         entries = generate_daily_schedule(
             self._client, routine, self._persona, day_of_week, date_str,
@@ -780,6 +801,7 @@ class ChatEngine:
         user_input: str = "",
         event_score: float | None = None,
     ) -> RhythmInputs:
+        self._ensure_runtime_state()
         with self._state_lock:
             valence = float(self._emotion_state.valence)
             arousal = float(self._emotion_state.arousal)
@@ -809,6 +831,7 @@ class ChatEngine:
         user_input: str = "",
         event_score: float | None = None,
     ) -> RhythmPolicy:
+        self._ensure_runtime_state()
         inputs = self.build_rhythm_inputs(kind=kind, user_input=user_input, event_score=event_score)
         kind_key = inputs.kind.lower()
 
@@ -973,6 +996,7 @@ class ChatEngine:
 
     def _build_system(self, user_input: str) -> str:
         """构建 system prompt（core > relationship > boundary > RAG > session > conflict > scratchpad/emotion）。"""
+        self._ensure_runtime_state()
         # 注入当前时间（使用用户时区，非服务器时区）
         now = datetime.now(_TIMEZONE)
         time_block = (
@@ -1105,6 +1129,10 @@ class ChatEngine:
 
         return system
 
+    def build_system_for_generation(self, user_input: str = "") -> str:
+        """对外暴露统一 system 构建，供主动消息链路复用同一人格/记忆约束。"""
+        return self._build_system(user_input)
+
     def _apply_relationship_emotion_trigger(self, user_input: str):
         governance = getattr(self, "_memory_governance", None)
         if not governance:
@@ -1131,6 +1159,7 @@ class ChatEngine:
 
     def save_session(self, path: str | Path):
         """将对话历史保存到文件。"""
+        self._ensure_runtime_state()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._state_lock:
@@ -1153,6 +1182,7 @@ class ChatEngine:
 
     def load_session(self, path: str | Path) -> bool:
         """从文件恢复对话历史。返回是否成功加载。"""
+        self._ensure_runtime_state()
         path = Path(path)
         if not path.exists():
             return False
@@ -1190,6 +1220,7 @@ class ChatEngine:
     # ── 中期记忆（Scratchpad）更新 ──
 
     def _should_update_scratchpad(self) -> bool:
+        self._ensure_runtime_state()
         if self._scratchpad_updating:
             return False
         turns_since = len(self._history) - self._scratchpad.last_update_turn
@@ -1198,6 +1229,7 @@ class ChatEngine:
         return turns_since >= 6
 
     def _get_messages_since_last_update(self) -> list[dict]:
+        self._ensure_runtime_state()
         result = []
         for h in self._history[self._scratchpad.last_update_turn:]:
             if h.parts and h.parts[0].text:
@@ -1205,6 +1237,7 @@ class ChatEngine:
         return result
 
     def _trigger_scratchpad_update(self):
+        self._ensure_runtime_state()
         if self._scratchpad_updating:
             return
         recent = self._get_messages_since_last_update()
@@ -1238,6 +1271,7 @@ class ChatEngine:
 
         image: 可选 (bytes, mime_type) 图片数据，与文本一起发送给 LLM。
         """
+        self._ensure_runtime_state()
         # 情绪衰减（距上次更新到现在的时间回归）
         with self._state_lock:
             self._emotion_state.decay(self._persona)

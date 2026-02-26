@@ -4,6 +4,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import remember_me.telegram_bot as tg_mod
 from remember_me.telegram_bot import TelegramBot
 
 
@@ -88,6 +89,37 @@ def test_flush_coalesce_skip_when_controller_closed() -> None:
     asyncio.run(bot._flush_coalesce(chat_id=123, delay=0))
     assert calls["typing"] == 0
     assert calls["send"] == 0
+
+
+def test_flush_coalesce_merges_messages_without_mechanical_prefix() -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            return None
+
+        async def send_message(self, chat_id: int, text: str):
+            return None
+
+    class _FakeController:
+        async def send_message(self, text: str):
+            captured["merged"] = text
+            return ["收到"]
+
+    bot = TelegramBot("token")
+    bot._app = SimpleNamespace(bot=_FakeBot())
+    bot._controller = _FakeController()
+    bot._chat_id = 123
+    bot._coalesce_buffer = ["第一条", "第二条"]
+
+    async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+        captured["delivered"] = list(msgs)
+
+    bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+    asyncio.run(bot._flush_coalesce(chat_id=123, delay=0))
+    assert captured["merged"] == "第一条\n第二条"
+    assert "连续发了" not in str(captured["merged"])
 
 
 def test_handle_photo_when_controller_dropped_replies_session_ended() -> None:
@@ -276,3 +308,142 @@ def test_daily_proactive_uses_rhythm_policy() -> None:
     assert engine.policy_calls and engine.policy_calls[0][0] == "proactive"
     assert engine.injected == ["在吗"]
     assert delivered["msgs"] == ["在吗"]
+
+
+def test_daily_proactive_skips_recent_duplicate() -> None:
+    class _FakeEngine:
+        def __init__(self):
+            self.injected: list[str] | None = None
+
+        def plan_rhythm_policy(self, *, kind: str, user_input: str = ""):
+            return SimpleNamespace(
+                min_count=1,
+                max_count=2,
+                prefer_count=1,
+                min_len=6,
+                max_len=22,
+                prefer_len=12,
+                allow_single_short_ack=False,
+            )
+
+        def get_recent_context(self) -> str:
+            return "最近在聊游戏和工作"
+
+        def inject_proactive_message(self, msgs: list[str]):
+            self.injected = list(msgs)
+
+    class _FakeStarter:
+        def generate(self, recent_context: str = "", count_policy=None):
+            return ["在吗"]
+
+    class _FakeBot:
+        pass
+
+    bot = TelegramBot("token")
+    engine = _FakeEngine()
+    starter = _FakeStarter()
+    bot._controller = SimpleNamespace(
+        _engine=engine,
+        _topic_starter=starter,
+        _event_tracker=None,
+        _update_activity=lambda: None,
+    )
+    bot._chat_id = 123
+    bot._last_user_activity = 0.0
+    bot._app = SimpleNamespace(bot=_FakeBot())
+    bot._mark_proactive_sent(["在吗"])
+
+    async def _ensure_session(chat_id: int, no_greet: bool = False) -> bool:
+        return True
+
+    delivered = {"called": False}
+
+    async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+        delivered["called"] = True
+
+    bot._ensure_session = _ensure_session  # type: ignore[assignment]
+    bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+    asyncio.run(bot._try_send_daily_message())
+    assert engine.injected is None
+    assert delivered["called"] is False
+
+
+def test_telegram_proactive_signature_dedup_supports_near_match() -> None:
+    bot = TelegramBot("token")
+    bot._mark_proactive_sent(["在吗，你忙完了没"])
+    assert bot._is_duplicate_proactive(["在吗？你忙完了没"])
+    assert not bot._is_duplicate_proactive(["明天你有空吗"])
+
+
+def test_telegram_call_topic_starter_supports_new_and_old_signatures() -> None:
+    captured = {"new": "", "old": ""}
+
+    def _new_fn(*, system_instruction=None, count_policy=None):
+        captured["new"] = str(system_instruction or "")
+        return ["ok"]
+
+    def _old_fn(*, count_policy=None):
+        captured["old"] = "called"
+        return ["ok"]
+
+    out_new = TelegramBot._call_topic_starter(
+        _new_fn,
+        system_instruction="SYS_BLOCK",
+        count_policy="p",
+    )
+    out_old = TelegramBot._call_topic_starter(
+        _old_fn,
+        system_instruction="SYS_BLOCK",
+        count_policy="p",
+    )
+    assert out_new == ["ok"]
+    assert out_old == ["ok"]
+    assert captured["new"] == "SYS_BLOCK"
+    assert captured["old"] == "called"
+
+
+def test_ensure_session_on_message_skip_proactive_when_user_active() -> None:
+    delivered = {"n": 0}
+
+    class _FakeController:
+        def __init__(self, persona_name: str):
+            self.persona_name = persona_name
+            self.session_loaded = False
+
+        async def start(self, on_message, on_typing=None, no_greet: bool = False):
+            on_message(["在吗"], "proactive")
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            return None
+
+    async def _run():
+        bot = TelegramBot("token")
+        bot._app = SimpleNamespace(bot=_FakeBot())
+        bot._last_user_activity = time.time()
+
+        async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+            delivered["n"] += 1
+
+        bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+        original = tg_mod.ChatController
+        try:
+            tg_mod.ChatController = _FakeController  # type: ignore[assignment]
+            ok = await bot._ensure_session(chat_id=123)
+            assert ok
+            await asyncio.sleep(0.02)
+        finally:
+            tg_mod.ChatController = original  # type: ignore[assignment]
+
+    asyncio.run(_run())
+    assert delivered["n"] == 0
+
+
+def test_split_telegram_text_respects_limit() -> None:
+    text = "a" * 100
+    chunks = TelegramBot._split_telegram_text(text, limit=30)
+    assert len(chunks) == 4
+    assert all(len(c) <= 30 for c in chunks)
+    assert "".join(chunks) == text

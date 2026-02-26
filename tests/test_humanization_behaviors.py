@@ -5,6 +5,7 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from remember_me.analyzer.persona import Persona, analyze
 from remember_me.controller import ChatController
@@ -18,6 +19,7 @@ from remember_me.engine.chat import (
 )
 from remember_me.engine.emotion import EmotionState
 from remember_me.engine.pending_events import PendingEvent, PendingEventTracker
+from remember_me.engine.topic_starter import TopicStarter
 from remember_me.importers.base import ChatHistory, ChatMessage
 from remember_me.memory.governance import MemoryGovernance
 from remember_me.memory.scratchpad import Scratchpad
@@ -351,6 +353,173 @@ def test_controller_phase_transitions_deep_to_cooldown() -> None:
     c._user_turn_count = 6
     c._set_phase(c._derive_phase_from_user_input("嗯", idle_before=400), reason="test")
     assert c.session_phase == "cooldown"
+
+
+def test_controller_proactive_signature_dedup() -> None:
+    c = ChatController("x")
+    msgs = ["在吗", "你忙完了没"]
+    assert not c._is_duplicate_proactive(msgs, window_seconds=3600)
+    c._mark_proactive_sent(msgs)
+    assert c._is_duplicate_proactive(msgs, window_seconds=3600)
+    assert not c._is_duplicate_proactive(["换个话题聊聊"], window_seconds=3600)
+    assert c._is_duplicate_proactive(["在吗？你忙完了没"], window_seconds=3600)
+
+
+def test_controller_call_topic_starter_supports_new_and_old_signatures() -> None:
+    captured = {"new": "", "old": ""}
+
+    def _new_fn(*, system_instruction=None, count_policy=None):
+        captured["new"] = str(system_instruction or "")
+        return ["ok"]
+
+    def _old_fn(*, count_policy=None):
+        captured["old"] = "called"
+        return ["ok"]
+
+    out_new = ChatController._call_topic_starter(
+        _new_fn,
+        system_instruction="SYS_BLOCK",
+        count_policy="p",
+    )
+    out_old = ChatController._call_topic_starter(
+        _old_fn,
+        system_instruction="SYS_BLOCK",
+        count_policy="p",
+    )
+    assert out_new == ["ok"]
+    assert out_old == ["ok"]
+    assert captured["new"] == "SYS_BLOCK"
+    assert captured["old"] == "called"
+
+
+def test_topic_starter_generate_followup_forwards_system_instruction() -> None:
+    starter = TopicStarter.__new__(TopicStarter)
+    starter._persona = Persona(name="小明")
+    starter._state_lock = threading.Lock()
+    starter._chase_ratio = 0.2
+    starter._last_proactive = ["你刚刚说工作压力大"]
+    starter._followup_count = 0
+    starter._proactive_count = 0
+
+    captured: dict[str, str] = {}
+
+    def _fake_generate(prompt: str, *, count_policy=None, user_input: str = "", system_instruction: str | None = None):
+        captured["system"] = system_instruction or ""
+        return ["后来怎么样了"]
+
+    starter._generate_with_context = _fake_generate  # type: ignore[assignment]
+    msgs = starter.generate_followup(
+        recent_context="最近在聊工作状态",
+        allow_new_topic=False,
+        system_instruction="SYS_BLOCK",
+    )
+    assert msgs == ["后来怎么样了"]
+    assert captured["system"] == "SYS_BLOCK"
+    assert starter._followup_count == 1
+    assert starter._proactive_count == 1
+
+
+def test_topic_starter_pick_topic_stays_within_interest_set() -> None:
+    persona = Persona(name="小明", topic_interests={"游戏": 5, "音乐": 3})
+    starter = TopicStarter(persona=persona, client=None)  # type: ignore[arg-type]
+    for _ in range(8):
+        topic = starter.pick_topic()
+        assert topic in {"游戏", "音乐"}
+
+
+def test_topic_starter_low_information_detection() -> None:
+    assert TopicStarter._is_low_information_messages(["在吗"])
+    assert TopicStarter._is_low_information_messages(["哈哈"])
+    assert not TopicStarter._is_low_information_messages(["你刚刚说的那个面试后来怎么样了"])
+
+
+def test_topic_starter_quality_penalizes_formal_and_off_context() -> None:
+    starter = TopicStarter.__new__(TopicStarter)
+    starter._persona = Persona(
+        name="小明",
+        catchphrases=["笑死"],
+        tone_markers=["啊"],
+    )
+    score, reasons = starter._evaluate_proactive_quality(
+        ["您好，请问您最近怎么样"],
+        user_input="我们刚刚聊的是项目延期和老板反馈",
+    )
+    assert score < 0.58
+    assert reasons
+
+
+def test_topic_starter_generate_with_context_retries_low_info_once() -> None:
+    class _FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            text = "在吗" if self.calls == 1 else "你刚刚说的项目后来怎么样了"
+            return SimpleNamespace(text=text, candidates=[])
+
+    starter = TopicStarter.__new__(TopicStarter)
+    starter._client = SimpleNamespace(models=_FakeModels())
+    starter._system_prompt = "base"
+
+    out = starter._generate_with_context(
+        "prompt",
+        user_input="我们刚刚在聊项目进展",
+    )
+    assert out
+    assert out[0] != "在吗"
+    assert starter._client.models.calls == 2
+
+
+def test_topic_starter_generate_with_context_retries_on_quality() -> None:
+    class _FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            text = "您好，请问您最近怎么样" if self.calls == 1 else "你上次提到那个延期，老板后来怎么说？"
+            return SimpleNamespace(text=text, candidates=[])
+
+    starter = TopicStarter.__new__(TopicStarter)
+    starter._client = SimpleNamespace(models=_FakeModels())
+    starter._system_prompt = "base"
+    starter._persona = Persona(name="小明", catchphrases=["笑死"])
+
+    out = starter._generate_with_context(
+        "prompt",
+        user_input="我们刚刚聊的是项目延期",
+    )
+    assert out
+    assert "延期" in out[0]
+    assert starter._client.models.calls == 2
+
+
+def test_topic_starter_followup_fallbacks_to_checkin_when_last_empty() -> None:
+    starter = TopicStarter.__new__(TopicStarter)
+    starter._persona = Persona(name="小明")
+    starter._state_lock = threading.Lock()
+    starter._chase_ratio = 0.3
+    starter._last_proactive = []
+    starter._followup_count = 0
+    starter._proactive_count = 0
+
+    captured: dict[str, str] = {}
+
+    def _fake_checkin(*, recent_context: str, count_policy=None, system_instruction: str | None = None):
+        captured["ctx"] = recent_context
+        captured["sys"] = system_instruction or ""
+        return ["补一句具体关心"]
+
+    starter.generate_checkin = _fake_checkin  # type: ignore[assignment]
+    msgs = starter.generate_followup(
+        recent_context="我们刚刚聊到你面试",
+        allow_new_topic=False,
+        system_instruction="SYS_BLOCK",
+    )
+    assert msgs == ["补一句具体关心"]
+    assert captured["ctx"] == "我们刚刚聊到你面试"
+    assert captured["sys"] == "SYS_BLOCK"
 
 
 def test_memory_governance_bootstrap_core_locked(tmp_path) -> None:

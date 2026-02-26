@@ -20,9 +20,13 @@ _TRIVIAL_SESSION_RE = re.compile(
     r"^(嗯|好|哦|啊|哈+|呵呵|ok|行|对|是|收到|知道了|好的)$",
     re.I,
 )
-_AI_IDENTITY_RE = re.compile(r"(你是ai|你是人工智能|你是机器人|你只是程序|你不是真人)")
+_AI_IDENTITY_RE = re.compile(
+    r"(你(?:其?实)?\s*是\s*ai|你\s*是\s*人工智能|你\s*是\s*机器人|你\s*只是\s*程序|你\s*不\s*是\s*真人)",
+    re.I,
+)
 _OVERRIDE_CUE_RE = re.compile(r"(以后|从现在开始|别再|不要再|改成|改为|你其实|你不是|你应该)")
 _NO_SWEAR_RE = re.compile(r"(别骂人|不要骂人|不许骂人|别说脏话|不要说脏话)")
+_STYLE_FORBID_RE = re.compile(r"(别说|不要说|别再说|不准说|禁止说|少说)")
 _RELATION_OVERRIDE_RE = re.compile(r"(从现在起|以后我们|关系.*改成|你其实只把我当)")
 _BOUNDARY_OVERRIDE_RE = re.compile(r"(永远|以后都|必须|不许).{0,8}(提|问|聊|叫|联系)")
 _ADDRESSING_INVALID_RE = re.compile(r"(客服|机器人|ai|人工智能)", re.I)
@@ -251,11 +255,22 @@ class MemoryGovernance:
         msg = (text or "").strip()
         if not msg:
             return ConflictResult(False, "")
+        normalized = re.sub(r"\s+", "", msg).lower()
 
         if persona and not self._core_profile_snapshot:
             self._core_profile_snapshot = self._build_snapshot_from_persona(persona)
 
-        if _AI_IDENTITY_RE.search(msg):
+        if _AI_IDENTITY_RE.search(msg) or any(
+            token in normalized
+            for token in (
+                "你其实是ai",
+                "你是ai",
+                "你是人工智能",
+                "你是机器人",
+                "你只是程序",
+                "你不是真人",
+            )
+        ):
             return ConflictResult(True, "试图重写身份设定")
 
         if _NO_SWEAR_RE.search(msg):
@@ -266,9 +281,18 @@ class MemoryGovernance:
             if swear_ratio > 0.005:
                 return ConflictResult(True, "试图改写导入历史中的语气习惯")
 
+        if _STYLE_FORBID_RE.search(msg):
+            snapshot = self._core_profile_snapshot or {}
+            style_tokens = set()
+            style_tokens |= _normalize_tokens(snapshot.get("catchphrases", []))
+            style_tokens |= _normalize_tokens(snapshot.get("tone_markers", []))
+            style_tokens |= _normalize_tokens(snapshot.get("self_references", []))
+            if any(tok and len(tok) >= 2 and tok in msg for tok in style_tokens):
+                return ConflictResult(True, "试图禁用导入历史中的表达习惯")
+
         if _OVERRIDE_CUE_RE.search(msg):
             tokens = self._core_tokens()
-            if any(tok and len(tok) >= 3 and tok in msg for tok in tokens):
+            if any(tok and len(tok) >= 2 and tok in msg for tok in tokens):
                 return ConflictResult(True, "试图覆盖导入历史的核心表达")
 
         return ConflictResult(False, "")

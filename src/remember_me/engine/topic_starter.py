@@ -81,6 +81,15 @@ _TOPIC_SEARCH_HINTS: dict[str, list[str]] = {
 from remember_me.models import MODEL_MAIN
 
 _MODEL = MODEL_MAIN
+_LOW_INFO_PROACTIVE_RE = _re.compile(
+    r"^(在吗|在不在|忙吗|忙不忙|哈喽|hello|hi|诶|欸|嗯|哦|(?:\?|？)+|哈哈+|哈)$",
+    _re.I,
+)
+_OVER_FORMAL_RE = _re.compile(r"(您好|请问|感谢|祝您|麻烦您|方便的话|辛苦了)")
+_GENERIC_OPENING_RE = _re.compile(
+    r"^(在吗|忙吗|最近怎么样|最近咋样|睡了吗|干嘛呢|hello|hi|哈喽|有空吗)$",
+    _re.I,
+)
 
 
 class TopicStarter:
@@ -135,19 +144,20 @@ class TopicStarter:
         interests = self._persona.topic_interests
         if not interests:
             return None
-        available = {t: w for t, w in interests.items() if t not in self._used_topics}
-        if not available:
-            # 保留上一个话题，避免清空后立即重复
-            last = self._used_topics.copy()
-            self._used_topics.clear()
-            available = {t: w for t, w in interests.items() if t not in last}
+        with self._state_lock:
+            available = {t: w for t, w in interests.items() if t not in self._used_topics}
             if not available:
-                available = dict(interests)
-        topics = list(available.keys())
-        weights = [available[t] for t in topics]
-        chosen = random.choices(topics, weights=weights, k=1)[0]
-        self._used_topics.add(chosen)
-        return chosen
+                # 保留上一个话题，避免清空后立即重复
+                last = self._used_topics.copy()
+                self._used_topics.clear()
+                available = {t: w for t, w in interests.items() if t not in last}
+                if not available:
+                    available = dict(interests)
+            topics = list(available.keys())
+            weights = [available[t] for t in topics]
+            chosen = random.choices(topics, weights=weights, k=1)[0]
+            self._used_topics.add(chosen)
+            return chosen
 
     @staticmethod
     def _fallback_policy() -> RhythmPolicy:
@@ -173,19 +183,104 @@ class TopicStarter:
             len_text = f"{policy.min_len}-{policy.max_len} 字"
         return f"回复 {count_text}，单条大约 {len_text}"
 
+    @staticmethod
+    def _is_low_information_messages(messages: list[str]) -> bool:
+        texts = [m.strip() for m in (messages or []) if m and not str(m).startswith("[sticker:")]
+        if not texts:
+            return True
+        meaningful = 0
+        for text in texts:
+            compact = _re.sub(r"\s+", "", text)
+            if len(compact) >= 5 and not _LOW_INFO_PROACTIVE_RE.fullmatch(compact):
+                meaningful += 1
+        return meaningful == 0
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return set()
+        words = _re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", raw)
+        tokens: set[str] = set()
+        for w in words:
+            if _re.fullmatch(r"[\u4e00-\u9fff]+", w):
+                if len(w) <= 1:
+                    tokens.add(w)
+                else:
+                    for i in range(len(w) - 1):
+                        tokens.add(w[i:i + 2])
+            else:
+                tokens.add(w)
+        return tokens
+
+    @classmethod
+    def _similarity(cls, left: str, right: str) -> float:
+        lt = cls._tokenize(left)
+        rt = cls._tokenize(right)
+        if not lt or not rt:
+            return 0.0
+        return len(lt & rt) / max(1, len(lt | rt))
+
+    def _evaluate_proactive_quality(
+        self,
+        messages: list[str],
+        *,
+        user_input: str = "",
+    ) -> tuple[float, list[str]]:
+        texts = [m.strip() for m in (messages or []) if m and not str(m).startswith("[sticker:")]
+        if not texts:
+            return 0.0, ["回复为空"]
+
+        reasons: list[str] = []
+        score = 1.0
+
+        if self._is_low_information_messages(texts):
+            score -= 0.55
+            reasons.append("不要只发空泛开场")
+
+        joined = " ".join(texts)
+        if _OVER_FORMAL_RE.search(joined):
+            score -= 0.25
+            reasons.append("避免客服式书面语")
+
+        if len(texts) == 1 and _GENERIC_OPENING_RE.fullmatch(_re.sub(r"\s+", "", texts[0])):
+            score -= 0.35
+            reasons.append("开场需要更具体")
+
+        context = str(user_input or "").strip()
+        if len(context) >= 8 and self._similarity(joined, context) < 0.06:
+            score -= 0.25
+            reasons.append("要贴合刚刚的话题")
+
+        persona = getattr(self, "_persona", None)
+        if persona:
+            style_tokens = []
+            style_tokens.extend(list(getattr(persona, "catchphrases", []) or [])[:6])
+            style_tokens.extend(list(getattr(persona, "tone_markers", []) or [])[:4])
+            style_tokens.extend(list(getattr(persona, "self_references", []) or [])[:3])
+            style_tokens = [str(x).strip() for x in style_tokens if str(x).strip()]
+            if style_tokens and len(joined) >= 10:
+                if not any(tok in joined for tok in style_tokens):
+                    score -= 0.08
+                    reasons.append("语气更贴近人格习惯")
+
+        return max(0.0, min(1.0, score)), reasons
+
     def _generate_with_context(
         self,
         prompt: str,
         *,
         count_policy: RhythmPolicy | None = None,
         user_input: str = "",
+        system_instruction: str | None = None,
+        retry_if_low_info: bool = True,
     ) -> list[str]:
         """用 Gemini 3.1 Pro 生成消息。"""
         response = self._client.models.generate_content(
             model=_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=self._system_prompt,
+                system_instruction=system_instruction or self._system_prompt,
                 temperature=0.9,
                 max_output_tokens=2048,
             ),
@@ -198,13 +293,34 @@ class TopicStarter:
         )
         messages = _split_reply(raw, truncated=truncated)
         policy = count_policy or self._fallback_policy()
-        return normalize_messages_by_policy(messages, policy, user_input=user_input)
+        normalized = normalize_messages_by_policy(messages, policy, user_input=user_input)
+
+        # 低信息主动消息（如“在吗/忙吗”）会显著增加机器人感；有上下文时允许重试一次。
+        quality, reasons = self._evaluate_proactive_quality(
+            normalized, user_input=user_input,
+        )
+        if retry_if_low_info and user_input.strip() and quality < 0.58:
+            require_line = "；".join(dict.fromkeys(reasons)) if reasons else "更具体、更口语化并贴合上下文"
+            strengthened_prompt = (
+                f"{prompt}\n\n"
+                f"补充硬性要求：{require_line}。"
+                "至少包含一条具体内容（提到刚才话题、事件细节或明确问题）。"
+            )
+            return self._generate_with_context(
+                strengthened_prompt,
+                count_policy=policy,
+                user_input=user_input,
+                system_instruction=system_instruction,
+                retry_if_low_info=False,
+            )
+        return normalized
 
     def generate(
         self,
         topic: str | None = None,
         recent_context: str = "",
         count_policy: RhythmPolicy | None = None,
+        system_instruction: str | None = None,
     ) -> list[str]:
         """搜索热点 + 生成主动消息。会参考当前对话内容决定如何切入。"""
         policy = count_policy or self._fallback_policy()
@@ -267,6 +383,7 @@ class TopicStarter:
             prompt,
             count_policy=policy,
             user_input=recent_context,
+            system_instruction=system_instruction,
         )
         if msgs:
             with self._state_lock:
@@ -283,6 +400,7 @@ class TopicStarter:
         self,
         recent_context: str,
         count_policy: RhythmPolicy | None = None,
+        system_instruction: str | None = None,
     ) -> list[str]:
         """对方回了消息后沉默了一段时间，接着聊或关心对方。不引入新话题。"""
         policy = count_policy or self._fallback_policy()
@@ -301,6 +419,7 @@ class TopicStarter:
             prompt,
             count_policy=policy,
             user_input=recent_context,
+            system_instruction=system_instruction,
         )
         if msgs:
             with self._state_lock:
@@ -314,6 +433,7 @@ class TopicStarter:
         recent_context: str = "",
         allow_new_topic: bool = True,
         count_policy: RhythmPolicy | None = None,
+        system_instruction: str | None = None,
     ) -> list[str]:
         """对方没回复时的行为，根据 chase_ratio 决定。"""
         policy = count_policy or self._fallback_policy()
@@ -321,19 +441,45 @@ class TopicStarter:
         if self._chase_ratio < 0.05:
             if not allow_new_topic:
                 return []
-            self._last_proactive = []
-            self._followup_count = 0
-            return self.generate(recent_context=recent_context, count_policy=policy)
+            with self._state_lock:
+                self._last_proactive = []
+                self._followup_count = 0
+            return self.generate(
+                recent_context=recent_context,
+                count_policy=policy,
+                system_instruction=system_instruction,
+            )
 
-        if self._followup_count >= max(1, round(self._chase_ratio * 10)):
+        with self._state_lock:
+            followup_count = self._followup_count
+            last_msg = _MSG_SEPARATOR.join(self._last_proactive)
+
+        if not last_msg.strip():
+            if allow_new_topic:
+                return self.generate(
+                    recent_context=recent_context,
+                    count_policy=policy,
+                    system_instruction=system_instruction,
+                )
+            return self.generate_checkin(
+                recent_context=recent_context,
+                count_policy=policy,
+                system_instruction=system_instruction,
+            )
+
+        if followup_count >= max(1, round(self._chase_ratio * 10)):
             if not allow_new_topic:
                 return []
-            self._last_proactive = []
-            self._followup_count = 0
-            return self.generate(recent_context=recent_context, count_policy=policy)
+            with self._state_lock:
+                self._last_proactive = []
+                self._followup_count = 0
+            return self.generate(
+                recent_context=recent_context,
+                count_policy=policy,
+                system_instruction=system_instruction,
+            )
 
         name = self._persona.name
-        last_msg = _MSG_SEPARATOR.join(self._last_proactive)
 
         prompt = (
             f"你刚刚跟对方说了：「{last_msg}」\n"
@@ -346,10 +492,12 @@ class TopicStarter:
             prompt,
             count_policy=policy,
             user_input=recent_context,
+            system_instruction=system_instruction,
         )
         if msgs:
-            self._followup_count += 1
-            self._proactive_count += 1
+            with self._state_lock:
+                self._followup_count += 1
+                self._proactive_count += 1
         return msgs
 
     def generate_event_followup(
@@ -358,6 +506,7 @@ class TopicStarter:
         event_context: str,
         followup_hint: str,
         count_policy: RhythmPolicy | None = None,
+        system_instruction: str | None = None,
     ) -> list[str]:
         """为待跟进事件生成追问消息。"""
         policy = count_policy or self._fallback_policy()
@@ -378,6 +527,7 @@ class TopicStarter:
             prompt,
             count_policy=policy,
             user_input=event_context,
+            system_instruction=system_instruction,
         )
         if msgs:
             with self._state_lock:
@@ -393,6 +543,7 @@ class TopicStarter:
         fact_meta: dict | None = None,
         recent_context: str = "",
         count_policy: RhythmPolicy | None = None,
+        system_instruction: str | None = None,
     ) -> list[str]:
         """基于已确认关系记忆生成主动接话（shared_event 优先）。"""
         policy = count_policy or self._fallback_policy()
@@ -454,6 +605,7 @@ class TopicStarter:
             prompt,
             count_policy=policy,
             user_input=recent_context or fact_content,
+            system_instruction=system_instruction,
         )
         if msgs:
             with self._state_lock:

@@ -82,6 +82,7 @@ class ChatController:
         self._user_turn_count = 0
         self._phase_updated_at = 0.0
         self._telemetry_seq = 0
+        self._recent_proactive_signatures: list[tuple[float, str]] = []
 
     @property
     def persona_name(self) -> str:
@@ -102,6 +103,98 @@ class ChatController:
             **fields,
         }
         logger.info("telemetry %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    @staticmethod
+    def _normalize_proactive_text(text: str) -> str:
+        lowered = str(text or "").strip().lower()
+        compact = re.sub(r"\s+", "", lowered)
+        compact = re.sub(r"[，。！？!?~…,.:;；、\"'“”‘’（）()\[\]{}\-]", "", compact)
+        return compact[:240]
+
+    @staticmethod
+    def _signature_tokens(signature: str) -> set[str]:
+        text = str(signature or "").strip().lower()
+        if not text:
+            return set()
+        words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
+        tokens: set[str] = set()
+        for w in words:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", w):
+                if len(w) <= 1:
+                    tokens.add(w)
+                else:
+                    for i in range(len(w) - 1):
+                        tokens.add(w[i:i + 2])
+            else:
+                tokens.add(w)
+        return tokens
+
+    @classmethod
+    def _signature_similarity(cls, left: str, right: str) -> float:
+        lt = cls._signature_tokens(left)
+        rt = cls._signature_tokens(right)
+        if not lt or not rt:
+            return 0.0
+        return len(lt & rt) / max(1, len(lt | rt))
+
+    def _build_proactive_signature(self, msgs: list[str]) -> str:
+        rows = [self._normalize_proactive_text(m) for m in (msgs or []) if m and str(m).strip()]
+        rows = [r for r in rows if r]
+        if not rows:
+            return ""
+        return "|".join(rows)
+
+    def _prune_proactive_signatures(self, window_seconds: int = 1800):
+        if not self._recent_proactive_signatures:
+            return
+        cutoff = time.time() - max(60, int(window_seconds))
+        self._recent_proactive_signatures = [
+            (ts, sig) for ts, sig in self._recent_proactive_signatures if ts >= cutoff
+        ]
+
+    def _is_duplicate_proactive(self, msgs: list[str], window_seconds: int = 1800) -> bool:
+        self._prune_proactive_signatures(window_seconds=window_seconds)
+        sig = self._build_proactive_signature(msgs)
+        if not sig:
+            return False
+        for _, old_sig in self._recent_proactive_signatures:
+            if old_sig == sig:
+                return True
+            if self._signature_similarity(old_sig, sig) >= 0.82:
+                return True
+        return False
+
+    def _mark_proactive_sent(self, msgs: list[str]):
+        sig = self._build_proactive_signature(msgs)
+        if not sig:
+            return
+        self._prune_proactive_signatures(window_seconds=1800)
+        self._recent_proactive_signatures.append((time.time(), sig))
+
+    def _build_outbound_system(self, user_input: str = "") -> str | None:
+        engine = self._engine
+        if not engine or not hasattr(engine, "build_system_for_generation"):
+            return None
+        try:
+            return engine.build_system_for_generation(user_input or "")
+        except Exception as e:
+            logger.debug("构建主动消息 system 失败，回退默认 system: %s", e)
+            return None
+
+    @staticmethod
+    def _call_topic_starter(
+        fn,
+        *args,
+        system_instruction: str | None = None,
+        **kwargs,
+    ):
+        if system_instruction:
+            try:
+                return fn(*args, system_instruction=system_instruction, **kwargs)
+            except TypeError:
+                # 兼容旧签名/测试桩
+                pass
+        return fn(*args, **kwargs)
 
     def _set_phase(self, phase: str, reason: str):
         if phase not in _SESSION_PHASES:
@@ -432,19 +525,27 @@ class ChatController:
             ctx = self._engine.get_recent_context() if self._session_loaded else ""
             loop = asyncio.get_event_loop()
             greet_policy = self._engine.plan_rhythm_policy(kind="greet", user_input=ctx)
+            system_instruction = self._build_outbound_system(ctx)
             greet_msgs = await loop.run_in_executor(
-                None, lambda: self._topic_starter.generate(
+                None,
+                lambda: self._call_topic_starter(
+                    self._topic_starter.generate,
                     recent_context=ctx,
                     count_policy=greet_policy,
-                )
+                    system_instruction=system_instruction,
+                ),
             )
             greet_msgs = [m for m in greet_msgs if m and m.strip()]
             if greet_msgs:
+                if self._is_duplicate_proactive(greet_msgs, window_seconds=1800):
+                    logger.info("开场消息跳过：与最近主动消息重复")
+                    return
                 self._engine.inject_proactive_message(greet_msgs)
                 self._update_activity()
                 self._last_interaction_type = "proactive"
                 self._consecutive_proactive = 1
                 self._next_proactive_at = time.time() + self._sample_proactive_cooldown()
+                self._mark_proactive_sent(greet_msgs)
                 self._set_phase("warmup", reason="greeting")
                 self._emit_metric("greeting_sent", reply_count=len(greet_msgs))
                 if self._on_message:
@@ -661,18 +762,23 @@ class ChatController:
                     due_events = self._event_tracker.get_due_events()
                     if due_events:
                         event = due_events[0]
+                        event_input = f"{event.event}\n{event.context}\n{event.followup_hint}"
                         event_policy = self._engine.plan_rhythm_policy(
                             kind="event_followup",
-                            user_input=f"{event.event}\n{event.context}\n{event.followup_hint}",
+                            user_input=event_input,
                         )
+                        event_system = self._build_outbound_system(event_input)
                         logger.info("触发事件追问: %s", event.event)
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate_event_followup(
+                            None,
+                            lambda: self._call_topic_starter(
+                                self._topic_starter.generate_event_followup,
                                 event.event,
                                 event.context,
                                 event.followup_hint,
                                 count_policy=event_policy,
-                            )
+                                system_instruction=event_system,
+                            ),
                         )
                         if msgs:
                             self._event_tracker.mark_done(event.id)
@@ -682,18 +788,23 @@ class ChatController:
                     fact = self._pick_shared_event_fact()
                     if fact:
                         ctx = self._engine.get_recent_context()
+                        relation_input = f"{ctx}\n{fact.content}"
                         rel_policy = self._engine.plan_rhythm_policy(
                             kind="relationship_followup",
-                            user_input=f"{ctx}\n{fact.content}",
+                            user_input=relation_input,
                         )
+                        relation_system = self._build_outbound_system(relation_input)
                         relation_fact_id = fact.id
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate_relationship_followup(
+                            None,
+                            lambda: self._call_topic_starter(
+                                self._topic_starter.generate_relationship_followup,
                                 fact_type=fact.type,
                                 fact_content=fact.content,
                                 fact_meta=fact.meta,
                                 recent_context=ctx,
                                 count_policy=rel_policy,
+                                system_instruction=relation_system,
                             ),
                         )
 
@@ -708,11 +819,15 @@ class ChatController:
                             kind="followup",
                             user_input=ctx,
                         )
+                        checkin_system = self._build_outbound_system(ctx)
                         msgs = await loop.run_in_executor(
-                            None, lambda: self._topic_starter.generate_checkin(
+                            None,
+                            lambda: self._call_topic_starter(
+                                self._topic_starter.generate_checkin,
                                 ctx,
                                 count_policy=checkin_policy,
-                            )
+                                system_instruction=checkin_system,
+                            ),
                         )
                     else:
                         # 主动消息后沉默 → 追问（最多 1 次追问，加上原始消息共 2 条）
@@ -724,12 +839,16 @@ class ChatController:
                                 kind="followup",
                                 user_input=ctx,
                             )
+                            followup_system = self._build_outbound_system(ctx)
                             msgs = await loop.run_in_executor(
-                                None, lambda: self._topic_starter.generate_followup(
+                                None,
+                                lambda: self._call_topic_starter(
+                                    self._topic_starter.generate_followup,
                                     recent_context=ctx,
                                     allow_new_topic=False,
                                     count_policy=followup_policy,
-                                )
+                                    system_instruction=followup_system,
+                                ),
                             )
 
                 if msgs:
@@ -739,11 +858,15 @@ class ChatController:
                     if not self._fresh_session and self._engine.is_conversation_ended():
                         self._set_phase("ending", reason="conversation_ended")
                         continue
+                    if self._is_duplicate_proactive(msgs, window_seconds=1800):
+                        logger.info("主动消息跳过：命中重复去重")
+                        continue
                     self._engine.inject_proactive_message(msgs)
                     self._update_activity()
                     self._consecutive_proactive += 1
                     self._last_interaction_type = "proactive"
                     self._fresh_session = False
+                    self._mark_proactive_sent(msgs)
                     if relation_fact_id:
                         self._last_relationship_fact_id = relation_fact_id
                         self._last_relationship_followup_at = now

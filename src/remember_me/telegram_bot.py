@@ -60,6 +60,10 @@ class TelegramBot:
     COALESCE_ENDING_DEBOUNCE = 0.55
     # 从第一条消息算起的最大等待（秒）：超过此时间无论如何都处理
     COALESCE_MAX_WAIT = 8.0
+    # 主动消息去重窗口（秒）：避免每日/主动消息连续重复
+    PROACTIVE_DEDUP_WINDOW = 45 * 60
+    # Telegram 单条文本上限 4096，这里留安全余量
+    TELEGRAM_TEXT_LIMIT = 3800
 
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
@@ -78,6 +82,7 @@ class TelegramBot:
         self._daily_times: list[datetime] = []
         self._daily_date: str = ""  # 当前计划对应的日期
         self._bg_tasks: set[asyncio.Task] = set()
+        self._recent_proactive_signatures: list[tuple[float, str]] = []
 
     def _is_allowed(self, user_id: int) -> bool:
         if self._allowed_users is None:
@@ -117,6 +122,125 @@ class TelegramBot:
     @staticmethod
     def _is_sentence_finished(text: str) -> bool:
         return bool(_SENTENCE_END_RE.search((text or "").strip()))
+
+    @staticmethod
+    def _normalize_signature_text(text: str) -> str:
+        """主动消息去重签名：忽略空白和常见标点，仅保留主体内容。"""
+        lowered = str(text or "").strip().lower()
+        compact = re.sub(r"\s+", "", lowered)
+        compact = re.sub(r"[，。！？!?~…,.:;；、\"'“”‘’（）()\[\]{}\-]", "", compact)
+        return compact[:240]
+
+    def _build_proactive_signature(self, msgs: list[str]) -> str:
+        rows = [self._normalize_signature_text(m) for m in (msgs or []) if m and str(m).strip()]
+        rows = [r for r in rows if r]
+        if not rows:
+            return ""
+        return "|".join(rows)
+
+    @staticmethod
+    def _signature_tokens(signature: str) -> set[str]:
+        text = str(signature or "").strip().lower()
+        if not text:
+            return set()
+        words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
+        tokens: set[str] = set()
+        for w in words:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", w):
+                if len(w) <= 1:
+                    tokens.add(w)
+                else:
+                    for i in range(len(w) - 1):
+                        tokens.add(w[i:i + 2])
+            else:
+                tokens.add(w)
+        return tokens
+
+    @classmethod
+    def _signature_similarity(cls, left: str, right: str) -> float:
+        lt = cls._signature_tokens(left)
+        rt = cls._signature_tokens(right)
+        if not lt or not rt:
+            return 0.0
+        return len(lt & rt) / max(1, len(lt | rt))
+
+    def _prune_proactive_signatures(self):
+        if not self._recent_proactive_signatures:
+            return
+        cutoff = time.time() - self.PROACTIVE_DEDUP_WINDOW
+        self._recent_proactive_signatures = [
+            (ts, sig) for ts, sig in self._recent_proactive_signatures if ts >= cutoff
+        ]
+
+    def _is_duplicate_proactive(self, msgs: list[str]) -> bool:
+        self._prune_proactive_signatures()
+        sig = self._build_proactive_signature(msgs)
+        if not sig:
+            return False
+        for _, old_sig in self._recent_proactive_signatures:
+            if old_sig == sig:
+                return True
+            if self._signature_similarity(old_sig, sig) >= 0.82:
+                return True
+        return False
+
+    def _mark_proactive_sent(self, msgs: list[str]):
+        sig = self._build_proactive_signature(msgs)
+        if not sig:
+            return
+        self._prune_proactive_signatures()
+        self._recent_proactive_signatures.append((time.time(), sig))
+
+    @staticmethod
+    def _split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return []
+        if len(raw) <= limit:
+            return [raw]
+
+        chunks: list[str] = []
+        remain = raw
+        while len(remain) > limit:
+            cut = max(
+                remain.rfind("\n", 0, limit),
+                remain.rfind("。", 0, limit),
+                remain.rfind("！", 0, limit),
+                remain.rfind("？", 0, limit),
+                remain.rfind("，", 0, limit),
+                remain.rfind(" ", 0, limit),
+            )
+            if cut < int(limit * 0.5):
+                cut = limit
+            chunk = remain[:cut].strip()
+            if chunk:
+                chunks.append(chunk)
+            remain = remain[cut:].strip()
+        if remain:
+            chunks.append(remain)
+        return chunks
+
+    @staticmethod
+    def _typing_delay_scale(text: str) -> float:
+        """根据消息长度微调打字延迟，让长句不至于“秒回”。"""
+        length = len((text or "").strip())
+        if length <= 0:
+            return 1.0
+        return min(1.7, 1.0 + (length / 180.0))
+
+    @staticmethod
+    def _call_topic_starter(
+        fn,
+        *args,
+        system_instruction: str | None = None,
+        **kwargs,
+    ):
+        if system_instruction:
+            try:
+                return fn(*args, system_instruction=system_instruction, **kwargs)
+            except TypeError:
+                pass
+        return fn(*args, **kwargs)
 
     def _compute_coalesce_delay(self, text: str, is_first: bool) -> float:
         if is_first:
@@ -336,18 +460,28 @@ class TelegramBot:
                 due_events = controller._event_tracker.get_due_events()
                 if due_events:
                     event = due_events[0]
+                    event_input = f"{event.event}\n{event.context}\n{event.followup_hint}"
                     event_policy = controller._engine.plan_rhythm_policy(
                         kind="event_followup",
-                        user_input=f"{event.event}\n{event.context}\n{event.followup_hint}",
+                        user_input=event_input,
                     )
+                    event_system = None
+                    if hasattr(controller._engine, "build_system_for_generation"):
+                        try:
+                            event_system = controller._engine.build_system_for_generation(event_input)
+                        except Exception:
+                            event_system = None
                     logger.info("每日消息触发事件追问: %s", event.event)
                     msgs = await loop.run_in_executor(
-                        None, lambda: controller._topic_starter.generate_event_followup(
+                        None,
+                        lambda: self._call_topic_starter(
+                            controller._topic_starter.generate_event_followup,
                             event.event,
                             event.context,
                             event.followup_hint,
                             count_policy=event_policy,
-                        )
+                            system_instruction=event_system,
+                        ),
                     )
                     if msgs:
                         controller._event_tracker.mark_done(event.id)
@@ -361,16 +495,28 @@ class TelegramBot:
                     kind="proactive",
                     user_input=ctx,
                 )
+                proactive_system = None
+                if hasattr(controller._engine, "build_system_for_generation"):
+                    try:
+                        proactive_system = controller._engine.build_system_for_generation(ctx)
+                    except Exception:
+                        proactive_system = None
                 msgs = await loop.run_in_executor(
-                    None, lambda: controller._topic_starter.generate(
+                    None,
+                    lambda: self._call_topic_starter(
+                        controller._topic_starter.generate,
                         recent_context=ctx,
                         count_policy=proactive_policy,
-                    )
+                        system_instruction=proactive_system,
+                    ),
                 )
 
             msgs = [m for m in (msgs or []) if m and m.strip()]
             if not msgs:
                 logger.info("每日消息生成为空")
+                return
+            if self._is_duplicate_proactive(msgs):
+                logger.info("每日消息跳过：与近期主动消息重复")
                 return
 
             # 注入对话历史并发送（加锁防止与 send_message 并发修改 engine 状态）
@@ -379,6 +525,7 @@ class TelegramBot:
                 controller._update_activity()
                 bot = self._app.bot
                 await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
+                self._mark_proactive_sent(msgs)
             logger.info("每日主动消息已发送: %d 条", len(msgs))
 
         except Exception as e:
@@ -400,15 +547,27 @@ class TelegramBot:
 
         def on_message(msgs: list[str], msg_type: str):
             is_followup = msg_type in {"proactive", "greet"}
-            self._track_task(
-                asyncio.create_task(
-                    self._deliver_messages(
-                        bot, chat_id, msgs,
+            async def _deliver_task():
+                clean = [m for m in (msgs or []) if m and str(m).strip()]
+                if not clean:
+                    return
+                async with self._send_lock:
+                    if not self._controller or self._chat_id != chat_id:
+                        return
+                    if is_followup and time.time() - self._last_user_activity < 8:
+                        logger.info("主动消息跳过：用户刚有输入活动")
+                        return
+                    if is_followup and self._is_duplicate_proactive(clean):
+                        logger.info("主动消息跳过：命中 Telegram 去重")
+                        return
+                    await self._deliver_messages(
+                        bot, chat_id, clean,
                         first_delay_phase="followup" if is_followup else "first",
                     )
-                ),
-                f"deliver_{msg_type}",
-            )
+                    if is_followup:
+                        self._mark_proactive_sent(clean)
+
+            self._track_task(asyncio.create_task(_deliver_task()), f"deliver_{msg_type}")
 
         def on_typing(is_typing: bool):
             if is_typing:
@@ -723,7 +882,8 @@ class TelegramBot:
         if len(messages) == 1:
             merged = messages[0]
         else:
-            merged = f"（对方连续发了 {len(messages)} 条消息）\n" + "\n".join(messages)
+            # 保留用户原始连发文本，不注入机械提示，降低 persona 漂移风险。
+            merged = "\n".join(messages)
 
         async with self._send_lock:
             bot = self._app.bot
@@ -812,6 +972,7 @@ class TelegramBot:
                     delay = engine.sample_inter_message_delay(first_delay_phase) * delay_factor
                 else:
                     delay = (0.45 + random.random() * 0.9) * delay_factor
+                delay *= self._typing_delay_scale(msg)
                 await asyncio.sleep(max(0.05, delay))
                 await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
@@ -826,13 +987,15 @@ class TelegramBot:
                 except Exception as e:
                     logger.warning("发送表情包失败: %s", e)
             else:
-                await bot.send_message(chat_id, msg)
+                for chunk in self._split_telegram_text(msg):
+                    await bot.send_message(chat_id, chunk)
 
             if i < len(msgs) - 1:
                 if engine:
                     delay = engine.sample_inter_message_delay("burst") * delay_factor
                 else:
                     delay = (0.4 + random.random() * 0.8) * delay_factor
+                delay *= self._typing_delay_scale(msgs[i + 1])
                 await asyncio.sleep(delay)
                 await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
