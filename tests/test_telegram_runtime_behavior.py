@@ -651,3 +651,26 @@ def test_plan_daily_times_keeps_today_future_slots(monkeypatch) -> None:
     assert len(times) == 1
     assert times[0].date() == _FixedDateTime.now(tg_mod.TIMEZONE).date()
     assert times[0].hour == 8
+
+
+def test_plan_daily_times_filters_before_sampling_avoids_empty_plan(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 6, 33, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+    # 如果先采样再过滤，这里会选中 1 点并被丢弃；修复后会先过滤，只能选到 8 点。
+    monkeypatch.setattr(tg_mod.random, "sample", lambda seq, k: list(seq)[:k])
+    monkeypatch.setattr(tg_mod.random, "randint", lambda a, b: 30)
+
+    bot = TelegramBot("token")
+    bot._load_persona_meta = lambda: {  # type: ignore[assignment]
+        "active_hours": [1, 8],
+        "chase_ratio": 0.0,
+        "avg_burst_length": 1.0,
+    }
+
+    times = bot._plan_daily_times()
+    assert len(times) == 1
+    assert times[0].hour == 8

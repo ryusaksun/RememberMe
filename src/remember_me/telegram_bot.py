@@ -466,6 +466,7 @@ class TelegramBot:
 
         now = datetime.now(TIMEZONE)
         today = now.date()
+        threshold = now - timedelta(hours=2)
 
         # 优先选 routine 中空闲的时段
         routine_path = PROFILES_DIR / f"{PERSONA_NAME}_routine.json"
@@ -482,16 +483,27 @@ class TelegramBot:
             except Exception:
                 pass
 
-        # 从 active_hours 中随机选 count 个不同的小时
-        chosen_hours = random.sample(active_hours, min(count, len(active_hours)))
+        # 先过滤出“今天仍可触发”的小时，再抽样，避免抽到过期时段导致整天无计划。
+        eligible_hours = []
+        for hour in active_hours:
+            latest_in_hour = datetime(today.year, today.month, today.day, hour, 59, tzinfo=TIMEZONE)
+            if latest_in_hour >= threshold:
+                eligible_hours.append(hour)
+        if not eligible_hours:
+            return []
+
+        chosen_hours = random.sample(eligible_hours, min(count, len(eligible_hours)))
 
         times = []
         for hour in chosen_hours:
-            minute = random.randint(0, 59)
+            min_minute = 0
+            if threshold.date() == today and hour == threshold.hour:
+                min_minute = max(0, min(59, threshold.minute))
+            minute = random.randint(min_minute, 59)
             dt = datetime(today.year, today.month, today.day, hour, minute, tzinfo=TIMEZONE)
             # 每日计划只包含“今天”能触发的时刻。
             # 若该时段已过去太久（超过 2 小时），直接跳过，避免被推到明天后在午夜刷新时丢失。
-            if dt < now - timedelta(hours=2):
+            if dt < threshold:
                 continue
             times.append(dt)
 
