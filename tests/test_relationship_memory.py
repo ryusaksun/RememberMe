@@ -147,6 +147,31 @@ def test_relationship_store_manual_confirm_and_reject(tmp_path) -> None:
     assert "rel_b" in rejected
 
 
+def test_relationship_store_manual_confirm_reject_supports_large_fact_set(tmp_path) -> None:
+    store = RelationshipMemoryStore("小明", data_dir=tmp_path)
+    facts = []
+    for idx in range(520):
+        facts.append(
+            RelationshipFact(
+                id=f"rel_many_{idx}",
+                type="shared_event",
+                subject="both",
+                content=f"共同经历片段 {idx}",
+                evidence=[f"证据 {idx}"],
+                confidence=0.65,
+                status="candidate",
+            )
+        )
+    store.upsert_facts(facts)
+
+    target = "rel_many_519"
+    assert store.confirm_fact(target)
+    assert any(f.id == target and f.status == "confirmed" for f in store.list_facts(limit=600))
+
+    assert store.reject_fact(target, reason="manual:rollback")
+    assert any(f.id == target and f.status == "rejected" for f in store.list_facts(limit=600))
+
+
 def test_relationship_extractor_rules_and_conflict_filter() -> None:
     history = ChatHistory(
         target_name="小明",

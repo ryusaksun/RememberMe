@@ -471,7 +471,7 @@ class RelationshipMemoryStore:
         return None
 
     def confirm_fact(self, ref: str | int) -> bool:
-        rows = self.list_facts(limit=500)
+        rows = self._sort_rows(self._facts)
         target = self._resolve_ref(ref, rows)
         if not target:
             return False
@@ -485,7 +485,7 @@ class RelationshipMemoryStore:
         return True
 
     def reject_fact(self, ref: str | int, reason: str = "manual_reject") -> bool:
-        rows = self.list_facts(limit=500)
+        rows = self._sort_rows(self._facts)
         target = self._resolve_ref(ref, rows)
         if not target:
             return False
