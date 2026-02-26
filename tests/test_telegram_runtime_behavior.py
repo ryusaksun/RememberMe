@@ -993,6 +993,48 @@ def test_ensure_session_on_message_rolls_back_proactive_on_delivery_failure() ->
     asyncio.run(_run())
 
 
+def test_ensure_session_singleflight_under_concurrent_calls() -> None:
+    counters = {"init": 0, "start": 0}
+
+    class _FakeController:
+        def __init__(self, persona_name: str):
+            counters["init"] += 1
+            self.persona_name = persona_name
+            self.session_loaded = False
+
+        async def start(self, on_message, on_typing=None, no_greet: bool = False):
+            counters["start"] += 1
+            await asyncio.sleep(0.03)
+
+        async def stop(self):
+            return None
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            return None
+
+    async def _run():
+        bot = TelegramBot("token")
+        bot._app = SimpleNamespace(bot=_FakeBot())
+
+        original = tg_mod.ChatController
+        try:
+            tg_mod.ChatController = _FakeController  # type: ignore[assignment]
+            r1, r2 = await asyncio.gather(
+                bot._ensure_session(chat_id=123),
+                bot._ensure_session(chat_id=123),
+            )
+            assert r1 is True and r2 is True
+            assert counters["init"] == 1
+            assert counters["start"] == 1
+            assert bot._controller is not None
+            assert bot._chat_id == 123
+        finally:
+            tg_mod.ChatController = original  # type: ignore[assignment]
+
+    asyncio.run(_run())
+
+
 def test_split_telegram_text_respects_limit() -> None:
     text = "a" * 100
     chunks = TelegramBot._split_telegram_text(text, limit=30)

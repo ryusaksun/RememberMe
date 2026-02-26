@@ -79,6 +79,7 @@ class TelegramBot:
         self._controller: ChatController | None = None
         self._chat_id: int | None = None
         self._send_lock = asyncio.Lock()
+        self._session_lock = asyncio.Lock()
         self._app: Application | None = None
         self._last_user_activity: float = 0.0  # 用户最后交互时间
         # 消息聚合状态
@@ -755,87 +756,92 @@ class TelegramBot:
 
     async def _ensure_session(self, chat_id: int, no_greet: bool = False) -> bool:
         """确保 controller 已启动。返回 True 表示就绪。"""
-        if self._controller and self._chat_id == chat_id:
-            return True
+        async with self._session_lock:
+            if self._controller and self._chat_id == chat_id:
+                return True
 
-        # 已有其他用户在用
-        if self._controller and self._chat_id != chat_id:
-            return False
+            # 已有其他用户在用
+            if self._controller and self._chat_id != chat_id:
+                return False
 
-        controller = ChatController(PERSONA_NAME)
-        bot = self._app.bot
+            controller = ChatController(PERSONA_NAME)
+            bot = self._app.bot
 
-        def on_message(msgs: list[str], msg_type: str):
-            is_followup = msg_type in {"proactive", "greet"}
-            async def _deliver_task():
-                clean = [m for m in (msgs or []) if m and str(m).strip()]
-                if not clean:
-                    return
-                try:
-                    async with self._send_lock:
-                        if not self._controller or self._chat_id != chat_id:
-                            return
-                        if is_followup and time.time() - self._last_user_activity < 8:
-                            logger.info("主动消息跳过：用户刚有输入活动")
-                            rollback_fn = getattr(self._controller, "rollback_proactive_delivery", None)
-                            if callable(rollback_fn):
-                                with contextlib.suppress(Exception):
-                                    rollback_fn(clean, reason="telegram_skip_recent_user_activity")
-                            return
-                        if is_followup and self._is_duplicate_proactive(clean):
-                            logger.info("主动消息跳过：命中 Telegram 去重")
-                            rollback_fn = getattr(self._controller, "rollback_proactive_delivery", None)
-                            if callable(rollback_fn):
-                                with contextlib.suppress(Exception):
-                                    rollback_fn(clean, reason="telegram_skip_duplicate")
-                            return
-                        await self._deliver_messages(
-                            bot, chat_id, clean,
-                            first_delay_phase="followup" if is_followup else "first",
-                        )
+            def on_message(msgs: list[str], msg_type: str):
+                is_followup = msg_type in {"proactive", "greet"}
+
+                async def _deliver_task():
+                    clean = [m for m in (msgs or []) if m and str(m).strip()]
+                    if not clean:
+                        return
+                    try:
+                        async with self._send_lock:
+                            if self._controller and self._controller is not controller:
+                                return
+                            if self._chat_id is not None and self._chat_id != chat_id:
+                                return
+                            if is_followup and time.time() - self._last_user_activity < 8:
+                                logger.info("主动消息跳过：用户刚有输入活动")
+                                rollback_fn = getattr(controller, "rollback_proactive_delivery", None)
+                                if callable(rollback_fn):
+                                    with contextlib.suppress(Exception):
+                                        rollback_fn(clean, reason="telegram_skip_recent_user_activity")
+                                return
+                            if is_followup and self._is_duplicate_proactive(clean):
+                                logger.info("主动消息跳过：命中 Telegram 去重")
+                                rollback_fn = getattr(controller, "rollback_proactive_delivery", None)
+                                if callable(rollback_fn):
+                                    with contextlib.suppress(Exception):
+                                        rollback_fn(clean, reason="telegram_skip_duplicate")
+                                return
+                            await self._deliver_messages(
+                                bot, chat_id, clean,
+                                first_delay_phase="followup" if is_followup else "first",
+                            )
+                            if is_followup:
+                                self._mark_proactive_sent(clean)
+                    except Exception as e:
+                        rolled_back = False
                         if is_followup:
-                            self._mark_proactive_sent(clean)
-                except Exception as e:
-                    rolled_back = False
-                    if is_followup and self._controller:
-                        controller = self._controller
-                        rollback_fn = getattr(controller, "rollback_proactive_delivery", None)
-                        if callable(rollback_fn):
-                            with contextlib.suppress(Exception):
-                                rolled_back = bool(
-                                    rollback_fn(clean, reason="telegram_send_failed")
-                                )
-                        elif getattr(controller, "_engine", None):
-                            with contextlib.suppress(Exception):
-                                rolled_back = bool(
-                                    controller._engine.rollback_last_proactive_message(clean)
-                                )
-                    if rolled_back:
-                        logger.warning("主动消息发送失败，已回滚未送达消息: %s", e)
-                    else:
-                        logger.warning("消息发送失败: %s", e)
+                            rollback_fn = getattr(controller, "rollback_proactive_delivery", None)
+                            if callable(rollback_fn):
+                                with contextlib.suppress(Exception):
+                                    rolled_back = bool(
+                                        rollback_fn(clean, reason="telegram_send_failed")
+                                    )
+                            elif getattr(controller, "_engine", None):
+                                with contextlib.suppress(Exception):
+                                    rolled_back = bool(
+                                        controller._engine.rollback_last_proactive_message(clean)
+                                    )
+                        if rolled_back:
+                            logger.warning("主动消息发送失败，已回滚未送达消息: %s", e)
+                        else:
+                            logger.warning("消息发送失败: %s", e)
 
-            self._track_task(asyncio.create_task(_deliver_task()), f"deliver_{msg_type}")
+                self._track_task(asyncio.create_task(_deliver_task()), f"deliver_{msg_type}")
 
-        def on_typing(is_typing: bool):
-            if is_typing:
-                self._track_task(
-                    asyncio.create_task(self._send_typing(bot, chat_id)),
-                    "typing_indicator",
+            def on_typing(is_typing: bool):
+                if is_typing:
+                    self._track_task(
+                        asyncio.create_task(self._send_typing(bot, chat_id)),
+                        "typing_indicator",
+                    )
+
+            try:
+                await controller.start(
+                    on_message=on_message, on_typing=on_typing, no_greet=no_greet,
                 )
+            except Exception:
+                # start() 失败时不写入状态，下次调用会重新初始化
+                logger.exception("session 初始化失败")
+                with contextlib.suppress(Exception):
+                    await controller.stop()
+                return False
 
-        try:
-            await controller.start(
-                on_message=on_message, on_typing=on_typing, no_greet=no_greet,
-            )
-        except Exception:
-            # start() 失败时不写入状态，下次调用会重新初始化
-            logger.exception("session 初始化失败")
-            return False
-
-        self._chat_id = chat_id
-        self._controller = controller
-        return True
+            self._chat_id = chat_id
+            self._controller = controller
+            return True
 
     # ── 命令处理 ──
 
@@ -1113,22 +1119,22 @@ class TelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        if not self._controller or self._chat_id != update.effective_chat.id:
-            await update.message.reply_text("当前没有进行中的对话。")
-            return
-
-        async with self._coalesce_lock:
-            self._cancel_coalesce_timer()
-            self._coalesce_buffer.clear()
-            self._coalesce_first_at = 0.0
-        async with self._send_lock:
-            controller = self._controller
-            if not controller or self._chat_id != update.effective_chat.id:
+        async with self._session_lock:
+            if not self._controller or self._chat_id != update.effective_chat.id:
                 await update.message.reply_text("当前没有进行中的对话。")
                 return
-            await controller.stop()
-            self._controller = None
-            self._chat_id = None
+            async with self._coalesce_lock:
+                self._cancel_coalesce_timer()
+                self._coalesce_buffer.clear()
+                self._coalesce_first_at = 0.0
+            async with self._send_lock:
+                controller = self._controller
+                if not controller or self._chat_id != update.effective_chat.id:
+                    await update.message.reply_text("当前没有进行中的对话。")
+                    return
+                await controller.stop()
+                self._controller = None
+                self._chat_id = None
         await update.message.reply_text(
             f"已结束与 {PERSONA_NAME} 的对话。会话已保存。"
         )
