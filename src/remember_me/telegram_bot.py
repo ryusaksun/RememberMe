@@ -89,6 +89,7 @@ class TelegramBot:
         # 每日调度
         self._daily_times: list[datetime] = []
         self._daily_date: str = ""  # 当前计划对应的日期
+        self._daily_retry_attempts: dict[str, int] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._recent_proactive_signatures: list[tuple[float, str]] = []
         self._last_error_reply_at: float = 0.0
@@ -511,6 +512,10 @@ class TelegramBot:
         times.sort()
         return times
 
+    @staticmethod
+    def _daily_slot_key(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M")
+
     async def _daily_scheduler(self):
         """后台任务：每日主动消息调度，每 30 秒检查一次。"""
         await asyncio.sleep(5)  # 等 Bot 完全启动
@@ -524,6 +529,7 @@ class TelegramBot:
                 if self._daily_date != today_str:
                     self._daily_times = self._plan_daily_times()
                     self._daily_date = today_str
+                    self._daily_retry_attempts.clear()
                     if self._daily_times:
                         time_strs = [t.strftime("%H:%M") for t in self._daily_times]
                         logger.info("每日主动消息计划 [%s]: %s", today_str, ", ".join(time_strs))
@@ -548,14 +554,25 @@ class TelegramBot:
                 for planned_time in self._daily_times:
                     if not attempted and now >= planned_time:
                         attempted = True
+                        slot_key = self._daily_slot_key(planned_time)
                         consumed = await self._try_send_daily_message()
                         if consumed:
+                            self._daily_retry_attempts.pop(slot_key, None)
                             continue
-                        retry_at = now + timedelta(minutes=10)
+                        attempts = self._daily_retry_attempts.get(slot_key, 0) + 1
+                        self._daily_retry_attempts.pop(slot_key, None)
+                        if attempts > 3:
+                            logger.warning("每日消息发送连续失败超过 3 次，放弃本次时段")
+                            continue
+                        retry_minutes = min(60, 10 * (2 ** (attempts - 1)))
+                        retry_at = now + timedelta(minutes=retry_minutes)
                         if retry_at.date() == planned_time.date():
+                            retry_key = self._daily_slot_key(retry_at)
+                            self._daily_retry_attempts[retry_key] = attempts
                             remaining.append(retry_at)
                             logger.info(
-                                "每日消息发送未成功，时段延后到 %s 重试",
+                                "每日消息发送失败（第 %d 次），时段延后到 %s 重试",
+                                attempts,
                                 retry_at.strftime("%H:%M"),
                             )
                         else:
@@ -652,6 +669,7 @@ class TelegramBot:
 
             loop = asyncio.get_event_loop()
             msgs = None
+            event_to_mark_done = ""
 
             # 优先级 1：检查待跟进事件
             if controller._event_tracker:
@@ -682,12 +700,12 @@ class TelegramBot:
                         ),
                     )
                     if msgs:
-                        controller._event_tracker.mark_done(event.id)
+                        event_to_mark_done = event.id
 
             # 优先级 2：常规新话题
             if not msgs:
                 if not controller._engine:
-                    return
+                    return False
                 ctx = self._get_engine_context(controller._engine, max_chars=460)
                 proactive_policy = controller._engine.plan_rhythm_policy(
                     kind="proactive",
@@ -724,6 +742,8 @@ class TelegramBot:
                 bot = self._app.bot
                 await self._deliver_messages(bot, chat_id, msgs, first_delay_phase="followup")
                 self._mark_proactive_sent(msgs)
+                if event_to_mark_done and controller._event_tracker:
+                    controller._event_tracker.mark_done(event_to_mark_done)
             logger.info("每日主动消息已发送: %d 条", len(msgs))
             return True
 

@@ -592,6 +592,146 @@ def test_daily_proactive_skips_recent_duplicate() -> None:
     assert delivered["called"] is False
 
 
+def test_daily_event_followup_marks_done_after_delivery() -> None:
+    class _FakeTracker:
+        def __init__(self):
+            self.done_ids: list[str] = []
+
+        def get_due_events(self):
+            return [SimpleNamespace(
+                id="evt_1",
+                event="今天去体检",
+                context="下午体检",
+                followup_hint="问结果",
+            )]
+
+        def mark_done(self, event_id: str):
+            self.done_ids.append(event_id)
+
+    class _FakeEngine:
+        def plan_rhythm_policy(self, *, kind: str, user_input: str = ""):
+            return SimpleNamespace(
+                min_count=1,
+                max_count=2,
+                prefer_count=1,
+                min_len=6,
+                max_len=22,
+                prefer_len=12,
+                allow_single_short_ack=False,
+            )
+
+        def get_proactive_context(self, max_chars: int = 460) -> str:
+            return "压缩上下文"
+
+        def inject_proactive_message(self, msgs: list[str]):
+            return None
+
+    class _FakeStarter:
+        def generate_event_followup(self, *_args, **_kwargs):
+            return ["体检结束了吗？结果还好吗"]
+
+        def generate(self, **_kwargs):
+            return ["在吗"]
+
+    class _FakeBot:
+        pass
+
+    tracker = _FakeTracker()
+    bot = TelegramBot("token")
+    bot._controller = SimpleNamespace(
+        _engine=_FakeEngine(),
+        _topic_starter=_FakeStarter(),
+        _event_tracker=tracker,
+        _update_activity=lambda: None,
+    )
+    bot._chat_id = 123
+    bot._last_user_activity = 0.0
+    bot._app = SimpleNamespace(bot=_FakeBot())
+
+    async def _ensure_session(chat_id: int, no_greet: bool = False) -> bool:
+        return True
+
+    async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+        return None
+
+    bot._ensure_session = _ensure_session  # type: ignore[assignment]
+    bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+    ok = asyncio.run(bot._try_send_daily_message())
+    assert ok is True
+    assert tracker.done_ids == ["evt_1"]
+
+
+def test_daily_event_followup_not_mark_done_when_delivery_failed() -> None:
+    class _FakeTracker:
+        def __init__(self):
+            self.done_ids: list[str] = []
+
+        def get_due_events(self):
+            return [SimpleNamespace(
+                id="evt_1",
+                event="今天去体检",
+                context="下午体检",
+                followup_hint="问结果",
+            )]
+
+        def mark_done(self, event_id: str):
+            self.done_ids.append(event_id)
+
+    class _FakeEngine:
+        def plan_rhythm_policy(self, *, kind: str, user_input: str = ""):
+            return SimpleNamespace(
+                min_count=1,
+                max_count=2,
+                prefer_count=1,
+                min_len=6,
+                max_len=22,
+                prefer_len=12,
+                allow_single_short_ack=False,
+            )
+
+        def get_proactive_context(self, max_chars: int = 460) -> str:
+            return "压缩上下文"
+
+        def inject_proactive_message(self, msgs: list[str]):
+            return None
+
+    class _FakeStarter:
+        def generate_event_followup(self, *_args, **_kwargs):
+            return ["体检结束了吗？结果还好吗"]
+
+        def generate(self, **_kwargs):
+            return ["在吗"]
+
+    class _FakeBot:
+        pass
+
+    tracker = _FakeTracker()
+    bot = TelegramBot("token")
+    bot._controller = SimpleNamespace(
+        _engine=_FakeEngine(),
+        _topic_starter=_FakeStarter(),
+        _event_tracker=tracker,
+        _update_activity=lambda: None,
+    )
+    bot._chat_id = 123
+    bot._last_user_activity = 0.0
+    bot._app = SimpleNamespace(bot=_FakeBot())
+
+    async def _ensure_session(chat_id: int, no_greet: bool = False) -> bool:
+        return True
+
+    async def _deliver_messages(bot_obj, chat_id: int, msgs: list[str], first_delay_phase: str = "first"):
+        raise RuntimeError("network down")
+
+    bot._ensure_session = _ensure_session  # type: ignore[assignment]
+    bot._deliver_messages = _deliver_messages  # type: ignore[assignment]
+
+    ok = asyncio.run(bot._try_send_daily_message())
+    assert ok is False
+    assert tracker.done_ids == []
+
+
 def test_telegram_proactive_signature_dedup_supports_near_match() -> None:
     bot = TelegramBot("token")
     bot._mark_proactive_sent(["在吗，你忙完了没"])
@@ -805,3 +945,42 @@ def test_daily_scheduler_consumes_slot_on_send_success(monkeypatch) -> None:
         pass
 
     assert bot._daily_times == []
+
+
+def test_daily_scheduler_retry_backoff_escalates_after_previous_failure(monkeypatch) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 2, 26, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(tg_mod, "datetime", _FixedDateTime)
+
+    bot = TelegramBot("token")
+    bot._daily_date = "2026-02-26"
+    original_slot = _FixedDateTime(2026, 2, 26, 9, 50, tzinfo=tg_mod.TIMEZONE)
+    bot._daily_times = [original_slot]
+    bot._daily_retry_attempts[bot._daily_slot_key(original_slot)] = 1
+
+    async def _try_send():
+        return False
+
+    sleep_calls = {"n": 0}
+
+    async def _sleep(_seconds: float):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    bot._try_send_daily_message = _try_send  # type: ignore[assignment]
+    monkeypatch.setattr(tg_mod.asyncio, "sleep", _sleep)
+
+    try:
+        asyncio.run(bot._daily_scheduler())
+    except asyncio.CancelledError:
+        pass
+
+    assert len(bot._daily_times) == 1
+    assert bot._daily_times[0].hour == 10
+    assert bot._daily_times[0].minute == 20
+    key = bot._daily_slot_key(bot._daily_times[0])
+    assert bot._daily_retry_attempts[key] == 2
