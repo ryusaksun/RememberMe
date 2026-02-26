@@ -83,6 +83,12 @@ class ChatController:
         self._phase_updated_at = 0.0
         self._telemetry_seq = 0
         self._recent_proactive_signatures: list[tuple[float, str]] = []
+        try:
+            self._session_resume_greet_max_idle = max(
+                0, int(os.environ.get("SESSION_RESUME_GREET_MAX_IDLE_SECONDS", "7200"))
+            )
+        except ValueError:
+            self._session_resume_greet_max_idle = 7200
 
     @property
     def persona_name(self) -> str:
@@ -375,6 +381,37 @@ class ChatController:
         hi = max(lo + 10, min(600, hi))
         return random.randint(lo, hi)
 
+    @staticmethod
+    def _read_session_updated_at(path: Path) -> float | None:
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            updated_at = str(raw.get("updated_at", "") or "").strip()
+            if not updated_at:
+                return None
+            return datetime.fromisoformat(updated_at).timestamp()
+        except Exception:
+            return None
+
+    def _should_send_greeting(
+        self,
+        *,
+        no_greet: bool,
+        session_loaded: bool,
+        session_updated_at: float | None,
+    ) -> bool:
+        if no_greet or not self._has_topics:
+            return False
+        if not session_loaded:
+            return True
+        if session_updated_at is None:
+            return False
+        idle = max(0.0, time.time() - session_updated_at)
+        return idle <= float(self._session_resume_greet_max_idle)
+
     def _load_notes(self) -> list[str]:
         """兼容旧接口：加载手动备注（实际来自运行时短期记忆 manual 标签）。"""
         try:
@@ -517,6 +554,7 @@ class ChatController:
 
         # 加载上次对话
         session_path = SESSIONS_DIR / f"{self._name}.json"
+        session_updated_at = self._read_session_updated_at(session_path)
         self._session_loaded = self._engine.load_session(session_path)
         self._history_start_index = len(self._engine._history)
         self._user_turn_count = sum(
@@ -564,8 +602,17 @@ class ChatController:
         )
 
         # 主动开场
-        if not no_greet and self._has_topics:
+        if self._should_send_greeting(
+            no_greet=no_greet,
+            session_loaded=self._session_loaded,
+            session_updated_at=session_updated_at,
+        ):
             self._greeting_task = asyncio.create_task(self._send_greeting())
+        elif self._session_loaded and not no_greet and self._has_topics:
+            logger.info(
+                "检测到恢复会话距离当前较久，跳过开场主动消息（idle>%ss）",
+                self._session_resume_greet_max_idle,
+            )
 
         # 启动后台主动消息循环
         self._proactive_task = asyncio.create_task(self._proactive_loop())

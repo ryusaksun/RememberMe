@@ -240,6 +240,47 @@ def test_pending_event_extract_events_raises_on_model_failure(tmp_path) -> None:
         assert "模型调用失败" in str(e)
 
 
+def test_controller_should_send_greeting_for_fresh_or_new_session() -> None:
+    c = ChatController("x")
+    c._has_topics = True
+    now = time.time()
+    c._session_resume_greet_max_idle = 3600
+
+    assert c._should_send_greeting(
+        no_greet=False,
+        session_loaded=False,
+        session_updated_at=None,
+    ) is True
+    assert c._should_send_greeting(
+        no_greet=False,
+        session_loaded=True,
+        session_updated_at=now - 300,
+    ) is True
+
+
+def test_controller_should_skip_greeting_for_stale_loaded_session() -> None:
+    c = ChatController("x")
+    c._has_topics = True
+    now = time.time()
+    c._session_resume_greet_max_idle = 1800
+
+    assert c._should_send_greeting(
+        no_greet=False,
+        session_loaded=True,
+        session_updated_at=now - 7200,
+    ) is False
+    assert c._should_send_greeting(
+        no_greet=False,
+        session_loaded=True,
+        session_updated_at=None,
+    ) is False
+    assert c._should_send_greeting(
+        no_greet=True,
+        session_loaded=False,
+        session_updated_at=None,
+    ) is False
+
+
 def test_pending_event_get_due_events_evicts_old_done(tmp_path) -> None:
     tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
     now = datetime.now()
