@@ -70,6 +70,8 @@ class TelegramBot:
     # Telegram API 发送层重试参数
     TELEGRAM_API_MAX_RETRIES = 4
     TELEGRAM_RETRY_BASE_DELAY = 0.45
+    # 出错提示限频，避免连续异常时刷屏
+    ERROR_REPLY_COOLDOWN = 20
 
     def __init__(self, token: str, allowed_users: set[int] | None = None):
         self._token = token
@@ -89,6 +91,7 @@ class TelegramBot:
         self._daily_date: str = ""  # 当前计划对应的日期
         self._bg_tasks: set[asyncio.Task] = set()
         self._recent_proactive_signatures: list[tuple[float, str]] = []
+        self._last_error_reply_at: float = 0.0
 
     def _is_allowed(self, user_id: int) -> bool:
         if self._allowed_users is None:
@@ -317,6 +320,21 @@ class TelegramBot:
                 with contextlib.suppress(Exception):
                     await task
             raise
+
+    @staticmethod
+    def _humanized_error_text() -> str:
+        return random.choice([
+            "我这边刚卡了一下，你再发一条试试。",
+            "等等，我这边网络抽了下，你再说一次。",
+            "刚刚没接上，你再发一遍我马上回。",
+        ])
+
+    async def _maybe_send_humanized_error(self, bot, chat_id: int):
+        now = time.time()
+        if now - self._last_error_reply_at < self.ERROR_REPLY_COOLDOWN:
+            return
+        self._last_error_reply_at = now
+        await self._send_text(bot, chat_id, self._humanized_error_text())
 
     @staticmethod
     def _call_topic_starter(
@@ -1009,7 +1027,8 @@ class TelegramBot:
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送消息失败")
-                await self._send_text(bot, chat_id, f"出错了：{e}")
+                with contextlib.suppress(Exception):
+                    await self._maybe_send_humanized_error(bot, chat_id)
 
     async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update.effective_user.id):
@@ -1058,7 +1077,8 @@ class TelegramBot:
                 await self._deliver_messages(bot, chat_id, replies, first_delay_phase="first")
             except Exception as e:
                 logger.exception("发送图片消息失败")
-                await update.message.reply_text(f"出错了：{e}")
+                with contextlib.suppress(Exception):
+                    await self._maybe_send_humanized_error(bot, chat_id)
 
     async def _deliver_messages(
         self,

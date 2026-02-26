@@ -126,6 +126,61 @@ def test_chat_engine_human_noise_layer(monkeypatch) -> None:
     assert out[1].startswith("打错字了，")
 
 
+def test_chat_engine_generate_content_with_retry_on_transient_error(monkeypatch) -> None:
+    class _TransientErr(Exception):
+        pass
+
+    class _Models:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            if self.calls == 1:
+                raise _TransientErr("503 service unavailable")
+            return SimpleNamespace(text="ok", candidates=[])
+
+    engine = ChatEngine.__new__(ChatEngine)
+    engine._client = SimpleNamespace(models=_Models())
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(float(s)))
+    monkeypatch.setattr("random.random", lambda: 0.0)
+
+    resp = engine._generate_content_with_retry(
+        model="m",
+        contents=[],
+        config=None,
+    )
+    assert resp.text == "ok"
+    assert engine._client.models.calls == 2
+    assert sleeps
+
+
+def test_chat_engine_generate_content_with_retry_not_retry_non_transient(monkeypatch) -> None:
+    class _FatalErr(Exception):
+        pass
+
+    class _Models:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            raise _FatalErr("invalid argument")
+
+    engine = ChatEngine.__new__(ChatEngine)
+    engine._client = SimpleNamespace(models=_Models())
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    try:
+        engine._generate_content_with_retry(model="m", contents=[], config=None)
+        assert False, "expected _FatalErr"
+    except _FatalErr:
+        pass
+    assert engine._client.models.calls == 1
+
+
 def test_pending_event_semantic_duplicate(monkeypatch, tmp_path) -> None:
     tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
     now = datetime.now().isoformat()

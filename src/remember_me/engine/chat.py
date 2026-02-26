@@ -220,6 +220,12 @@ _PROMPT_LEAK_KEYWORDS = (
     "绝不承认是 ai",
 )
 _SAFE_REPLY_FALLBACK = "嗯，刚刚卡了一下，你继续说。"
+_GEN_RETRY_ATTEMPTS = 3
+_TRANSIENT_GEN_ERR_RE = re.compile(
+    r"(timeout|timed out|deadline exceeded|rate limit|429|5\d\d|"
+    r"service unavailable|temporar|connection|network|reset by peer|too many requests)",
+    re.I,
+)
 
 
 def _clean_reasoning_leak(msg: str) -> str:
@@ -704,6 +710,41 @@ class ChatEngine:
         if len(text) <= 8 and self._TRIVIAL_RE.match(text) and not re.search(r"[?？!！]", text):
             return MODEL_LIGHT
         return MODEL_MAIN
+
+    @staticmethod
+    def _is_transient_generation_error(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+        try:
+            code = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            code = None
+        if code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+        text = f"{type(exc).__name__}: {exc}"
+        return bool(_TRANSIENT_GEN_ERR_RE.search(text))
+
+    def _generate_content_with_retry(self, *, model: str, contents, config):
+        delay = 0.45
+        for attempt in range(1, _GEN_RETRY_ATTEMPTS + 1):
+            try:
+                return self._client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as e:
+                if attempt >= _GEN_RETRY_ATTEMPTS or not self._is_transient_generation_error(e):
+                    raise
+                sleep_for = min(2.5, delay + random.random() * 0.25)
+                logger.warning(
+                    "LLM 生成临时失败，第 %d/%d 次重试: %s",
+                    attempt, _GEN_RETRY_ATTEMPTS, e,
+                )
+                time.sleep(max(0.05, sleep_for))
+                delay = min(3.0, delay * 1.8)
 
     @staticmethod
     def _sample_delay_from_profile(
@@ -1383,7 +1424,7 @@ class ChatEngine:
             mods.max_output_tokens = min(mods.max_output_tokens, 768)
 
         try:
-            response = self._client.models.generate_content(
+            response = self._generate_content_with_retry(
                 model=model,
                 contents=self._history,
                 config=types.GenerateContentConfig(

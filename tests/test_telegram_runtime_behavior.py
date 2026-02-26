@@ -210,6 +210,53 @@ def test_flush_coalesce_merges_messages_without_mechanical_prefix() -> None:
     assert "连续发了" not in str(captured["merged"])
 
 
+def test_flush_coalesce_failure_uses_humanized_error_reply() -> None:
+    sent: list[str] = []
+
+    class _FakeBot:
+        async def send_chat_action(self, chat_id: int, action):
+            return None
+
+        async def send_message(self, chat_id: int, text: str):
+            sent.append(text)
+            return None
+
+    class _FakeController:
+        async def send_message(self, text: str):
+            raise RuntimeError("llm timeout 504")
+
+    bot = TelegramBot("token")
+    bot._app = SimpleNamespace(bot=_FakeBot())
+    bot._controller = _FakeController()
+    bot._chat_id = 123
+    bot._coalesce_buffer = ["你好"]
+
+    async def _run_with_typing_heartbeat(bot_obj, chat_id: int, coro):
+        return await coro
+
+    bot._run_with_typing_heartbeat = _run_with_typing_heartbeat  # type: ignore[assignment]
+
+    asyncio.run(bot._flush_coalesce(chat_id=123, delay=0))
+    assert sent
+    assert all("llm timeout 504" not in msg for msg in sent)
+    assert all(not msg.startswith("出错了：") for msg in sent)
+
+
+def test_humanized_error_reply_is_rate_limited() -> None:
+    sent: list[str] = []
+
+    class _FakeBot:
+        async def send_message(self, chat_id: int, text: str):
+            sent.append(text)
+            return None
+
+    bot = TelegramBot("token")
+    bot.ERROR_REPLY_COOLDOWN = 60
+    bot._last_error_reply_at = time.time()
+    asyncio.run(bot._maybe_send_humanized_error(_FakeBot(), 123))
+    assert sent == []
+
+
 def test_handle_photo_when_controller_dropped_replies_session_ended() -> None:
     class _FakeFile:
         async def download_as_bytearray(self):
