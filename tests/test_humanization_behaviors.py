@@ -18,7 +18,11 @@ from remember_me.engine.chat import (
     normalize_messages_by_policy,
 )
 from remember_me.engine.emotion import EmotionState
-from remember_me.engine.pending_events import PendingEvent, PendingEventTracker
+from remember_me.engine.pending_events import (
+    PendingEvent,
+    PendingEventExtractionError,
+    PendingEventTracker,
+)
 from remember_me.engine.topic_starter import TopicStarter
 from remember_me.importers.base import ChatHistory, ChatMessage
 from remember_me.memory.governance import MemoryGovernance
@@ -214,6 +218,25 @@ def test_pending_event_semantic_duplicate(monkeypatch, tmp_path) -> None:
 def test_pending_event_duplicate_handles_none_context(tmp_path) -> None:
     tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
     assert tracker._is_duplicate("明天面试", None) is False
+
+
+def test_pending_event_extract_events_raises_on_model_failure(tmp_path) -> None:
+    class _FakeModels:
+        def generate_content(self, **kwargs):
+            raise RuntimeError("upstream timeout")
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    tracker = PendingEventTracker(persona_name="x", data_dir=tmp_path)
+    try:
+        tracker.extract_events(
+            _FakeClient(),
+            recent_messages=[{"role": "user", "text": "明天去面试"}],
+        )
+        assert False, "expected PendingEventExtractionError"
+    except PendingEventExtractionError as e:
+        assert "模型调用失败" in str(e)
 
 
 def test_pending_event_get_due_events_evicts_old_done(tmp_path) -> None:

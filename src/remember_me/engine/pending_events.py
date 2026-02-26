@@ -63,6 +63,10 @@ _EXTRACT_PROMPT = """\
 _MAX_EVENT_AGE_HOURS = 48
 
 
+class PendingEventExtractionError(RuntimeError):
+    """待跟进事件提取失败（应由上层决定是否重试）。"""
+
+
 @dataclass
 class PendingEvent:
     id: str
@@ -110,7 +114,11 @@ class PendingEventTracker:
     def extract_events(
         self, client: genai.Client, recent_messages: list[dict]
     ) -> list[PendingEvent]:
-        """用 LLM 从近期对话中提取待跟进事件。"""
+        """用 LLM 从近期对话中提取待跟进事件。
+
+        发生模型调用或解析异常时抛出 PendingEventExtractionError，
+        由上层控制是否重试，避免静默丢失提取窗口。
+        """
         if not recent_messages:
             return []
 
@@ -130,6 +138,10 @@ class PendingEventTracker:
                     max_output_tokens=1024,
                 ),
             )
+        except Exception as e:
+            raise PendingEventExtractionError(f"事件提取模型调用失败: {e}") from e
+
+        try:
             raw = (response.text or "").strip()
             # 处理 markdown 代码块
             if raw.startswith("```"):
@@ -137,11 +149,10 @@ class PendingEventTracker:
                 raw = raw.rsplit("```", 1)[0]
             items = json.loads(raw)
         except Exception as e:
-            logger.debug("事件提取失败: %s", e)
-            return []
+            raise PendingEventExtractionError(f"事件提取结果解析失败: {e}") from e
 
         if not isinstance(items, list):
-            return []
+            raise PendingEventExtractionError("事件提取结果格式错误：期望 JSON 数组")
 
         now = datetime.now()
         new_events = []
