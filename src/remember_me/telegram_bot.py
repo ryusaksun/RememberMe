@@ -777,9 +777,17 @@ class TelegramBot:
                             return
                         if is_followup and time.time() - self._last_user_activity < 8:
                             logger.info("主动消息跳过：用户刚有输入活动")
+                            rollback_fn = getattr(self._controller, "rollback_proactive_delivery", None)
+                            if callable(rollback_fn):
+                                with contextlib.suppress(Exception):
+                                    rollback_fn(clean, reason="telegram_skip_recent_user_activity")
                             return
                         if is_followup and self._is_duplicate_proactive(clean):
                             logger.info("主动消息跳过：命中 Telegram 去重")
+                            rollback_fn = getattr(self._controller, "rollback_proactive_delivery", None)
+                            if callable(rollback_fn):
+                                with contextlib.suppress(Exception):
+                                    rollback_fn(clean, reason="telegram_skip_duplicate")
                             return
                         await self._deliver_messages(
                             bot, chat_id, clean,
@@ -904,8 +912,11 @@ class TelegramBot:
     ):
         if idx < 1:
             return None, "序号必须大于等于 1。"
-        cached_ids = self._relationship_view_cache.get(user_id) if user_id > 0 else None
-        if cached_ids:
+        has_cache = user_id > 0 and user_id in self._relationship_view_cache
+        cached_ids = self._relationship_view_cache.get(user_id, []) if has_cache else None
+        if has_cache:
+            if not cached_ids:
+                return None, "最近一次 /note rel list 结果为空，请先重新 list。"
             if idx > len(cached_ids):
                 return None, f"序号超出范围（1-{len(cached_ids)}）。"
             target_id = cached_ids[idx - 1]

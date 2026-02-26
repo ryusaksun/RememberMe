@@ -909,3 +909,87 @@ def test_controller_stop_closes_engine_client() -> None:
         assert closed["ok"] is True
 
     asyncio.run(_run())
+
+
+def test_controller_extract_pending_events_keeps_index_on_failure() -> None:
+    class _Tracker:
+        def extract_events(self, client, messages):
+            raise RuntimeError("extract failed")
+
+    c = ChatController("x")
+    c._event_tracker = _Tracker()
+    c._event_extract_index = 0
+    c._engine = SimpleNamespace(
+        client=None,
+        _history=[SimpleNamespace(role="user", parts=[SimpleNamespace(text="明天去面试")])],
+    )
+
+    asyncio.run(c._extract_pending_events())
+    assert c._event_extract_index == 0
+
+
+def test_controller_extract_pending_events_advances_index_on_success() -> None:
+    class _Tracker:
+        def extract_events(self, client, messages):
+            return []
+
+    c = ChatController("x")
+    c._event_tracker = _Tracker()
+    c._event_extract_index = 0
+    c._engine = SimpleNamespace(
+        client=None,
+        _history=[SimpleNamespace(role="user", parts=[SimpleNamespace(text="明天去面试")])],
+    )
+
+    asyncio.run(c._extract_pending_events())
+    assert c._event_extract_index == 1
+
+
+def test_controller_extract_relationship_facts_keeps_index_on_failure() -> None:
+    class _Extractor:
+        def extract_from_messages(self, *args, **kwargs):
+            raise RuntimeError("extract rel failed")
+
+    class _Store:
+        def upsert_facts(self, facts):
+            return 0
+
+        def promote_candidates(self, **kwargs):
+            return 0
+
+    c = ChatController("x")
+    c._relationship_extractor = _Extractor()
+    c._relationship_store = _Store()
+    c._relationship_extract_index = 0
+    c._engine = SimpleNamespace(
+        client=None,
+        _history=[SimpleNamespace(role="user", parts=[SimpleNamespace(text="别提前任")])],
+    )
+
+    asyncio.run(c._extract_relationship_facts())
+    assert c._relationship_extract_index == 0
+
+
+def test_controller_extract_relationship_facts_advances_index_on_success() -> None:
+    class _Extractor:
+        def extract_from_messages(self, *args, **kwargs):
+            return []
+
+    class _Store:
+        def upsert_facts(self, facts):
+            return 0
+
+        def promote_candidates(self, **kwargs):
+            return 0
+
+    c = ChatController("x")
+    c._relationship_extractor = _Extractor()
+    c._relationship_store = _Store()
+    c._relationship_extract_index = 0
+    c._engine = SimpleNamespace(
+        client=None,
+        _history=[SimpleNamespace(role="user", parts=[SimpleNamespace(text="别提前任")])],
+    )
+
+    asyncio.run(c._extract_relationship_facts())
+    assert c._relationship_extract_index == 1

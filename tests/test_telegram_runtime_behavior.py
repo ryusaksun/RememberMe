@@ -532,6 +532,74 @@ def test_note_rel_confirm_cache_uses_direct_id_lookup_not_limited_list() -> None
     asyncio.run(_run())
 
 
+def test_note_rel_confirm_after_empty_list_cache_should_not_fallback_to_default_rows() -> None:
+    class _Fact:
+        def __init__(self, fid: str, status: str, content: str):
+            self.id = fid
+            self.status = status
+            self.content = content
+            self.type = "shared_event"
+            self.confidence = 0.8
+            self.evidence = []
+
+    class _Store:
+        def __init__(self):
+            self.rows = [_Fact("rel_candidate", "candidate", "候选记录")]
+            self.confirmed: list[str] = []
+
+        def list_facts(self, **kwargs):
+            statuses = kwargs.get("statuses")
+            rows = list(self.rows)
+            if statuses:
+                rows = [x for x in rows if x.status in statuses]
+            return rows
+
+        def get_fact_by_id(self, fact_id: str):
+            for row in self.rows:
+                if row.id == fact_id:
+                    return row
+            return None
+
+        def confirm_fact(self, ref):
+            self.confirmed.append(str(ref))
+            return True
+
+        def reject_fact(self, ref, reason: str = "manual_reject"):
+            return True
+
+    class _Msg:
+        def __init__(self, text: str):
+            self.text = text
+            self.replies: list[str] = []
+
+        async def reply_text(self, text: str):
+            self.replies.append(text)
+
+    store = _Store()
+    bot = TelegramBot("token")
+    bot._get_relationship_store = lambda: store  # type: ignore[assignment]
+
+    async def _run():
+        msg_list = _Msg("/note rel list rejected")
+        upd_list = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_list,
+        )
+        await bot._cmd_note(upd_list, SimpleNamespace())
+        assert msg_list.replies and "暂无关系记忆记录" in msg_list.replies[-1]
+
+        msg_confirm = _Msg("/note rel confirm 1")
+        upd_confirm = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=msg_confirm,
+        )
+        await bot._cmd_note(upd_confirm, SimpleNamespace())
+        assert store.confirmed == []
+        assert msg_confirm.replies and "结果为空" in msg_confirm.replies[-1]
+
+    asyncio.run(_run())
+
+
 def test_daily_proactive_uses_rhythm_policy() -> None:
     class _FakeEngine:
         def __init__(self):
@@ -847,9 +915,14 @@ def test_ensure_session_on_message_skip_proactive_when_user_active() -> None:
         def __init__(self, persona_name: str):
             self.persona_name = persona_name
             self.session_loaded = False
+            self.rollback_calls: list[tuple[list[str], str]] = []
 
         async def start(self, on_message, on_typing=None, no_greet: bool = False):
             on_message(["在吗"], "proactive")
+
+        def rollback_proactive_delivery(self, msgs: list[str], *, reason: str = "delivery_failed"):
+            self.rollback_calls.append((list(msgs), reason))
+            return True
 
     class _FakeBot:
         async def send_chat_action(self, chat_id: int, action):
@@ -871,6 +944,7 @@ def test_ensure_session_on_message_skip_proactive_when_user_active() -> None:
             ok = await bot._ensure_session(chat_id=123)
             assert ok
             await asyncio.sleep(0.02)
+            assert bot._controller.rollback_calls == [(["在吗"], "telegram_skip_recent_user_activity")]
         finally:
             tg_mod.ChatController = original  # type: ignore[assignment]
 

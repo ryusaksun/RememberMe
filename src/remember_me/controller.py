@@ -699,6 +699,7 @@ class ChatController:
         if not self._event_tracker or not self._engine:
             return
         snapshot_index = len(self._engine._history)
+        advance_index = False
         try:
             messages = []
             for h in self._engine._history[self._event_extract_index:snapshot_index]:
@@ -706,7 +707,7 @@ class ChatController:
                     messages.append({"role": h.role, "text": h.parts[0].text})
 
             if not messages:
-                self._event_extract_index = snapshot_index
+                advance_index = True
                 return
 
             loop = asyncio.get_event_loop()
@@ -715,23 +716,26 @@ class ChatController:
                     self._engine.client, messages
                 )
             )
+            advance_index = True
         except Exception as e:
             logger.warning("事件提取失败: %s", e)
         finally:
-            # 无论成功失败都推进索引，避免重复处理相同消息
-            self._event_extract_index = snapshot_index
+            if advance_index:
+                self._event_extract_index = snapshot_index
 
     async def _extract_relationship_facts(self):
         """异步提取关系记忆（低频增量，不阻塞主回复）。"""
         if not self._engine or not self._relationship_extractor or not self._relationship_store:
             return
         snapshot_index = len(self._engine._history)
+        advance_index = False
         try:
             messages = []
             for h in self._engine._history[self._relationship_extract_index:snapshot_index]:
                 if h.parts and len(h.parts) > 0 and getattr(h.parts[0], "text", None):
                     messages.append({"role": h.role, "text": h.parts[0].text})
             if not messages:
+                advance_index = True
                 return
 
             loop = asyncio.get_event_loop()
@@ -745,17 +749,17 @@ class ChatController:
                     conflict_validator=self._relationship_validator,
                 ),
             )
-            if not facts:
-                return
-            await loop.run_in_executor(None, lambda: self._relationship_store.upsert_facts(facts))
-            await loop.run_in_executor(None, lambda: self._relationship_store.promote_candidates(
-                min_confidence=0.78, min_evidence=2,
-            ))
+            if facts:
+                await loop.run_in_executor(None, lambda: self._relationship_store.upsert_facts(facts))
+                await loop.run_in_executor(None, lambda: self._relationship_store.promote_candidates(
+                    min_confidence=0.78, min_evidence=2,
+                ))
+            advance_index = True
         except Exception as e:
             logger.warning("关系记忆提取失败: %s", e)
         finally:
-            # 无论成功失败都推进索引，避免重复处理相同消息
-            self._relationship_extract_index = snapshot_index
+            if advance_index:
+                self._relationship_extract_index = snapshot_index
 
     async def _proactive_loop(self):
         """后台主动消息循环。

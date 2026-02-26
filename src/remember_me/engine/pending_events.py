@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -79,28 +80,32 @@ class PendingEventTracker:
     def __init__(self, persona_name: str, data_dir: Path = Path("data")):
         self._path = data_dir / "pending_events" / f"{persona_name}.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._events: list[PendingEvent] = self._load()
         self._embedding_fn = None
 
     def _load(self) -> list[PendingEvent]:
-        if not self._path.exists():
-            return []
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            return [PendingEvent(**e) for e in data]
-        except Exception as e:
-            logger.warning("加载 pending_events 失败: %s", e)
-            return []
+        with self._lock:
+            if not self._path.exists():
+                return []
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                return [PendingEvent(**e) for e in data]
+            except Exception as e:
+                logger.warning("加载 pending_events 失败: %s", e)
+                return []
 
     def _save(self):
-        self._path.write_text(
-            json.dumps([asdict(e) for e in self._events], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with self._lock:
+            self._path.write_text(
+                json.dumps([asdict(e) for e in self._events], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     @property
     def pending_count(self) -> int:
-        return sum(1 for e in self._events if e.status == "pending")
+        with self._lock:
+            return sum(1 for e in self._events if e.status == "pending")
 
     def extract_events(
         self, client: genai.Client, recent_messages: list[dict]
@@ -140,42 +145,43 @@ class PendingEventTracker:
 
         now = datetime.now()
         new_events = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                minutes = int(item.get("followup_after_minutes", 60))
-            except (TypeError, ValueError):
-                minutes = 60
-            followup_at = now + timedelta(minutes=max(10, min(minutes, 1440)))
+        with self._lock:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    minutes = int(item.get("followup_after_minutes", 60))
+                except (TypeError, ValueError):
+                    minutes = 60
+                followup_at = now + timedelta(minutes=max(10, min(minutes, 1440)))
 
-            # 去重：如果已有类似事件（关键词重叠），跳过
-            event_text = str(item.get("event", "") or "").strip()
-            context_text = str(item.get("context", "") or "")
-            if not event_text:
-                continue
-            if self._is_duplicate(event_text, context_text):
-                continue
+                # 去重：如果已有类似事件（关键词重叠），跳过
+                event_text = str(item.get("event", "") or "").strip()
+                context_text = str(item.get("context", "") or "")
+                if not event_text:
+                    continue
+                if self._is_duplicate(event_text, context_text):
+                    continue
 
-            ev = PendingEvent(
-                id=uuid.uuid4().hex[:8],
-                event=event_text,
-                context=context_text,
-                followup_hint=item.get("followup_hint", ""),
-                followup_after=followup_at.isoformat(),
-                extracted_at=now.isoformat(),
-            )
-            new_events.append(ev)
-            self._events.append(ev)
+                ev = PendingEvent(
+                    id=uuid.uuid4().hex[:8],
+                    event=event_text,
+                    context=context_text,
+                    followup_hint=item.get("followup_hint", ""),
+                    followup_after=followup_at.isoformat(),
+                    extracted_at=now.isoformat(),
+                )
+                new_events.append(ev)
+                self._events.append(ev)
 
-        if new_events:
-            self._evict_old(now=now)
-            self._save()
-            logger.info(
-                "提取到 %d 个待跟进事件: %s",
-                len(new_events),
-                [e.event for e in new_events],
-            )
+            if new_events:
+                self._evict_old(now=now)
+                self._save()
+                logger.info(
+                    "提取到 %d 个待跟进事件: %s",
+                    len(new_events),
+                    [e.event for e in new_events],
+                )
 
         return new_events
 
@@ -216,7 +222,10 @@ class PendingEventTracker:
         if len(candidate) < 2:
             return True
 
-        for e in self._events:
+        with self._lock:
+            snapshot = [e for e in self._events if e.status == "pending"]
+
+        for e in snapshot:
             if e.status != "pending":
                 continue
 
@@ -239,52 +248,55 @@ class PendingEventTracker:
 
     def get_due_events(self) -> list[PendingEvent]:
         """获取已到追问时间的 pending 事件，并顺带清理过期/无效旧记录。"""
-        now = datetime.now()
-        changed = self._evict_old(now=now)
-        due = []
-        for e in self._events:
-            if e.status != "pending":
-                continue
-            try:
-                followup_at = datetime.fromisoformat(e.followup_after)
-                if followup_at <= now:
-                    due.append(e)
-            except ValueError:
-                continue
-        if changed:
-            self._save()
-        return due
+        with self._lock:
+            now = datetime.now()
+            changed = self._evict_old(now=now)
+            due = []
+            for e in self._events:
+                if e.status != "pending":
+                    continue
+                try:
+                    followup_at = datetime.fromisoformat(e.followup_after)
+                    if followup_at <= now:
+                        due.append(e)
+                except ValueError:
+                    continue
+            if changed:
+                self._save()
+            return due
 
     def mark_done(self, event_id: str):
         """标记事件为已完成。"""
-        changed = False
-        for e in self._events:
-            if e.id == event_id:
-                if e.status != "done":
-                    changed = True
-                e.status = "done"
-                break
-        if self._evict_old() or changed:
-            self._save()
+        with self._lock:
+            changed = False
+            for e in self._events:
+                if e.id == event_id:
+                    if e.status != "done":
+                        changed = True
+                    e.status = "done"
+                    break
+            if self._evict_old() or changed:
+                self._save()
 
     def _evict_old(self, now: datetime | None = None) -> bool:
         """清理过期事件。"""
-        if now is None:
-            now = datetime.now()
-        cutoff = now - timedelta(hours=_MAX_EVENT_AGE_HOURS)
-        kept = []
-        changed = False
-        for e in self._events:
-            try:
-                extracted = datetime.fromisoformat(e.extracted_at)
-                if extracted < cutoff:
-                    changed = True
-                    continue  # 太旧了，丢弃
-            except ValueError:
-                if e.status != "pending":
-                    changed = True
-                    continue
-            kept.append(e)
-        if changed:
-            self._events = kept
-        return changed
+        with self._lock:
+            if now is None:
+                now = datetime.now()
+            cutoff = now - timedelta(hours=_MAX_EVENT_AGE_HOURS)
+            kept = []
+            changed = False
+            for e in self._events:
+                try:
+                    extracted = datetime.fromisoformat(e.extracted_at)
+                    if extracted < cutoff:
+                        changed = True
+                        continue  # 太旧了，丢弃
+                except ValueError:
+                    if e.status != "pending":
+                        changed = True
+                        continue
+                kept.append(e)
+            if changed:
+                self._events = kept
+            return changed
